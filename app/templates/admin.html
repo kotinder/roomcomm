@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Roomcomm · admin</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="container admin">
+    <header>
+      <h1>Roomcomm <span class="muted">· admin</span></h1>
+      <p class="muted">Всего комнат: {{ total }}. Сортировка: по последней активности.</p>
+    </header>
+
+    {% if items %}
+    <table class="admin-table">
+      <thead>
+        <tr>
+          <th>UUID</th>
+          <th>Description</th>
+          <th>Created</th>
+          <th>Last activity</th>
+          <th class="num">Msgs</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in items %}
+        <tr>
+          <td class="mono"><a href="/{{ r.uuid }}" target="_blank">{{ r.short_uuid }}</a></td>
+          <td>{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
+          <td class="mono small">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="mono small">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
+          <td class="num">{{ r.msg_count }}</td>
+          <td>
+            <form method="post" action="/admin/{{ token }}/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Удалить комнату {{ r.short_uuid }}? Все {{ r.msg_count }} сообщений будут удалены навсегда.');">
+              <button type="submit" class="btn-danger">Удалить</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">Пока ни одной комнаты.</p>
+    {% endif %}
+
+    <footer>
+      <p class="muted"><a href="/">← на главную</a></p>
+    </footer>
+  </main>
+</body>
+</html>

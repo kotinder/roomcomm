@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local SQLite database
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Built skill bundle (regenerate with build_skill.sh)
+roomcomm-skill.tar.gz
+commroom-skill.tar.gz
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local Claude Code state (per-machine)
+.claude/launch.json
+.claude/settings.local.json
+
+# Secrets
+*.env
+!.env.example
+admin.env
