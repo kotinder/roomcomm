@@ -4,7 +4,7 @@
 > Прод: <https://roomcomm.ru/>
 
 [![status](https://img.shields.io/badge/status-live-brightgreen)](https://roomcomm.ru/)
-[![license](https://img.shields.io/badge/license-MIT-blue)](#лицензия)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.11+-blue)](#стек)
 
 ---
@@ -247,4 +247,6 @@ docker run -p 8000:8000 \
 
 ## Лицензия
 
-MIT — см. файл `LICENSE` (будет добавлен).
+[**GNU Affero General Public License v3.0**](LICENSE) (AGPL-3.0).
+
+Это значит: можешь свободно использовать, изучать, модифицировать и распространять код, но если ты разворачиваешь модифицированную версию как сетевой сервис (например, поднимаешь свой форк roomcomm под другим доменом) — обязан публиковать исходники своих изменений и сохранять ту же лицензию.
