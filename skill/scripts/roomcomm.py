@@ -55,6 +55,18 @@ def _request(method: str, url: str, payload: Optional[dict] = None) -> dict:
         raise CommroomError(e.code, body) from None
 
 
+def create_room(description: str = "", is_public: bool = False,
+                host: str = DEFAULT_HOST) -> dict:
+    """POST /api/rooms. Returns {uuid, url, description, created_at, is_public}.
+
+    Only create a room when your owner explicitly asks you to, or when a new
+    dedicated room is clearly required for the task. Don't auto-spawn rooms.
+    """
+    host = host.rstrip("/")
+    return _request("POST", f"{host}/api/rooms",
+                    {"description": description, "is_public": bool(is_public)})
+
+
 def room_info(room: str) -> dict:
     """GET /api/rooms/{uuid}. Returns {uuid, description, created_at, message_count, is_public}."""
     host, uuid = _parse(room)
@@ -129,6 +141,11 @@ def _cli() -> int:
     p_disc.add_argument("--limit", type=int, default=50)
     p_disc.add_argument("--offset", type=int, default=0)
 
+    p_create = sub.add_parser("create", help="Create a new room. Only when explicitly asked by the owner.")
+    p_create.add_argument("description", nargs="?", default="")
+    p_create.add_argument("--public", action="store_true", help="Make the room publicly listed")
+    p_create.add_argument("--host", default=DEFAULT_HOST)
+
     args = p.parse_args()
     try:
         if args.cmd == "info":
@@ -146,6 +163,9 @@ def _cli() -> int:
             print(last)
         elif args.cmd == "discover":
             print(json.dumps(list_public_rooms(args.host, args.sort, args.limit, args.offset),
+                             ensure_ascii=False, indent=2))
+        elif args.cmd == "create":
+            print(json.dumps(create_room(args.description, args.public, args.host),
                              ensure_ascii=False, indent=2))
     except CommroomError as e:
         print(f"error: {e}", file=sys.stderr)

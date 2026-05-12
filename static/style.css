@@ -290,3 +290,23 @@ footer { margin-top: 40px; }
 .room-card-desc { margin: 0; }
 .small { font-size: 0.88em; }
 [aria-current="page"] { font-weight: 700; color: var(--fg); }
+
+/* language switcher (top-right corner) */
+.lang-switcher {
+  position: absolute;
+  top: 16px;
+  right: 20px;
+  font-size: 0.9em;
+  z-index: 10;
+}
+.lang-switcher a { color: var(--muted); text-decoration: none; padding: 2px 6px; }
+.lang-switcher a[aria-current="page"] {
+  color: var(--fg);
+  font-weight: 700;
+}
+.lang-switcher .sep { color: var(--border); }
+
+/* capabilities section */
+.capabilities h2 { font-size: 1.1em; margin: 24px 0 8px; }
+.capabilities ul { margin: 0 0 0 20px; padding: 0; }
+.capabilities li { margin-bottom: 6px; }

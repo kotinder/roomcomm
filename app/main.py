@@ -1,8 +1,11 @@
 import os
 import secrets
+import time
 import uuid as uuid_lib
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -15,6 +18,64 @@ from sqlmodel import Session, delete, select, func
 
 ADMIN_TOKEN = os.environ.get("ROOMCOMM_ADMIN_TOKEN", "")
 
+# In-memory rate limit for POST /api/rooms: max 10 creations per hour per IP.
+# Resets on container restart — that's acceptable for MVP, the goal is to stop
+# obviously broken/abusive auto-spawners, not high-determination attackers.
+ROOM_CREATE_LIMIT = 10
+ROOM_CREATE_WINDOW = 3600  # seconds
+_create_buckets: dict[str, deque] = defaultdict(deque)
+_create_lock = Lock()
+
+
+def _lang(request: Request) -> str:
+    return i18n.detect(
+        request.query_params.get("lang"),
+        request.cookies.get("lang"),
+        request.headers.get("accept-language"),
+    )
+
+
+def _apply_lang_cookie(request: Request, response):
+    """If ?lang= is in the query and valid, persist it in a cookie."""
+    q = request.query_params.get("lang", "").lower()
+    if q in i18n.SUPPORTED:
+        response.set_cookie(
+            "lang", q,
+            max_age=60 * 60 * 24 * 365,  # 1 year
+            samesite="lax",
+            httponly=False,
+            secure=request.url.scheme == "https",
+        )
+    return response
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        # take leftmost (original client), trust because nginx terminates TLS
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_create_rate(request: Request) -> None:
+    """Raise 429 if the IP has created too many rooms in the last hour."""
+    ip = _client_ip(request)
+    now = time.monotonic()
+    with _create_lock:
+        bucket = _create_buckets[ip]
+        cutoff = now - ROOM_CREATE_WINDOW
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= ROOM_CREATE_LIMIT:
+            retry_after = int(ROOM_CREATE_WINDOW - (now - bucket[0])) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many rooms created from this IP. Try again in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        bucket.append(now)
+
+from . import i18n
 from .database import engine, get_session, init_db
 from .models import Message, Room
 from .schemas import (
@@ -91,6 +152,7 @@ def create_room(
     request: Request,
     session: Session = Depends(get_session),
 ):
+    _check_create_rate(request)
     description = (payload.description or "").strip()
     if len(description) > 500:
         raise HTTPException(status_code=400, detail="description too long (max 500)")
@@ -230,7 +292,12 @@ def post_message(
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    return templates.TemplateResponse(request, "index.html", {})
+    lang = _lang(request)
+    resp = templates.TemplateResponse(
+        request, "index.html",
+        {"lang": lang, "t": i18n.t(lang)},
+    )
+    return _apply_lang_cookie(request, resp)
 
 
 @app.get("/rooms", response_class=HTMLResponse)
@@ -241,11 +308,13 @@ def public_rooms_page(
 ):
     """Server-rendered public listing — same data as GET /api/rooms but as HTML."""
     page = list_public_rooms(request, sort=sort, limit=200, offset=0, session=session)
-    return templates.TemplateResponse(
-        request,
-        "rooms.html",
-        {"rooms": page.rooms, "total": page.total, "sort": sort},
+    lang = _lang(request)
+    resp = templates.TemplateResponse(
+        request, "rooms.html",
+        {"rooms": page.rooms, "total": page.total, "sort": sort,
+         "lang": lang, "t": i18n.t(lang)},
     )
+    return _apply_lang_cookie(request, resp)
 
 
 def _wants_markdown(request: Request) -> bool:
@@ -271,29 +340,33 @@ def _render_room_agent_md(request: Request, room: Optional[Room], room_uuid: str
 
 @app.get("/{room_uuid}", response_class=HTMLResponse)
 def room_page(room_uuid: str, request: Request, session: Session = Depends(get_session)):
+    lang = _lang(request)
+    t = i18n.t(lang)
     try:
         room_uuid = str(uuid_lib.UUID(room_uuid))
     except (ValueError, AttributeError, TypeError):
         if _wants_markdown(request):
             return PlainTextResponse("# Room not found\n\nNo such room.\n",
                                      status_code=404, media_type="text/markdown; charset=utf-8")
-        return templates.TemplateResponse(
+        resp = templates.TemplateResponse(
             request,
             "room.html",
-            {"room": None, "messages": [], "not_found": True},
+            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t},
             status_code=404,
         )
+        return _apply_lang_cookie(request, resp)
     room = session.get(Room, room_uuid)
     if room is None:
         if _wants_markdown(request):
             return PlainTextResponse("# Room not found\n\nNo such room.\n",
                                      status_code=404, media_type="text/markdown; charset=utf-8")
-        return templates.TemplateResponse(
+        resp = templates.TemplateResponse(
             request,
             "room.html",
-            {"room": None, "messages": [], "not_found": True},
+            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t},
             status_code=404,
         )
+        return _apply_lang_cookie(request, resp)
 
     if _wants_markdown(request):
         return PlainTextResponse(
@@ -305,7 +378,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         select(Message).where(Message.room_uuid == room_uuid).order_by(Message.id.asc())
     ).all()
     agent_md = _render_room_agent_md(request, room, room_uuid)
-    return templates.TemplateResponse(
+    resp = templates.TemplateResponse(
         request,
         "room.html",
         {
@@ -314,8 +387,11 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
             "not_found": False,
             "short_uuid": room.uuid[:8],
             "agent_md": agent_md,
+            "lang": lang,
+            "t": t,
         },
     )
+    return _apply_lang_cookie(request, resp)
 
 
 # ---------- Admin ----------
