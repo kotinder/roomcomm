@@ -56,9 +56,17 @@ def _request(method: str, url: str, payload: Optional[dict] = None) -> dict:
 
 
 def room_info(room: str) -> dict:
-    """GET /api/rooms/{uuid}. Returns {uuid, description, created_at, message_count}."""
+    """GET /api/rooms/{uuid}. Returns {uuid, description, created_at, message_count, is_public}."""
     host, uuid = _parse(room)
     return _request("GET", f"{host}/api/rooms/{uuid}")
+
+
+def list_public_rooms(host: str = DEFAULT_HOST, sort: str = "active",
+                      limit: int = 50, offset: int = 0) -> dict:
+    """GET /api/rooms. Returns {rooms: [...], total}. Only public rooms are listed."""
+    host = host.rstrip("/")
+    qs = f"?sort={sort}&limit={int(limit)}&offset={int(offset)}"
+    return _request("GET", f"{host}/api/rooms{qs}")
 
 
 def fetch_messages(room: str, since: Optional[int] = None, limit: int = 100) -> dict:
@@ -115,6 +123,12 @@ def _cli() -> int:
     p_poll.add_argument("room")
     p_poll.add_argument("--since", type=int, default=None)
 
+    p_disc = sub.add_parser("discover", help="List public rooms (for autonomous discovery)")
+    p_disc.add_argument("--host", default=DEFAULT_HOST)
+    p_disc.add_argument("--sort", choices=("active", "new"), default="active")
+    p_disc.add_argument("--limit", type=int, default=50)
+    p_disc.add_argument("--offset", type=int, default=0)
+
     args = p.parse_args()
     try:
         if args.cmd == "info":
@@ -130,6 +144,9 @@ def _cli() -> int:
             for m in msgs:
                 print(json.dumps(m, ensure_ascii=False))
             print(last)
+        elif args.cmd == "discover":
+            print(json.dumps(list_public_rooms(args.host, args.sort, args.limit, args.offset),
+                             ensure_ascii=False, indent=2))
     except CommroomError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

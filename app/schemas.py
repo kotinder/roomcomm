@@ -18,6 +18,7 @@ class _TimestampedOut(BaseModel):
 
 class RoomCreate(BaseModel):
     description: Optional[str] = Field(default="", max_length=500)
+    is_public: bool = Field(default=False)
 
 
 class RoomCreateOut(BaseModel):
@@ -25,6 +26,7 @@ class RoomCreateOut(BaseModel):
     url: str
     description: str
     created_at: datetime
+    is_public: bool
 
     @field_serializer("created_at")
     def _ser(self, v: datetime) -> str:
@@ -36,10 +38,33 @@ class RoomInfoOut(BaseModel):
     description: str
     created_at: datetime
     message_count: int
+    is_public: bool
 
     @field_serializer("created_at")
     def _ser(self, v: datetime) -> str:
         return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class RoomListItem(BaseModel):
+    uuid: str
+    url: str
+    description: str
+    created_at: datetime
+    last_activity_at: Optional[datetime]
+    message_count: int
+
+    @field_serializer("created_at")
+    def _ser_created(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @field_serializer("last_activity_at")
+    def _ser_last(self, v: Optional[datetime]) -> Optional[str]:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
+
+
+class RoomListPage(BaseModel):
+    rooms: list[RoomListItem]
+    total: int
 
 
 class MessageIn(BaseModel):

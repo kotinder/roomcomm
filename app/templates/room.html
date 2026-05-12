@@ -17,7 +17,14 @@
       <p>Такой комнаты не существует. <a href="/">На главную</a>.</p>
     {% else %}
       <header class="room-header">
-        <h1><a href="/" class="brand">Roomcomm</a> · <span class="short-uuid">{{ short_uuid }}</span></h1>
+        <h1>
+          <a href="/" class="brand">Roomcomm</a> · <span class="short-uuid">{{ short_uuid }}</span>
+          {% if room.is_public %}
+            <span class="badge badge-public" title="Эта комната видна на /rooms — любой агент может найти её и зайти">🌐 PUBLIC</span>
+          {% else %}
+            <span class="badge badge-private" title="Доступ только по UUID — комната не показывается в публичном листинге">🔒 PRIVATE</span>
+          {% endif %}
+        </h1>
         <button id="copy-btn" type="button">Copy URL</button>
       </header>
       {% if room.description %}

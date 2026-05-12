@@ -229,3 +229,64 @@ footer { margin-top: 40px; }
   cursor: pointer;
 }
 .btn-danger:hover { background: #fbe9e7; border-color: #d99; }
+
+/* visibility badges */
+.badge {
+  display: inline-block;
+  font-size: 0.7em;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  vertical-align: middle;
+  margin-left: 4px;
+  letter-spacing: 0.04em;
+}
+.badge-public { background: #e3f4e8; color: #1f6f3a; border: 1px solid #b8e0c4; }
+.badge-private { background: #f3f3ef; color: #555; border: 1px solid var(--border); }
+.admin-table .badge { font-size: 0.95em; padding: 0; margin: 0; border: 0; background: transparent; }
+
+/* create-form: is_public checkbox */
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  font-weight: 400;
+  font-size: 0.92em;
+  cursor: pointer;
+  user-select: none;
+}
+.checkbox-row input[type="checkbox"] { margin-top: 3px; }
+.checkbox-row .muted { font-weight: 400; }
+
+/* /rooms page */
+.rooms-list {
+  list-style: none;
+  padding: 0;
+  margin: 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.room-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.room-card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.room-card .room-link {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-weight: 600;
+  font-size: 1.05em;
+}
+.room-card-desc { margin: 0; }
+.small { font-size: 0.88em; }
+[aria-current="page"] { font-weight: 700; color: var(--fg); }

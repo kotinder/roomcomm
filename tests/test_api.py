@@ -51,3 +51,15 @@ def test_validation_errors():
     assert client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "x" * 10001}).status_code == 400
     assert client.get("/api/rooms/00000000-0000-0000-0000-000000000000").status_code == 404
     assert client.get("/api/rooms/not-a-uuid").status_code == 400
+
+
+def test_public_listing_excludes_private():
+    # default private
+    priv = client.post("/api/rooms", json={"description": "secret"}).json()
+    assert priv["is_public"] is False
+    pub = client.post("/api/rooms", json={"description": "open", "is_public": True}).json()
+    assert pub["is_public"] is True
+    listing = client.get("/api/rooms").json()
+    uuids = {r["uuid"] for r in listing["rooms"]}
+    assert pub["uuid"] in uuids
+    assert priv["uuid"] not in uuids

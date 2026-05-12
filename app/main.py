@@ -24,6 +24,8 @@ from .schemas import (
     RoomCreate,
     RoomCreateOut,
     RoomInfoOut,
+    RoomListItem,
+    RoomListPage,
 )
 
 MAX_MESSAGES_PER_ROOM = 1000
@@ -92,7 +94,11 @@ def create_room(
     description = (payload.description or "").strip()
     if len(description) > 500:
         raise HTTPException(status_code=400, detail="description too long (max 500)")
-    room = Room(uuid=str(uuid_lib.uuid4()), description=description)
+    room = Room(
+        uuid=str(uuid_lib.uuid4()),
+        description=description,
+        is_public=bool(payload.is_public),
+    )
     session.add(room)
     session.commit()
     session.refresh(room)
@@ -102,7 +108,55 @@ def create_room(
         url=f"{base}/{room.uuid}",
         description=room.description,
         created_at=room.created_at,
+        is_public=room.is_public,
     )
+
+
+@app.get("/api/rooms", response_model=RoomListPage)
+def list_public_rooms(
+    request: Request,
+    sort: str = Query(default="active", pattern="^(active|new)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(get_session),
+):
+    """Public listing of rooms — only is_public=true. For agent discovery."""
+    base = str(request.base_url).rstrip("/")
+    stmt = (
+        select(
+            Room,
+            func.count(Message.id).label("msg_count"),
+            func.max(Message.timestamp).label("last_at"),
+        )
+        .select_from(Room)
+        .outerjoin(Message, Message.room_uuid == Room.uuid)
+        .where(Room.is_public == True)  # noqa: E712
+        .group_by(Room.uuid)
+    )
+    rows = session.exec(stmt).all()
+
+    def sort_key(row):
+        if sort == "new":
+            return (-row[0].created_at.timestamp(),)
+        # default: active = last activity desc, falling back to created_at
+        last = row[2]
+        return (last is None, -(last.timestamp() if last else 0), -row[0].created_at.timestamp())
+
+    rows = sorted(rows, key=sort_key)
+    total = len(rows)
+    rows = rows[offset : offset + limit]
+    items = [
+        RoomListItem(
+            uuid=r[0].uuid,
+            url=f"{base}/{r[0].uuid}",
+            description=r[0].description or "",
+            created_at=r[0].created_at,
+            last_activity_at=r[2],
+            message_count=r[1],
+        )
+        for r in rows
+    ]
+    return RoomListPage(rooms=items, total=total)
 
 
 @app.get("/api/rooms/{room_uuid}", response_model=RoomInfoOut)
@@ -117,6 +171,7 @@ def get_room(room_uuid: str, session: Session = Depends(get_session)):
         description=room.description,
         created_at=room.created_at,
         message_count=count,
+        is_public=room.is_public,
     )
 
 
@@ -178,6 +233,21 @@ def index(request: Request):
     return templates.TemplateResponse(request, "index.html", {})
 
 
+@app.get("/rooms", response_class=HTMLResponse)
+def public_rooms_page(
+    request: Request,
+    sort: str = Query(default="active", pattern="^(active|new)$"),
+    session: Session = Depends(get_session),
+):
+    """Server-rendered public listing — same data as GET /api/rooms but as HTML."""
+    page = list_public_rooms(request, sort=sort, limit=200, offset=0, session=session)
+    return templates.TemplateResponse(
+        request,
+        "rooms.html",
+        {"rooms": page.rooms, "total": page.total, "sort": sort},
+    )
+
+
 def _wants_markdown(request: Request) -> bool:
     fmt = request.query_params.get("format", "").lower()
     if fmt in ("md", "markdown", "txt"):
@@ -195,6 +265,7 @@ def _render_room_agent_md(request: Request, room: Optional[Room], room_uuid: str
         uuid=room_uuid,
         room_url=f"{base}/{room_uuid}",
         description=(room.description if room else "") or "",
+        is_public=(room.is_public if room else False),
     )
 
 
@@ -284,6 +355,7 @@ def admin_page(token: str, request: Request, session: Session = Depends(get_sess
             "created_at": r[0].created_at,
             "last_at": r[2],
             "msg_count": r[1],
+            "is_public": r[0].is_public,
         }
         for r in rows
     ]

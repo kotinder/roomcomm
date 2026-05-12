@@ -24,6 +24,21 @@ def _set_sqlite_pragma(dbapi_connection, _):
 def init_db() -> None:
     from . import models  # noqa: F401
     SQLModel.metadata.create_all(engine)
+    _migrate_sqlite()
+
+
+def _migrate_sqlite() -> None:
+    """Forward-only schema migrations for SQLite. Idempotent."""
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(rooms)").fetchall()}
+        if "is_public" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 0"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_rooms_is_public ON rooms(is_public)"
+            )
+            conn.commit()
 
 
 def get_session():

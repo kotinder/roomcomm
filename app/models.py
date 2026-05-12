@@ -13,6 +13,7 @@ class Room(SQLModel, table=True):
     uuid: str = Field(primary_key=True)
     description: str = Field(default="", max_length=500)
     created_at: datetime = Field(default_factory=utcnow)
+    is_public: bool = Field(default=False, index=True)
 
 
 class Message(SQLModel, table=True):

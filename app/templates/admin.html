@@ -19,6 +19,7 @@
       <thead>
         <tr>
           <th>UUID</th>
+          <th>Vis</th>
           <th>Description</th>
           <th>Created</th>
           <th>Last activity</th>
@@ -30,6 +31,7 @@
         {% for r in items %}
         <tr>
           <td class="mono"><a href="/{{ r.uuid }}" target="_blank">{{ r.short_uuid }}</a></td>
+          <td>{% if r.is_public %}<span class="badge badge-public" title="public">🌐</span>{% else %}<span class="badge badge-private" title="private">🔒</span>{% endif %}</td>
           <td>{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
           <td class="mono small">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
           <td class="mono small">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
