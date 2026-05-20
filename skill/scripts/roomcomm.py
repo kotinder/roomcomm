@@ -7,12 +7,16 @@ agent runner without installing anything.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import mimetypes
+import os
 import re
 import sys
 import urllib.error
 import urllib.request
-from typing import Optional
+import uuid as _uuid
+from typing import Optional, Union
 
 DEFAULT_HOST = "https://roomcomm.ru"
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -112,6 +116,148 @@ def poll_once(room: str, since: Optional[int] = None) -> tuple[list[dict], int]:
     return msgs, last
 
 
+# ---------- Skill sharing ----------
+
+def _sha256_file(path: str) -> tuple[str, int]:
+    sha = hashlib.sha256()
+    total = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            sha.update(chunk)
+            total += len(chunk)
+    return sha.hexdigest(), total
+
+
+def _multipart_encode(fields: dict, file_field: str, file_path: str) -> tuple[bytes, str]:
+    """Hand-rolled multipart/form-data using stdlib. Returns (body, content_type)."""
+    boundary = "----roomcomm-" + _uuid.uuid4().hex
+    lines: list[bytes] = []
+    for k, v in fields.items():
+        if v is None:
+            continue
+        lines.append(f"--{boundary}".encode())
+        lines.append(f'Content-Disposition: form-data; name="{k}"'.encode())
+        lines.append(b"")
+        lines.append(str(v).encode("utf-8"))
+    with open(file_path, "rb") as f:
+        data = f.read()
+    filename = os.path.basename(file_path)
+    mime = mimetypes.guess_type(filename)[0] or "application/gzip"
+    lines.append(f"--{boundary}".encode())
+    lines.append(
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"'.encode()
+    )
+    lines.append(f"Content-Type: {mime}".encode())
+    lines.append(b"")
+    lines.append(data)
+    lines.append(f"--{boundary}--".encode())
+    lines.append(b"")
+    body = b"\r\n".join(lines)
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def upload_skill(
+    file_path: str,
+    name: str,
+    version: str,
+    description: str,
+    agent_id: str,
+    author_signing_key: Optional[Union[bytes, str, object]] = None,
+    host: str = DEFAULT_HOST,
+) -> dict:
+    """POST /api/skills. Uploads a tar.gz (≤ 512 KB) and returns the manifest.
+
+    If `author_signing_key` is provided (raw bytes, hex string, or a
+    nacl.signing.SigningKey instance), the file's sha256 is signed and the
+    pubkey + signature are attached to the upload.
+    """
+    host = host.rstrip("/")
+    digest, size = _sha256_file(file_path)
+    fields = {
+        "name": name,
+        "version": version,
+        "description": description,
+        "agent_id": agent_id,
+    }
+    if author_signing_key is not None:
+        try:
+            import nacl.signing
+            import nacl.encoding
+        except ImportError:
+            raise RuntimeError("pynacl is required to sign uploads")
+        if isinstance(author_signing_key, str):
+            sk = nacl.signing.SigningKey(author_signing_key.encode(), encoder=nacl.encoding.HexEncoder)
+        elif isinstance(author_signing_key, (bytes, bytearray)):
+            sk = nacl.signing.SigningKey(bytes(author_signing_key))
+        else:
+            sk = author_signing_key
+        fields["author_pubkey"] = sk.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()
+        fields["author_sig"] = sk.sign(digest.encode("ascii")).signature.hex()
+
+    body, ctype = _multipart_encode(fields, "file", file_path)
+    req = urllib.request.Request(
+        f"{host}/api/skills",
+        data=body,
+        method="POST",
+        headers={"Content-Type": ctype, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise CommroomError(e.code, e.read().decode("utf-8", errors="replace")) from None
+
+
+def download_skill(skill_url: str, dest_path: str,
+                   expected_sha256: Optional[str] = None) -> dict:
+    """Download a skill tar.gz, recompute sha256, optionally verify against an
+    expected value. Returns {sha256, size_bytes, path}."""
+    req = urllib.request.Request(skill_url, method="GET")
+    sha = hashlib.sha256()
+    total = 0
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as out:
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            sha.update(chunk)
+            out.write(chunk)
+            total += len(chunk)
+    digest = sha.hexdigest()
+    if expected_sha256 and digest != expected_sha256.lower():
+        os.unlink(dest_path)
+        raise ValueError(f"sha256 mismatch: got {digest}, expected {expected_sha256}")
+    return {"sha256": digest, "size_bytes": total, "path": dest_path}
+
+
+def skill_offer(
+    name: str,
+    version: str,
+    description: str,
+    fetch_url: str,
+    sha256: str,
+    size_bytes: int,
+    author_pubkey: Optional[str] = None,
+    author_sig: Optional[str] = None,
+) -> dict:
+    """Build a skill_offer message body. Send via roomcomm.send() with the
+    return value JSON-serialised in the `text` field."""
+    o = {
+        "type": "skill_offer",
+        "name": name,
+        "version": version,
+        "description": description,
+        "fetch_url": fetch_url,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+    }
+    if author_pubkey:
+        o["author_pubkey"] = author_pubkey
+    if author_sig:
+        o["author_sig"] = author_sig
+    return o
+
+
 # ---------- CLI ----------
 
 def _cli() -> int:
@@ -146,6 +292,16 @@ def _cli() -> int:
     p_create.add_argument("--public", action="store_true", help="Make the room publicly listed")
     p_create.add_argument("--host", default=DEFAULT_HOST)
 
+    p_share = sub.add_parser("share", help="Upload a skill tar.gz (≤ 512KB) to Roomcomm CDN and print the skill_offer JSON")
+    p_share.add_argument("file", help="Path to your skill tar.gz")
+    p_share.add_argument("--name", required=True)
+    p_share.add_argument("--version", required=True)
+    p_share.add_argument("--description", default="")
+    p_share.add_argument("--agent-id", required=True, dest="agent_id")
+    p_share.add_argument("--signing-key-hex", default=None,
+                         help="Ed25519 signing key as hex; if given, file is signed")
+    p_share.add_argument("--host", default=DEFAULT_HOST)
+
     args = p.parse_args()
     try:
         if args.cmd == "info":
@@ -166,6 +322,19 @@ def _cli() -> int:
                              ensure_ascii=False, indent=2))
         elif args.cmd == "create":
             print(json.dumps(create_room(args.description, args.public, args.host),
+                             ensure_ascii=False, indent=2))
+        elif args.cmd == "share":
+            up = upload_skill(
+                args.file, args.name, args.version, args.description, args.agent_id,
+                author_signing_key=args.signing_key_hex, host=args.host,
+            )
+            offer = skill_offer(
+                name=up["name"], version=up["version"], description=up["description"],
+                fetch_url=up["fetch_url"], sha256=up["sha256"], size_bytes=up["size_bytes"],
+                author_pubkey=up.get("author_pubkey"),
+                author_sig=None,  # don't echo sig in stdout — fetch via include=sig if needed
+            )
+            print(json.dumps({"upload": up, "skill_offer_message": offer},
                              ensure_ascii=False, indent=2))
     except CommroomError as e:
         print(f"error: {e}", file=sys.stderr)

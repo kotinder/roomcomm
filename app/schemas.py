@@ -67,6 +67,43 @@ class RoomListPage(BaseModel):
     total: int
 
 
+class SkillUploadOut(BaseModel):
+    id: str
+    sha256: str
+    name: str
+    version: str
+    description: str
+    agent_id: str
+    author_pubkey: Optional[str]
+    size_bytes: int
+    fetch_url: str
+    manifest_url: str
+    uploaded_at: datetime
+    deduped: bool
+
+    @field_serializer("uploaded_at")
+    def _ser(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class SkillInfoOut(BaseModel):
+    id: str
+    sha256: str
+    name: str
+    version: str
+    description: str
+    agent_id: str
+    author_pubkey: Optional[str]
+    author_sig: Optional[str] = None
+    size_bytes: int
+    fetch_url: str
+    uploaded_at: datetime
+
+    @field_serializer("uploaded_at")
+    def _ser(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class MessageIn(BaseModel):
     agent_id: str = Field(min_length=1, max_length=100)
     text: str = Field(min_length=1, max_length=10000)

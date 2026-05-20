@@ -1,5 +1,9 @@
+import hashlib
+import io
 import os
+import re
 import secrets
+import tarfile
 import time
 import uuid as uuid_lib
 from collections import defaultdict, deque
@@ -8,7 +12,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -25,6 +29,15 @@ ROOM_CREATE_LIMIT = 10
 ROOM_CREATE_WINDOW = 3600  # seconds
 _create_buckets: dict[str, deque] = defaultdict(deque)
 _create_lock = Lock()
+
+# Skill upload limits — same shape as room create, independent bucket.
+SKILL_UPLOAD_LIMIT = 10
+SKILL_UPLOAD_WINDOW = 3600
+SKILL_MAX_BYTES = 512 * 1024
+_skill_buckets: dict[str, deque] = defaultdict(deque)
+_skill_lock = Lock()
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_HEX128_RE = re.compile(r"^[0-9a-fA-F]{128}$")
 
 
 def _lang(request: Request) -> str:
@@ -75,9 +88,40 @@ def _check_create_rate(request: Request) -> None:
             )
         bucket.append(now)
 
+
+def _check_skill_rate(request: Request) -> None:
+    """Raise 429 if the IP has uploaded too many skills in the last hour."""
+    ip = _client_ip(request)
+    now = time.monotonic()
+    with _skill_lock:
+        bucket = _skill_buckets[ip]
+        cutoff = now - SKILL_UPLOAD_WINDOW
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= SKILL_UPLOAD_LIMIT:
+            retry_after = int(SKILL_UPLOAD_WINDOW - (now - bucket[0])) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many skill uploads from this IP. Try again in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        bucket.append(now)
+
+
+def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
+    """Returns True if signature is valid; False on any error."""
+    try:
+        import nacl.encoding
+        import nacl.signing
+        verify_key = nacl.signing.VerifyKey(pubkey_hex.encode(), encoder=nacl.encoding.HexEncoder)
+        verify_key.verify(message, bytes.fromhex(sig_hex))
+        return True
+    except Exception:
+        return False
+
 from . import i18n
-from .database import engine, get_session, init_db
-from .models import Message, Room
+from .database import SKILLS_DIR, engine, get_session, init_db
+from .models import Message, Room, Skill
 from .schemas import (
     MessageIn,
     MessageOut,
@@ -87,6 +131,8 @@ from .schemas import (
     RoomInfoOut,
     RoomListItem,
     RoomListPage,
+    SkillInfoOut,
+    SkillUploadOut,
 )
 
 MAX_MESSAGES_PER_ROOM = 1000
@@ -286,6 +332,194 @@ def post_message(
     session.commit()
     session.refresh(msg)
     return MessageOut(id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp)
+
+
+# ---------- Skills (CDN) ----------
+
+def _skill_urls(request: Request, skill: Skill) -> tuple[str, str]:
+    base = str(request.base_url).rstrip("/")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", skill.name) or "skill"
+    safe_ver = re.sub(r"[^A-Za-z0-9._-]", "_", skill.version) or "v"
+    fetch_url = f"{base}/api/skills/{skill.id}/{safe_name}-{safe_ver}.tar.gz"
+    manifest_url = f"{base}/api/skills/{skill.id}"
+    return fetch_url, manifest_url
+
+
+def _skill_to_info(request: Request, skill: Skill, include_sig: bool) -> SkillInfoOut:
+    fetch_url, _ = _skill_urls(request, skill)
+    return SkillInfoOut(
+        id=skill.id,
+        sha256=skill.sha256,
+        name=skill.name,
+        version=skill.version,
+        description=skill.description,
+        agent_id=skill.agent_id,
+        author_pubkey=skill.author_pubkey,
+        author_sig=skill.author_sig if include_sig else None,
+        size_bytes=skill.size_bytes,
+        fetch_url=fetch_url,
+        uploaded_at=skill.uploaded_at,
+    )
+
+
+@app.post("/api/skills", response_model=SkillUploadOut, status_code=201)
+async def upload_skill(
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form(..., min_length=1, max_length=100),
+    version: str = Form(..., min_length=1, max_length=50),
+    description: str = Form("", max_length=500),
+    agent_id: str = Form(..., min_length=1, max_length=100),
+    author_pubkey: Optional[str] = Form(None),
+    author_sig: Optional[str] = Form(None),
+    session: Session = Depends(get_session),
+):
+    """Upload a skill bundle (.tar.gz, ≤ 512 KB). Returns the manifest.
+
+    Rate-limited to 10 uploads/hour per IP. Dedup by sha256: re-uploading the
+    same bytes returns the existing record with `deduped: true`.
+
+    Author signature (Ed25519 over the file's sha256 hex) is optional but
+    strongly recommended — pass both `author_pubkey` and `author_sig` together.
+    """
+    _check_skill_rate(request)
+
+    # 1. Signature pair validation
+    if (author_pubkey is None) != (author_sig is None):
+        raise HTTPException(status_code=400,
+                            detail="provide both author_pubkey and author_sig, or neither")
+    if author_pubkey is not None and not _HEX64_RE.match(author_pubkey):
+        raise HTTPException(status_code=400, detail="author_pubkey must be 64 hex chars")
+    if author_sig is not None and not _HEX128_RE.match(author_sig):
+        raise HTTPException(status_code=400, detail="author_sig must be 128 hex chars")
+
+    # 2. Stream read with size cap + sha256
+    sha = hashlib.sha256()
+    chunks: list[bytes] = []
+    total = 0
+    CHUNK = 64 * 1024
+    while True:
+        chunk = await file.read(CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > SKILL_MAX_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"file too large: {total} bytes, limit {SKILL_MAX_BYTES}",
+            )
+        sha.update(chunk)
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    digest = sha.hexdigest()
+
+    if total == 0:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    # 3. Verify signature if present
+    if author_pubkey and author_sig:
+        if not _verify_ed25519_sig(author_pubkey, digest.encode("ascii"), author_sig):
+            raise HTTPException(status_code=400,
+                                detail="author_sig does not verify against author_pubkey and sha256")
+
+    # 4. Validate tar.gz contents (must contain a SKILL.md somewhere)
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+        names = tf.getnames()
+        tf.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"not a valid tar.gz: {e}")
+    has_skill_md = any(n.endswith("SKILL.md") for n in names)
+    if not has_skill_md:
+        raise HTTPException(status_code=400,
+                            detail="tar.gz must contain a SKILL.md at any depth")
+
+    # 5. Dedup by sha256
+    existing = session.exec(select(Skill).where(Skill.sha256 == digest)).first()
+    if existing:
+        fetch_url, manifest_url = _skill_urls(request, existing)
+        return SkillUploadOut(
+            id=existing.id,
+            sha256=existing.sha256,
+            name=existing.name,
+            version=existing.version,
+            description=existing.description,
+            agent_id=existing.agent_id,
+            author_pubkey=existing.author_pubkey,
+            size_bytes=existing.size_bytes,
+            fetch_url=fetch_url,
+            manifest_url=manifest_url,
+            uploaded_at=existing.uploaded_at,
+            deduped=True,
+        )
+
+    # 6. Persist file + DB row
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    storage_path = SKILLS_DIR / f"{digest}.tar.gz"
+    storage_path.write_bytes(data)
+
+    skill = Skill(
+        id=str(uuid_lib.uuid4()),
+        sha256=digest,
+        name=name.strip(),
+        version=version.strip(),
+        description=(description or "").strip(),
+        agent_id=agent_id.strip(),
+        author_pubkey=author_pubkey,
+        author_sig=author_sig,
+        size_bytes=total,
+    )
+    session.add(skill)
+    session.commit()
+    session.refresh(skill)
+
+    fetch_url, manifest_url = _skill_urls(request, skill)
+    response = SkillUploadOut(
+        id=skill.id,
+        sha256=skill.sha256,
+        name=skill.name,
+        version=skill.version,
+        description=skill.description,
+        agent_id=skill.agent_id,
+        author_pubkey=skill.author_pubkey,
+        size_bytes=skill.size_bytes,
+        fetch_url=fetch_url,
+        manifest_url=manifest_url,
+        uploaded_at=skill.uploaded_at,
+        deduped=False,
+    )
+    return JSONResponse(content=response.model_dump(mode="json"), status_code=201)
+
+
+@app.get("/api/skills/{skill_id}", response_model=SkillInfoOut)
+def get_skill_manifest(
+    skill_id: str,
+    request: Request,
+    include: str = Query(default=""),
+    session: Session = Depends(get_session),
+):
+    skill = session.get(Skill, skill_id)
+    if skill is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+    include_sig = "sig" in include.split(",")
+    return _skill_to_info(request, skill, include_sig=include_sig)
+
+
+@app.get("/api/skills/{skill_id}/{filename}")
+def download_skill(
+    skill_id: str,
+    filename: str,
+    session: Session = Depends(get_session),
+):
+    """Redirects to nginx-served CDN path. The filename in the URL is
+    cosmetic — actual file is named after sha256."""
+    skill = session.get(Skill, skill_id)
+    if skill is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+    return RedirectResponse(
+        url=f"/skills-cdn/{skill.sha256}.tar.gz",
+        status_code=307,
+    )
 
 
 # ---------- HTML ----------

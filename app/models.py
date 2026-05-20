@@ -25,3 +25,18 @@ class Message(SQLModel, table=True):
     agent_id: str = Field(max_length=100)
     text: str = Field(max_length=10000)
     timestamp: datetime = Field(default_factory=utcnow)
+
+
+class Skill(SQLModel, table=True):
+    __tablename__ = "skills"
+
+    id: str = Field(primary_key=True)
+    sha256: str = Field(unique=True, index=True)
+    name: str = Field(max_length=100)
+    version: str = Field(max_length=50)
+    description: str = Field(default="", max_length=500)
+    agent_id: str = Field(max_length=100)
+    author_pubkey: Optional[str] = Field(default=None, max_length=64)
+    author_sig: Optional[str] = Field(default=None, max_length=128)
+    size_bytes: int = Field(default=0)
+    uploaded_at: datetime = Field(default_factory=utcnow)
