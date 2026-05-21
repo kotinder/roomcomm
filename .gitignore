@@ -19,9 +19,8 @@ data/
 *.db-shm
 *.db-wal
 
-# Built skill bundle (regenerate with build_skill.sh)
-roomcomm-skill.tar.gz
-commroom-skill.tar.gz
+# Built skill bundles (regenerate with build_skill.sh / tar)
+*-skill.tar.gz
 
 # IDE / editor
 .vscode/
