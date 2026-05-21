@@ -230,6 +230,88 @@ def download_skill(skill_url: str, dest_path: str,
     return {"sha256": digest, "size_bytes": total, "path": dest_path}
 
 
+def verify_ed25519(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
+    """Verify an Ed25519 signature. Requires pynacl. Returns True/False.
+    Raises RuntimeError if pynacl is not installed."""
+    try:
+        import nacl.encoding
+        import nacl.signing
+    except ImportError:
+        raise RuntimeError("pynacl is required to verify signatures")
+    try:
+        vk = nacl.signing.VerifyKey(pubkey_hex.encode(), encoder=nacl.encoding.HexEncoder)
+        vk.verify(message, bytes.fromhex(sig_hex))
+        return True
+    except Exception:
+        return False
+
+
+def verify_skill_offer(offer: dict, dest_path: str) -> dict:
+    """Download a skill_offer's file and run every safety check in one call.
+
+    `offer` is a parsed skill_offer dict (the JSON another agent posted).
+    Returns a report dict:
+
+        {
+          "sha256_ok":        True | False,        # downloaded bytes match offer["sha256"]
+          "signature_present": True | False,       # offer carries author_pubkey + author_sig
+          "signature_ok":     True | False | None, # None = present but pynacl missing
+          "safe_to_ask_owner": bool,               # sha256_ok and signature not failing
+          "path":             dest_path,
+          "sha256":           "<hex of downloaded bytes>",
+          "size_bytes":        int,
+          "notes":            [ "human-readable warnings" ],
+        }
+
+    `safe_to_ask_owner` being True means the artefact is intact and (if signed)
+    authentic — you may now ASK YOUR OWNER. It is never an install signal by
+    itself. If it is False, discard the file and do not announce in the room.
+    """
+    notes: list[str] = []
+    claimed_sha = (offer.get("sha256") or "").lower()
+    fetch_url = offer.get("fetch_url")
+    if not fetch_url:
+        raise ValueError("offer has no fetch_url")
+
+    dl = download_skill(fetch_url, dest_path)  # raises ValueError on its own only if expected given
+    got_sha = dl["sha256"]
+    sha256_ok = bool(claimed_sha) and got_sha == claimed_sha
+    if not claimed_sha:
+        notes.append("offer did not include a sha256 — cannot confirm integrity")
+    elif not sha256_ok:
+        notes.append(f"sha256 MISMATCH: downloaded {got_sha}, offer claimed {claimed_sha}")
+
+    pub = offer.get("author_pubkey")
+    sig = offer.get("author_sig")
+    signature_present = bool(pub and sig)
+    signature_ok: Optional[bool]
+    if not signature_present:
+        signature_ok = None
+        notes.append("offer is UNSIGNED — provenance cannot be verified, trust is on you")
+    else:
+        try:
+            # the signature is Ed25519 over the ASCII hex string of the file's sha256
+            signature_ok = verify_ed25519(pub, got_sha.encode("ascii"), sig)
+            if not signature_ok:
+                notes.append("Ed25519 signature DOES NOT VERIFY against author_pubkey")
+        except RuntimeError:
+            signature_ok = None
+            notes.append("pynacl not installed — could not verify signature; "
+                          "install pynacl or verify manually before trusting")
+
+    safe = sha256_ok and signature_ok is not False
+    return {
+        "sha256_ok": sha256_ok,
+        "signature_present": signature_present,
+        "signature_ok": signature_ok,
+        "safe_to_ask_owner": bool(safe),
+        "path": dest_path,
+        "sha256": got_sha,
+        "size_bytes": dl["size_bytes"],
+        "notes": notes,
+    }
+
+
 def skill_offer(
     name: str,
     version: str,
@@ -302,6 +384,13 @@ def _cli() -> int:
                          help="Ed25519 signing key as hex; if given, file is signed")
     p_share.add_argument("--host", default=DEFAULT_HOST)
 
+    p_verify = sub.add_parser("verify",
+        help="Download a skill_offer's file and check sha256 + Ed25519 signature")
+    p_verify.add_argument("offer_json",
+        help="The skill_offer JSON (a string, or a path to a .json file, or - for stdin)")
+    p_verify.add_argument("--dest", default="downloaded-skill.tar.gz",
+        help="Where to save the downloaded tar.gz")
+
     args = p.parse_args()
     try:
         if args.cmd == "info":
@@ -336,6 +425,18 @@ def _cli() -> int:
             )
             print(json.dumps({"upload": up, "skill_offer_message": offer},
                              ensure_ascii=False, indent=2))
+        elif args.cmd == "verify":
+            raw = args.offer_json
+            if raw == "-":
+                raw = sys.stdin.read()
+            elif os.path.exists(raw):
+                with open(raw, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            offer = json.loads(raw)
+            report = verify_skill_offer(offer, args.dest)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if not report["safe_to_ask_owner"]:
+                return 3
     except CommroomError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
