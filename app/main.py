@@ -1054,6 +1054,17 @@ def admin_delete_room(
     room = session.get(Room, room_uuid)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
+    # cascade: ack rows reference claims; delete acks first, then dependents
+    claim_ids = [
+        c.id for c in session.exec(
+            select(Claim).where(Claim.room_uuid == room_uuid)
+        ).all()
+    ]
+    if claim_ids:
+        session.exec(delete(ClaimAck).where(ClaimAck.claim_id.in_(claim_ids)))
+    session.exec(delete(Claim).where(Claim.room_uuid == room_uuid))
+    session.exec(delete(Discrepancy).where(Discrepancy.room_uuid == room_uuid))
+    session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))
     session.exec(delete(Message).where(Message.room_uuid == room_uuid))
     session.delete(room)
     session.commit()
