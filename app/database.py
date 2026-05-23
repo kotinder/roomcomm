@@ -41,6 +41,11 @@ def _migrate_sqlite() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_rooms_is_public ON rooms(is_public)"
             )
             conn.commit()
+        if "protocol_mode" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN protocol_mode VARCHAR(20) NOT NULL DEFAULT 'standard'"
+            )
+            conn.commit()
 
 
 def get_session():

@@ -21,6 +21,11 @@ def _override():
 fastapi_app.dependency_overrides[get_session] = _override
 client = TestClient(fastapi_app)
 
+# Bypass rate-limiter for tests — the suite creates many rooms in one process.
+import app.main as _main
+_main.ROOM_CREATE_LIMIT = 10_000
+_main.SKILL_UPLOAD_LIMIT = 10_000
+
 
 def _new_room():
     r = client.post("/api/rooms", json={"description": "test"})
@@ -199,3 +204,128 @@ def test_skill_signature_valid_and_invalid():
                         "application/gzip")},
     )
     assert r2.status_code == 400
+
+
+# ---------- Protocol / claims / arbiter ----------
+
+def test_room_protocol_mode_default_and_premium():
+    r = client.post("/api/rooms", json={"description": "x"})
+    assert r.json()["protocol_mode"] == "standard"
+    r2 = client.post("/api/rooms", json={"description": "y", "protocol_mode": "premium"})
+    assert r2.status_code == 201 and r2.json()["protocol_mode"] == "premium"
+
+
+def test_propose_and_ack_claim_promotes_to_agreed():
+    uid = _new_room()
+    # propose by alice
+    r = client.post(f"/api/rooms/{uid}/claims", json={
+        "type": "price", "value": "1000 USD", "proposed_by": "alice",
+    })
+    assert r.status_code == 201
+    claim_id = r.json()["id"]
+    assert r.json()["status"] == "proposed"
+    # ack by bob (a different agent) — should auto-promote to agreed
+    r2 = client.post(f"/api/rooms/{uid}/claims/{claim_id}/ack",
+                     json={"agent_id": "bob"})
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "agreed"
+
+
+def test_self_ack_does_not_promote():
+    uid = _new_room()
+    r = client.post(f"/api/rooms/{uid}/claims", json={
+        "type": "quantity", "value": "100 units", "proposed_by": "alice",
+    })
+    claim_id = r.json()["id"]
+    # alice acks her own claim — should remain proposed
+    r2 = client.post(f"/api/rooms/{uid}/claims/{claim_id}/ack",
+                     json={"agent_id": "alice"})
+    assert r2.json()["status"] == "proposed"
+
+
+def test_context_shape_and_hash():
+    uid = _new_room()
+    r = client.get(f"/api/rooms/{uid}/context")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) >= {"room_uuid", "agreed", "proposed", "discrepancies", "context_hash"}
+    # empty context hash is stable
+    h1 = body["context_hash"]
+    h2 = client.get(f"/api/rooms/{uid}/context").json()["context_hash"]
+    assert h1 == h2 and len(h1) == 64
+
+
+def test_handshake_requires_current_hash():
+    uid = _new_room()
+    # bogus hash
+    r = client.post(f"/api/rooms/{uid}/handshake", json={
+        "agent_id": "alice", "context_hash": "0" * 64,
+    })
+    # at this point context is empty → current hash is some specific value.
+    # if user gave wrong one, expect 409.
+    ctx_hash = client.get(f"/api/rooms/{uid}/context").json()["context_hash"]
+    if "0" * 64 != ctx_hash:
+        assert r.status_code == 409
+    # correct hash → 201
+    r2 = client.post(f"/api/rooms/{uid}/handshake", json={
+        "agent_id": "alice", "context_hash": ctx_hash,
+    })
+    assert r2.status_code == 201
+
+
+def test_refresh_disabled_without_llm_key(monkeypatch):
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "")
+    monkeypatch.setattr("app.llm.DEEPSEEK_API_KEY", "")
+    uid = _new_room()
+    r = client.post(f"/api/rooms/{uid}/context/refresh")
+    assert r.status_code == 503
+
+
+def test_refresh_with_mocked_llm(monkeypatch):
+    """Inject a fake extract_claims and verify claims+discrepancies are persisted."""
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake-key")
+
+    async def fake_extract(messages, agreed, proposed):
+        return {
+            "extracted": [
+                {"type": "price", "value": "5000 EUR",
+                 "source_msg_id": messages[-1]["id"] if messages else None,
+                 "quote": "we agree on 5000 EUR"},
+            ],
+            "discrepancies": [
+                {"description": "alice said 4000, bob said 5000",
+                 "severity": "high", "related_msg_id": None, "related_claim_id": None},
+            ],
+        }, "nvidia:test-model"
+
+    monkeypatch.setattr("app.llm.extract_claims", fake_extract)
+
+    uid = _new_room()
+    client.post(f"/api/rooms/{uid}/messages",
+                json={"agent_id": "alice", "text": "I propose 5000 EUR"})
+    r = client.post(f"/api/rooms/{uid}/context/refresh")
+    assert r.status_code == 200, r.text
+    assert r.json()["extracted"] == 1 and r.json()["discrepancies_found"] == 1
+    ctx = client.get(f"/api/rooms/{uid}/context").json()
+    assert len(ctx["proposed"]) == 1
+    assert ctx["proposed"][0]["proposed_by"] == "arbiter"
+    assert ctx["proposed"][0]["value"] == "5000 EUR"
+    assert len(ctx["discrepancies"]) == 1
+    assert ctx["discrepancies"][0]["severity"] == "high"
+
+
+def test_refresh_dedups_by_type_and_value(monkeypatch):
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake-key")
+    same = [{"type": "price", "value": "100 USD", "source_msg_id": None, "quote": None}]
+
+    async def fake_extract(messages, agreed, proposed):
+        return {"extracted": same, "discrepancies": []}, "test"
+
+    monkeypatch.setattr("app.llm.extract_claims", fake_extract)
+    uid = _new_room()
+    client.post(f"/api/rooms/{uid}/messages",
+                json={"agent_id": "x", "text": "stuff"})
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    ctx = client.get(f"/api/rooms/{uid}/context").json()
+    assert len(ctx["proposed"]) == 1  # second refresh deduped

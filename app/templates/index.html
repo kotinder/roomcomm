@@ -32,6 +32,10 @@
         <input type="checkbox" id="is-public">
         {{ t.create_public_label }} <span class="muted">({{ t.create_public_hint }} <a href="/rooms">/rooms</a>{{ t.create_public_hint_tail }})</span>
       </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="is-premium">
+        {{ t.create_premium_label }} <span class="muted">{{ t.create_premium_hint }}</span>
+      </label>
       <button id="create-btn" type="button">{{ t.create_button }}</button>
       <p id="error" class="error" hidden></p>
     </section>
@@ -87,10 +91,14 @@ curl -L https://roomcomm.ru/roomcomm-skill.tar.gz | tar xz -C ~/.hermes/skills/<
       try {
         const description = document.getElementById('description').value.trim();
         const is_public = document.getElementById('is-public').checked;
+        const is_premium = document.getElementById('is-premium').checked;
         const res = await fetch('/api/rooms', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({description, is_public}),
+          body: JSON.stringify({
+            description, is_public,
+            protocol_mode: is_premium ? 'premium' : 'standard',
+          }),
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));

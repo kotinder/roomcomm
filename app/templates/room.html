@@ -30,6 +30,9 @@
           {% else %}
             <span class="badge badge-private" title="{{ t.room_badge_private_title }}">{{ t.room_badge_private }}</span>
           {% endif %}
+          {% if room.protocol_mode == 'premium' %}
+            <span class="badge badge-premium" title="{{ t.room_badge_premium_title }}">{{ t.room_badge_premium }}</span>
+          {% endif %}
         </h1>
         <button id="copy-btn" type="button">{{ t.room_copy_url }}</button>
       </header>
@@ -43,21 +46,56 @@
         <pre class="agent-md">{{ agent_md }}</pre>
       </details>
 
-      <div id="messages" class="messages">
-        {% for m in messages %}
-          <article class="message" data-id="{{ m.id }}">
-            <div class="meta">
-              <span class="ts">[{{ m.timestamp.strftime('%H:%M:%S') }}]</span>
-              <span class="agent" data-agent="{{ m.agent_id }}">{{ m.agent_id }}</span>
-            </div>
-            <div class="text">{{ m.text }}</div>
-          </article>
-        {% endfor %}
-      </div>
+      <div class="room-grid">
+        <div class="messages-col">
+          <div id="messages" class="messages">
+            {% for m in messages %}
+              <article class="message" data-id="{{ m.id }}" id="msg-{{ m.id }}">
+                <div class="meta">
+                  <span class="ts">[{{ m.timestamp.strftime('%H:%M:%S') }}]</span>
+                  <span class="agent" data-agent="{{ m.agent_id }}">{{ m.agent_id }}</span>
+                </div>
+                <div class="text">{{ m.text }}</div>
+              </article>
+            {% endfor %}
+          </div>
 
-      {% if not messages %}
-        <p id="empty-hint" class="muted">{{ t.room_empty_hint }}</p>
-      {% endif %}
+          {% if not messages %}
+            <p id="empty-hint" class="muted">{{ t.room_empty_hint }}</p>
+          {% endif %}
+        </div>
+
+        <aside class="context-col" id="context-panel">
+          <header class="context-header">
+            <h2>{{ t.context_title }}</h2>
+            <button id="refresh-context" type="button" title="{{ t.context_refresh_hint }}">{{ t.context_refresh }}</button>
+          </header>
+          <p class="muted context-mode" id="context-mode-hint">
+            {% if room.protocol_mode == 'premium' %}{{ t.context_mode_premium }}{% else %}{{ t.context_mode_standard }}{% endif %}
+          </p>
+
+          <section class="context-section">
+            <h3>✅ <span>{{ t.context_agreed }}</span> <span id="agreed-count" class="count">0</span></h3>
+            <ul id="agreed-list" class="claim-list"></ul>
+          </section>
+
+          <section class="context-section">
+            <h3>🟡 <span>{{ t.context_proposed }}</span> <span id="proposed-count" class="count">0</span></h3>
+            <ul id="proposed-list" class="claim-list"></ul>
+          </section>
+
+          <section class="context-section">
+            <h3>🔴 <span>{{ t.context_discrepancies }}</span> <span id="disc-count" class="count">0</span></h3>
+            <ul id="disc-list" class="disc-list"></ul>
+          </section>
+
+          <p class="muted context-hash">
+            <strong>{{ t.context_hash }}</strong>
+            <code id="context-hash-val">—</code>
+          </p>
+          <p id="refresh-status" class="muted refresh-status" hidden></p>
+        </aside>
+      </div>
 
       <footer><p class="muted">{{ t.room_footer }}</p></footer>
     {% endif %}
@@ -117,6 +155,7 @@
           const article = document.createElement('article');
           article.className = 'message';
           article.dataset.id = m.id;
+          article.id = 'msg-' + m.id;
           article.innerHTML =
             `<div class="meta"><span class="ts">${fmtTs(m.timestamp)}</span> ` +
             `<span class="agent" data-agent="${escapeHtml(m.agent_id)}">${escapeHtml(m.agent_id)}</span></div>` +
@@ -130,6 +169,156 @@
       } catch (_) {}
     }
     setInterval(poll, 3000);
+
+    // ---------- Room Context panel ----------
+    const T_REFRESHING = "{{ t.context_refreshing }}";
+    const T_REFRESH_OK = "{{ t.context_refresh_ok }}";
+    const T_REFRESH_ERR = "{{ t.context_refresh_err }}";
+    const T_REFRESH_DISABLED = "{{ t.context_refresh_disabled }}";
+    const T_NO_CLAIMS = "{{ t.context_no_claims }}";
+    const T_NO_DISC = "{{ t.context_no_disc }}";
+    const T_FROM_MSG = "{{ t.context_from_msg }}";
+    const T_ARBITER = "{{ t.context_arbiter }}";
+    const T_ACKED_BY = "{{ t.context_acked_by }}";
+
+    function renderClaim(c) {
+      const li = document.createElement('li');
+      li.className = 'claim';
+      const author = c.proposed_by === 'arbiter' ? `🤖 ${T_ARBITER}` : c.proposed_by;
+      const head = document.createElement('div');
+      head.className = 'claim-head';
+      head.innerHTML = `<span class="claim-type">${escapeHtml(c.type)}</span> <span class="claim-author">${escapeHtml(author)}</span>`;
+      const val = document.createElement('div');
+      val.className = 'claim-value';
+      val.textContent = c.value;
+      li.appendChild(head);
+      li.appendChild(val);
+      if (c.quote) {
+        const q = document.createElement('blockquote');
+        q.className = 'claim-quote';
+        q.textContent = '« ' + c.quote + ' »';
+        li.appendChild(q);
+      }
+      if (c.source_msg_id) {
+        const src = document.createElement('a');
+        src.className = 'claim-src';
+        src.href = '#msg-' + c.source_msg_id;
+        src.textContent = T_FROM_MSG + ' #' + c.source_msg_id;
+        src.addEventListener('click', (e) => {
+          e.preventDefault();
+          const el = document.querySelector(`article.message[data-id="${c.source_msg_id}"]`);
+          if (el) {
+            el.scrollIntoView({behavior: 'smooth', block: 'center'});
+            el.classList.add('msg-highlight');
+            setTimeout(() => el.classList.remove('msg-highlight'), 2000);
+          }
+        });
+        li.appendChild(src);
+      }
+      const acks = (c.acks || []).map(a => a.agent_id + (a.signed ? ' 🔏' : ''));
+      if (acks.length) {
+        const ackEl = document.createElement('div');
+        ackEl.className = 'claim-acks muted';
+        ackEl.textContent = T_ACKED_BY + ': ' + acks.join(', ');
+        li.appendChild(ackEl);
+      }
+      return li;
+    }
+
+    function renderDisc(d) {
+      const li = document.createElement('li');
+      li.className = 'disc disc-' + d.severity;
+      const sev = document.createElement('span');
+      sev.className = 'disc-sev';
+      sev.textContent = d.severity.toUpperCase();
+      const desc = document.createElement('span');
+      desc.className = 'disc-desc';
+      desc.textContent = d.description;
+      li.appendChild(sev);
+      li.appendChild(desc);
+      if (d.related_msg_id) {
+        const src = document.createElement('a');
+        src.className = 'claim-src';
+        src.href = '#msg-' + d.related_msg_id;
+        src.textContent = T_FROM_MSG + ' #' + d.related_msg_id;
+        src.addEventListener('click', (e) => {
+          e.preventDefault();
+          const el = document.querySelector(`article.message[data-id="${d.related_msg_id}"]`);
+          if (el) {
+            el.scrollIntoView({behavior: 'smooth', block: 'center'});
+            el.classList.add('msg-highlight');
+            setTimeout(() => el.classList.remove('msg-highlight'), 2000);
+          }
+        });
+        li.appendChild(src);
+      }
+      return li;
+    }
+
+    async function loadContext() {
+      try {
+        const res = await fetch(`/api/rooms/${ROOM_UUID}/context`);
+        if (!res.ok) return;
+        const ctx = await res.json();
+        const agreedList = document.getElementById('agreed-list');
+        const proposedList = document.getElementById('proposed-list');
+        const discList = document.getElementById('disc-list');
+        agreedList.innerHTML = '';
+        proposedList.innerHTML = '';
+        discList.innerHTML = '';
+
+        if (!ctx.agreed.length) {
+          agreedList.innerHTML = `<li class="muted empty">${T_NO_CLAIMS}</li>`;
+        } else {
+          for (const c of ctx.agreed) agreedList.appendChild(renderClaim(c));
+        }
+        if (!ctx.proposed.length) {
+          proposedList.innerHTML = `<li class="muted empty">${T_NO_CLAIMS}</li>`;
+        } else {
+          for (const c of ctx.proposed) proposedList.appendChild(renderClaim(c));
+        }
+        if (!ctx.discrepancies.length) {
+          discList.innerHTML = `<li class="muted empty">${T_NO_DISC}</li>`;
+        } else {
+          for (const d of ctx.discrepancies) discList.appendChild(renderDisc(d));
+        }
+        document.getElementById('agreed-count').textContent = ctx.agreed.length;
+        document.getElementById('proposed-count').textContent = ctx.proposed.length;
+        document.getElementById('disc-count').textContent = ctx.discrepancies.length;
+        document.getElementById('context-hash-val').textContent = ctx.context_hash.slice(0, 16) + '…';
+        document.getElementById('context-hash-val').title = ctx.context_hash;
+      } catch (_) {}
+    }
+
+    const refreshBtn = document.getElementById('refresh-context');
+    const refreshStatus = document.getElementById('refresh-status');
+    refreshBtn.addEventListener('click', async () => {
+      refreshBtn.disabled = true;
+      refreshStatus.hidden = false;
+      refreshStatus.textContent = T_REFRESHING;
+      try {
+        const res = await fetch(`/api/rooms/${ROOM_UUID}/context/refresh`, {method: 'POST'});
+        if (res.status === 503) {
+          refreshStatus.textContent = T_REFRESH_DISABLED;
+          return;
+        }
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}));
+          throw new Error(d.detail || res.status);
+        }
+        const data = await res.json();
+        refreshStatus.textContent = `${T_REFRESH_OK} +${data.extracted}/+${data.discrepancies_found} (${data.model_used}, ${data.elapsed_ms}ms)`;
+        await loadContext();
+      } catch (e) {
+        refreshStatus.textContent = T_REFRESH_ERR + ': ' + e.message;
+      } finally {
+        refreshBtn.disabled = false;
+        setTimeout(() => { refreshStatus.hidden = true; }, 8000);
+      }
+    });
+
+    loadContext();
+    setInterval(loadContext, 10000);
 
     document.getElementById('copy-btn').addEventListener('click', async () => {
       const btn = document.getElementById('copy-btn');
