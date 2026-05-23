@@ -33,7 +33,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.environ.get("ROOMCOMM_DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-TIMEOUT_SECONDS = 30.0
+TIMEOUT_SECONDS = 90.0  # Nemotron with reasoning can take 30-60s
 MAX_MESSAGES_IN_PROMPT = 80  # tail of conversation if longer
 MAX_CHARS_PER_MESSAGE = 2000
 
@@ -123,7 +123,19 @@ async def _call_openai_compat(
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
         raise LLMUnavailable(f"unexpected response shape: {e}")
-    return json.loads(content)
+    # Some models (Nemotron with reasoning) wrap the JSON in commentary
+    # despite response_format=json_object. Extract the first balanced {...}.
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(content[start : end + 1])
+            except json.JSONDecodeError as e:
+                raise LLMUnavailable(f"could not parse JSON from response: {e}; content[:200]={content[:200]!r}")
+        raise LLMUnavailable(f"no JSON found in response; content[:200]={content[:200]!r}")
 
 
 def _validate_output(raw: dict) -> dict:
@@ -214,7 +226,7 @@ async def extract_claims(
             raw = await _call_openai_compat(url, key, model, payload)
             return _validate_output(raw), f"{name}:{model}"
         except Exception as e:
-            log.warning("LLM provider %s failed: %s", name, e)
+            log.warning("LLM provider %s failed: %r", name, e)
             last_err = e
             continue
 
