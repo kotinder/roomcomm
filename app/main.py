@@ -546,9 +546,13 @@ async def _refresh_room_context_bg(room_uuid: str) -> None:
         async with _refresh_locks[room_uuid]:
             from .database import engine as _eng
             with Session(_eng) as s:
-                await _do_refresh(s, room_uuid)
+                extracted, discs, model_used, ms = await _do_refresh(s, room_uuid)
+                log.info(
+                    "bg refresh %s: +%d claims, +%d discrepancies, model=%s, %dms",
+                    room_uuid, extracted, discs, model_used, ms,
+                )
     except Exception as e:
-        log.warning("background refresh failed for %s: %s", room_uuid, e)
+        log.warning("background refresh failed for %s: %r", room_uuid, e)
 
 
 async def _do_refresh(session: Session, room_uuid: str) -> tuple[int, int, str, int]:
