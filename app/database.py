@@ -51,6 +51,23 @@ def _migrate_sqlite() -> None:
                 "ALTER TABLE rooms ADD COLUMN last_extracted_msg_id INTEGER NOT NULL DEFAULT 0"
             )
             conn.commit()
+
+        # PCIS-style signatures on messages (Phase: per-message non-repudiation).
+        msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
+        if msg_cols and "pubkey_hex" not in msg_cols:
+            conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN pubkey_hex VARCHAR(64)")
+            conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN signature_hex VARCHAR(128)")
+            conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN memory_root VARCHAR(128)")
+            conn.commit()
+
+        # Arbiter-signed hash chain on revisions.
+        rev_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(claim_revisions)").fetchall()}
+        if rev_cols and "row_hash" not in rev_cols:
+            conn.exec_driver_sql("ALTER TABLE claim_revisions ADD COLUMN prev_hash VARCHAR(64)")
+            conn.exec_driver_sql("ALTER TABLE claim_revisions ADD COLUMN row_hash VARCHAR(64)")
+            conn.exec_driver_sql("ALTER TABLE claim_revisions ADD COLUMN arbiter_signature_hex VARCHAR(128)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_claim_revisions_row_hash ON claim_revisions(row_hash)")
+            conn.commit()
         # Ledger model migration: the old flat `claims` table and `claim_acks`
         # are incompatible with the new thread+revisions schema. Detect and
         # drop them — pre-redesign data was test-only.

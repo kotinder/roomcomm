@@ -451,3 +451,152 @@ def test_refresh_full_reprocesses_all(monkeypatch):
     # ?full=true should reset watermark and reprocess everything
     client.post(f"/api/rooms/{uid}/context/refresh?full=true")
     assert len(calls) == 4
+
+
+# ---------- PCIS: per-message signatures + arbiter-signed chain + /verify ----------
+
+def _ed_keys():
+    try:
+        from nacl.encoding import HexEncoder
+        from nacl.signing import SigningKey
+    except ImportError:
+        import pytest
+        pytest.skip("pynacl not installed")
+    sk = SigningKey.generate()
+    return sk, sk.verify_key.encode(encoder=HexEncoder).decode()
+
+
+def test_arbiter_pubkey_endpoint():
+    r = client.get("/api/arbiter/pubkey")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["alg"] == "ed25519"
+    assert len(body["pubkey_hex"]) == 64
+    int(body["pubkey_hex"], 16)  # is valid hex
+
+
+def test_message_signed_intake_accepted_and_verified():
+    from app import pcis as app_pcis
+    from nacl.encoding import HexEncoder
+    sk, pub = _ed_keys()
+    uid = _new_room()
+    from datetime import datetime, timezone
+    ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    text = "I commit to deliver by Friday."
+    surface = app_pcis.message_surface(text, ts_iso, uid, None)
+    sig_hex = sk.sign(surface).signature.hex()
+    r = client.post(f"/api/rooms/{uid}/messages", json={
+        "agent_id": "alice", "text": text, "ts_iso": ts_iso,
+        "pubkey_hex": pub, "signature_hex": sig_hex,
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["pubkey_hex"] == pub
+    assert body["signature_hex"] == sig_hex
+    # /verify should return CLEAN
+    v = client.post(f"/api/rooms/{uid}/verify").json()
+    assert v["verdict"] == "CLEAN", v
+
+
+def test_message_tampered_signature_rejected():
+    from app import pcis as app_pcis
+    sk, pub = _ed_keys()
+    uid = _new_room()
+    from datetime import datetime, timezone
+    ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    text = "I commit to deliver by Friday."
+    surface = app_pcis.message_surface(text, ts_iso, uid, None)
+    sig_hex = sk.sign(surface).signature.hex()
+    # Flip last hex char.
+    bad_sig = sig_hex[:-1] + ("0" if sig_hex[-1] != "0" else "1")
+    r = client.post(f"/api/rooms/{uid}/messages", json={
+        "agent_id": "alice", "text": text, "ts_iso": ts_iso,
+        "pubkey_hex": pub, "signature_hex": bad_sig,
+    })
+    assert r.status_code == 400
+    # And no row was created.
+    msgs = client.get(f"/api/rooms/{uid}/messages").json()["messages"]
+    assert len(msgs) == 0
+
+
+def test_ts_too_far_rejected():
+    from app import pcis as app_pcis
+    sk, pub = _ed_keys()
+    uid = _new_room()
+    ts_iso = "2020-01-01T00:00:00.000000Z"  # ancient
+    text = "old"
+    surface = app_pcis.message_surface(text, ts_iso, uid, None)
+    sig_hex = sk.sign(surface).signature.hex()
+    r = client.post(f"/api/rooms/{uid}/messages", json={
+        "agent_id": "alice", "text": text, "ts_iso": ts_iso,
+        "pubkey_hex": pub, "signature_hex": sig_hex,
+    })
+    assert r.status_code == 400
+    assert "5 minutes" in r.json()["detail"]
+
+
+def test_manual_thread_has_arbiter_chained_revision():
+    """Opening a thread manually should produce a propose-revision with a
+    valid row_hash and arbiter signature."""
+    uid = _new_room()
+    r = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "Deadline", "value": "Friday", "opened_by": "alice",
+    })
+    cid = r.json()["id"]
+    # Fetch the thread with revisions.
+    full = client.get(f"/api/rooms/{uid}/claims/{cid}").json()
+    assert full["revisions_count"] == 1
+    # /verify should be CLEAN.
+    v = client.post(f"/api/rooms/{uid}/verify").json()
+    assert v["verdict"] == "CLEAN", v
+
+
+def test_verify_detects_tampered_revision_value():
+    """Directly mutate a revision in the DB to simulate operator tampering;
+    /verify must REFUTE."""
+    uid = _new_room()
+    cid = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "Topic", "value": "original", "opened_by": "alice",
+    }).json()["id"]
+    # Mutate via direct DB access — simulate the operator editing SQLite.
+    from app.models import Claim as ClaimM, ClaimRevision as RevM
+    from sqlmodel import select as _select
+    with Session(engine) as s:
+        rev = s.exec(_select(RevM).where(RevM.claim_id == cid)).first()
+        rev.value = "tampered"
+        s.add(rev)
+        s.commit()
+    v = client.post(f"/api/rooms/{uid}/verify").json()
+    assert v["verdict"] == "REFUTED"
+    assert "tampered_revision_payload" in v["details"].get("type", "") or \
+           "broken_chain" in v["details"].get("type", "") or \
+           "invalid_arbiter_signature" in v["details"].get("type", "")
+
+
+def test_verify_detects_broken_chain():
+    """Insert a revision out of order (mutate prev_hash) → broken_chain."""
+    uid = _new_room()
+    cid = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "A", "value": "v1", "opened_by": "alice",
+    }).json()["id"]
+    # Add a confirm revision normally so we have ≥ 2 revisions to chain.
+    client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "bob", "value": "v1", "kind": "confirm",
+    })
+    # Now corrupt the second revision's prev_hash.
+    from app.models import ClaimRevision as RevM
+    from sqlmodel import select as _select
+    with Session(engine) as s:
+        revs = s.exec(_select(RevM).where(RevM.claim_id == cid).order_by(RevM.id)).all()
+        assert len(revs) == 2
+        revs[1].prev_hash = "0" * 64
+        s.add(revs[1])
+        s.commit()
+    v = client.post(f"/api/rooms/{uid}/verify").json()
+    assert v["verdict"] == "REFUTED"
+
+
+def test_verify_empty_room_clean():
+    uid = _new_room()
+    v = client.post(f"/api/rooms/{uid}/verify").json()
+    assert v["verdict"] == "CLEAN"

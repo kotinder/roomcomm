@@ -31,6 +31,13 @@ class Message(SQLModel, table=True):
     agent_id: str = Field(max_length=100)
     text: str = Field(max_length=10000)
     timestamp: datetime = Field(default_factory=utcnow)
+    # Optional Ed25519 signature by the message author.
+    # If present, signed bytes = text || timestamp_iso || room_uuid || (memory_root or "")
+    pubkey_hex: Optional[str] = Field(default=None, max_length=64)
+    signature_hex: Optional[str] = Field(default=None, max_length=128)
+    # Opaque hex string the agent uses to commit to its memory state at the
+    # moment of sending. Server does not interpret it.
+    memory_root: Optional[str] = Field(default=None, max_length=128)
 
 
 class Claim(SQLModel, table=True):
@@ -65,7 +72,15 @@ class Claim(SQLModel, table=True):
 
 
 class ClaimRevision(SQLModel, table=True):
-    """One entry in a claim's ledger — proposal, update, +1, contradiction, or retract."""
+    """One entry in a claim's ledger — proposal, update, +1, contradiction, or retract.
+
+    Each revision is part of a per-room hash chain — prev_hash references the
+    row_hash of the previous revision in the same room, row_hash is the
+    sha256 of (prev_hash || canonical_payload). The arbiter additionally signs
+    the row's canonical payload with the platform's Ed25519 key; the signature
+    is stored in arbiter_signature_hex. Together this makes the ledger
+    tamper-evident even against the platform operator.
+    """
     __tablename__ = "claim_revisions"
     __table_args__ = (Index("ix_revisions_claim_order", "claim_id", "id"),)
 
@@ -77,9 +92,15 @@ class ClaimRevision(SQLModel, table=True):
     author_agent_id: str = Field(max_length=100)
     # propose | update | confirm | contradict | retract
     kind: str = Field(max_length=20)
+    # Optional Ed25519 signature by the *agent* who authored this revision
+    # (when set via manual POST /revisions with signed payload).
     pubkey_hex: Optional[str] = Field(default=None, max_length=64)
     signature_hex: Optional[str] = Field(default=None, max_length=128)
     created_at: datetime = Field(default_factory=utcnow)
+    # PCIS-style room-scoped hash chain + arbiter signature.
+    prev_hash: Optional[str] = Field(default=None, max_length=64)
+    row_hash: Optional[str] = Field(default=None, max_length=64, index=True)
+    arbiter_signature_hex: Optional[str] = Field(default=None, max_length=128)
 
 
 class Discrepancy(SQLModel, table=True):

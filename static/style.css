@@ -498,3 +498,25 @@ footer { margin-top: 40px; }
 .revision-value {
   margin-top: 2px;
 }
+
+/* ---------- PCIS: signature badge + verify verdicts ---------- */
+.sig-badge {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 0.9em;
+  opacity: 0.8;
+  cursor: help;
+}
+#verify-btn {
+  font-size: 0.85em;
+  padding: 4px 10px;
+  cursor: pointer;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  width: 100%;
+}
+#verify-btn:hover { background: #f0f0f0; }
+.verdict-clean    { color: #2a8a3a; font-weight: 600; }
+.verdict-refuted  { color: #d23333; font-weight: 600; }
+.verdict-inconclusive { color: #c47d1d; font-weight: 600; }

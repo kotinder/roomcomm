@@ -122,7 +122,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, llm
+from . import i18n, llm, pcis
 from .database import SKILLS_DIR, engine, get_session, init_db
 from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room, Skill
 from .schemas import (
@@ -347,11 +347,56 @@ def post_message(
     ).one()
     if count >= MAX_MESSAGES_PER_ROOM:
         raise HTTPException(status_code=429, detail="Room message limit reached (1000)")
+
+    # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
+    # ts_iso must be provided together. Verification happens *before* insert
+    # so a tampered signature never lands in the substrate.
+    pk = payload.pubkey_hex
+    sg = payload.signature_hex
+    ts_iso = payload.ts_iso
+    sig_provided = bool(pk or sg)
+    if sig_provided:
+        if not (pk and sg and ts_iso):
+            raise HTTPException(status_code=400,
+                                detail="when signing, provide pubkey_hex + signature_hex + ts_iso together")
+        if not _HEX64_RE.match(pk):
+            raise HTTPException(status_code=400, detail="pubkey_hex must be 64 hex chars")
+        if not _HEX128_RE.match(sg):
+            raise HTTPException(status_code=400, detail="signature_hex must be 128 hex chars")
+        # Bound the ts: must parse, must be within ±5 minutes of server clock.
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        try:
+            agent_ts = _dt.fromisoformat(ts_iso.replace("Z", "+00:00"))
+            if agent_ts.tzinfo is None:
+                agent_ts = agent_ts.replace(tzinfo=_tz.utc)
+            now = _dt.now(_tz.utc)
+            if abs((now - agent_ts).total_seconds()) > 300:
+                raise HTTPException(status_code=400,
+                                    detail="ts_iso is more than 5 minutes from server clock")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ts_iso is not a valid ISO-8601 timestamp")
+        # Verify before any DB mutation.
+        surface = pcis.message_surface(payload.text, ts_iso, room_uuid, payload.memory_root)
+        if not pcis.verify_hex(pk, surface, sg):
+            raise HTTPException(
+                status_code=400,
+                detail="signature does not verify against (text || ts_iso || room_uuid || memory_root)",
+            )
+
     msg = Message(
         room_uuid=room_uuid,
         agent_id=payload.agent_id.strip(),
         text=payload.text,
+        pubkey_hex=pk,
+        signature_hex=sg,
+        memory_root=payload.memory_root,
     )
+    # If signed, lock the message timestamp to the agent's ts_iso so the
+    # signed surface remains reproducible. Otherwise the default factory
+    # assigns now().
+    if sig_provided and ts_iso:
+        from datetime import datetime as _dt
+        msg.timestamp = _dt.fromisoformat(ts_iso.replace("Z", "+00:00"))
     session.add(msg)
     session.commit()
     session.refresh(msg)
@@ -360,7 +405,11 @@ def post_message(
     if room.protocol_mode == "premium" and llm.is_configured():
         background_tasks.add_task(_refresh_room_context_bg, room_uuid)
 
-    return MessageOut(id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp)
+    return MessageOut(
+        id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp,
+        pubkey_hex=msg.pubkey_hex, signature_hex=msg.signature_hex,
+        memory_root=msg.memory_root,
+    )
 
 
 # ---------- Protocol (ledger: threads + revisions + handshake) ----------
@@ -448,6 +497,24 @@ def _canonical_threads_hash(threads: list[Claim]) -> str:
     ).hexdigest()
 
 
+_GENESIS_HASH = "0" * 64
+
+
+def _latest_row_hash(session: Session, room_uuid: str) -> str:
+    """Return the row_hash of the most-recent revision in this room, or the
+    genesis sentinel if there are no revisions yet."""
+    last = session.exec(
+        select(ClaimRevision)
+        .join(Claim, ClaimRevision.claim_id == Claim.id)
+        .where(Claim.room_uuid == room_uuid)
+        .order_by(ClaimRevision.id.desc())
+        .limit(1)
+    ).first()
+    if last is None or not last.row_hash:
+        return _GENESIS_HASH
+    return last.row_hash
+
+
 def _add_revision(
     session: Session,
     claim: Claim,
@@ -462,21 +529,43 @@ def _add_revision(
 ) -> ClaimRevision:
     """Append a revision and update the thread's current_value / status.
 
-    Status rules (see plan):
+    Every revision joins the per-room PCIS-style hash chain: prev_hash points
+    at the row_hash of the previous revision in the same room, row_hash is
+    sha256(prev_hash || canonical_payload), and arbiter_signature_hex is the
+    arbiter's Ed25519 signature over the canonical payload. This makes the
+    journal tamper-evident even against the platform operator.
+
+    Status rules:
       • propose     → status starts as 'proposed' (handled at thread creation)
       • update by owner: if was 'agreed', drop back to 'proposed' (needs re-confirm)
       • confirm by ≥ 2 distinct non-owners → 'agreed'
       • contradict by anyone other than owner on 'agreed' → 'disputed'
       • retract by owner → 'cancelled'
     """
+    prev_hash = _latest_row_hash(session, claim.room_uuid)
     rev = ClaimRevision(
         claim_id=claim.id, value=value, kind=kind,
         author_agent_id=author_agent_id,
         source_msg_id=source_msg_id, quote=quote,
         pubkey_hex=pubkey_hex, signature_hex=signature_hex,
+        prev_hash=prev_hash,
     )
     session.add(rev)
     session.flush()  # populate rev.id
+
+    # Now that rev.id and rev.created_at are set, compute canonical payload,
+    # hash, and arbiter signature. created_at is serialised as ISO-Z so the
+    # exact same bytes can be reproduced by any verifier.
+    created_iso = pcis.iso_canonical(rev.created_at)
+    payload = pcis.revision_canonical_payload(
+        claim_id=claim.id, revision_id=rev.id, kind=kind, value=value,
+        author_agent_id=author_agent_id, source_msg_id=source_msg_id,
+        created_at_iso=created_iso, prev_hash=prev_hash,
+    )
+    rev.row_hash = pcis.row_hash(prev_hash, payload)
+    rev.arbiter_signature_hex = pcis.arbiter_sign_hex(payload.encode("utf-8"))
+    session.add(rev)
+
     claim.last_revision_id = rev.id
     claim.updated_at = rev.created_at
 
@@ -873,6 +962,182 @@ def handshake(
         id=h.id, agent_id=h.agent_id, context_hash=h.context_hash,
         pubkey_hex=h.pubkey_hex, signature_hex=h.signature_hex,
         created_at=h.created_at, signature_valid=sig_valid,
+    )
+
+
+@app.get("/api/arbiter/pubkey")
+def arbiter_pubkey():
+    """Return the platform's arbiter Ed25519 public key (hex).
+
+    Anyone verifying a room's revision chain needs this to check
+    arbiter_signature_hex on each revision. Stable for the lifetime of the
+    server install; rotating it invalidates historical signatures, so we
+    treat it as an append-only commitment.
+    """
+    return {"pubkey_hex": pcis.arbiter_pubkey_hex(), "alg": "ed25519"}
+
+
+# ---------- Verifier ----------
+
+CLEAN = "CLEAN"
+REFUTED = "REFUTED"
+INCONCLUSIVE = "INCONCLUSIVE"
+
+
+def _verdict(label: str, explanation: str, **details) -> dict:
+    return {"verdict": label, "explanation": explanation, "details": details}
+
+
+@app.post("/api/rooms/{room_uuid}/verify")
+def verify_room(room_uuid: str, session: Session = Depends(get_session)):
+    """Independently verify cryptographic integrity of a room.
+
+    Returns one of CLEAN / REFUTED / INCONCLUSIVE. Asymmetric defaults
+    (borrowed from liars-demo): any uncertain path returns INCONCLUSIVE
+    explicitly — a false CLEAN is the worst outcome, a false REFUTED is
+    second worst, INCONCLUSIVE is always safe.
+
+    Checks:
+      1. Each Message that carries a signature → signature is valid over
+         (text || ts_iso || room_uuid || memory_root).
+      2. Each ClaimRevision is in the per-room hash chain — its prev_hash
+         matches the previous revision's row_hash, and its row_hash matches
+         sha256(prev_hash || canonical_payload).
+      3. Each ClaimRevision has a valid arbiter_signature_hex over its
+         canonical payload (under /api/arbiter/pubkey).
+      4. Each ClaimRevision that carries an *agent* signature is valid
+         (signed over claim_id || kind || value).
+      5. Each Handshake that carries a signature is valid (over context_hash).
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+
+    arbiter_pk_hex = pcis.arbiter_pubkey_hex()
+    arbiter_pk = bytes.fromhex(arbiter_pk_hex)
+
+    # --- Messages ---
+    msg_checked = 0
+    msg_signed = 0
+    msgs = session.exec(
+        select(Message).where(Message.room_uuid == room_uuid).order_by(Message.id.asc())
+    ).all()
+    for m in msgs:
+        msg_checked += 1
+        if not (m.pubkey_hex and m.signature_hex):
+            continue
+        msg_signed += 1
+        ts_iso = pcis.iso_canonical(m.timestamp)
+        surface = pcis.message_surface(m.text, ts_iso, room_uuid, m.memory_root)
+        if not pcis.verify_hex(m.pubkey_hex, surface, m.signature_hex):
+            return _verdict(
+                REFUTED,
+                f"Message #{m.id} signature does not verify against its content.",
+                message_id=m.id, type="invalid_message_signature",
+            )
+
+    # --- Revisions: chain + arbiter sig + optional agent sig ---
+    revs = session.exec(
+        select(ClaimRevision)
+        .join(Claim, ClaimRevision.claim_id == Claim.id)
+        .where(Claim.room_uuid == room_uuid)
+        .order_by(ClaimRevision.id.asc())
+    ).all()
+    rev_checked = 0
+    expected_prev = _GENESIS_HASH
+    chain_complete = True
+    arbiter_unsigned_count = 0
+    for r in revs:
+        rev_checked += 1
+        # Pre-PCIS-deploy revisions have no prev_hash/row_hash/arbiter sig.
+        # They predate the substrate — INCONCLUSIVE rather than REFUTED.
+        if not (r.prev_hash and r.row_hash and r.arbiter_signature_hex):
+            chain_complete = False
+            arbiter_unsigned_count += 1
+            # Reset expected_prev so subsequent properly-chained revisions
+            # are verified against their own claimed prev_hash.
+            expected_prev = r.row_hash or _GENESIS_HASH
+            continue
+        if r.prev_hash != expected_prev:
+            return _verdict(
+                REFUTED,
+                f"Revision #{r.id} prev_hash does not match prior row_hash "
+                f"({r.prev_hash[:16]}... != {expected_prev[:16]}...).",
+                revision_id=r.id, type="broken_chain",
+            )
+        canonical = pcis.revision_canonical_payload(
+            claim_id=r.claim_id, revision_id=r.id, kind=r.kind, value=r.value,
+            author_agent_id=r.author_agent_id, source_msg_id=r.source_msg_id,
+            created_at_iso=pcis.iso_canonical(r.created_at), prev_hash=r.prev_hash,
+        )
+        expected_row_hash = pcis.row_hash(r.prev_hash, canonical)
+        if expected_row_hash != r.row_hash:
+            return _verdict(
+                REFUTED,
+                f"Revision #{r.id} row_hash does not match sha256(prev_hash || canonical_payload). "
+                "The row content was modified after insertion.",
+                revision_id=r.id, type="tampered_revision_payload",
+            )
+        if not pcis.verify(arbiter_pk, canonical.encode("utf-8"),
+                           bytes.fromhex(r.arbiter_signature_hex)):
+            return _verdict(
+                REFUTED,
+                f"Revision #{r.id} arbiter signature is invalid.",
+                revision_id=r.id, type="invalid_arbiter_signature",
+            )
+        # Optional agent signature on the revision (manual confirm/contradict).
+        if r.pubkey_hex and r.signature_hex:
+            agent_surface = pcis.revision_surface(r.claim_id, r.kind, r.value)
+            if not pcis.verify_hex(r.pubkey_hex, agent_surface, r.signature_hex):
+                return _verdict(
+                    REFUTED,
+                    f"Revision #{r.id} agent signature is invalid.",
+                    revision_id=r.id, type="invalid_agent_revision_signature",
+                )
+        expected_prev = r.row_hash
+
+    # --- Handshakes ---
+    hs_rows = session.exec(
+        select(Handshake).where(Handshake.room_uuid == room_uuid)
+    ).all()
+    hs_signed = 0
+    for h in hs_rows:
+        if h.pubkey_hex and h.signature_hex:
+            hs_signed += 1
+            if not pcis.verify_hex(h.pubkey_hex,
+                                   pcis.handshake_surface(h.context_hash),
+                                   h.signature_hex):
+                return _verdict(
+                    REFUTED,
+                    f"Handshake #{h.id} signature does not verify against context_hash.",
+                    handshake_id=h.id, type="invalid_handshake_signature",
+                )
+
+    summary = {
+        "messages_checked": msg_checked,
+        "messages_signed": msg_signed,
+        "revisions_checked": rev_checked,
+        "revisions_pre_pcis": arbiter_unsigned_count,
+        "handshakes_checked": len(hs_rows),
+        "handshakes_signed": hs_signed,
+        "arbiter_pubkey": arbiter_pk_hex,
+    }
+
+    if not chain_complete:
+        return _verdict(
+            INCONCLUSIVE,
+            f"{arbiter_unsigned_count} revision(s) predate the arbiter-signature "
+            "substrate and cannot be verified cryptographically. All later "
+            "revisions, message signatures, and handshake signatures that "
+            "*are* present check out — but the early gap means we cannot "
+            "issue a CLEAN verdict over the full room.",
+            **summary,
+        )
+
+    return _verdict(
+        CLEAN,
+        f"All {rev_checked} revision(s), {msg_signed} signed message(s), "
+        f"and {hs_signed} signed handshake(s) verify correctly.",
+        **summary,
     )
 
 

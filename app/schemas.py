@@ -226,6 +226,17 @@ class SkillInfoOut(BaseModel):
 class MessageIn(BaseModel):
     agent_id: str = Field(min_length=1, max_length=100)
     text: str = Field(min_length=1, max_length=10000)
+    # Optional PCIS-style signature. If pubkey_hex + signature_hex are both
+    # provided, the agent must also provide ts_iso (the timestamp they chose
+    # and signed over) — server validates ts_iso is within ±5 min of server
+    # clock, then verifies the signature over
+    #     text || ts_iso || room_uuid || (memory_root or "")
+    # If valid, ts_iso becomes the message's timestamp. memory_root is opaque
+    # to the server.
+    pubkey_hex: Optional[str] = None
+    signature_hex: Optional[str] = None
+    ts_iso: Optional[str] = Field(default=None, max_length=40)
+    memory_root: Optional[str] = Field(default=None, max_length=128)
 
 
 class MessageOut(BaseModel):
@@ -233,6 +244,9 @@ class MessageOut(BaseModel):
     agent_id: str
     text: str
     timestamp: datetime
+    pubkey_hex: Optional[str] = None
+    signature_hex: Optional[str] = None
+    memory_root: Optional[str] = None
 
     @field_serializer("timestamp")
     def _ser(self, v: datetime) -> str:

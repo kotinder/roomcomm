@@ -54,6 +54,7 @@
                 <div class="meta">
                   <span class="ts">[{{ m.timestamp.strftime('%H:%M:%S') }}]</span>
                   <span class="agent" data-agent="{{ m.agent_id }}">{{ m.agent_id }}</span>
+                  {% if m.signature_hex %}<span class="sig-badge" title="{{ t.signed_by }} {{ m.pubkey_hex[:16] }}…">🔏</span>{% endif %}
                 </div>
                 <div class="text">{{ m.text }}</div>
               </article>
@@ -88,6 +89,10 @@
             <strong>{{ t.context_hash }}</strong>
             <code id="context-hash-val">—</code>
           </p>
+          <p>
+            <button id="verify-btn" type="button" title="{{ t.verify_hint }}">🔍 {{ t.verify_button }}</button>
+          </p>
+          <p id="verify-status" class="muted refresh-status" hidden></p>
           <p id="refresh-status" class="muted refresh-status" hidden></p>
         </aside>
       </div>
@@ -151,9 +156,12 @@
           article.className = 'message';
           article.dataset.id = m.id;
           article.id = 'msg-' + m.id;
+          const sigIcon = m.signature_hex
+            ? ` <span class="sig-badge" title="signed by ${escapeHtml((m.pubkey_hex||'').slice(0,16))}…">🔏</span>`
+            : '';
           article.innerHTML =
             `<div class="meta"><span class="ts">${fmtTs(m.timestamp)}</span> ` +
-            `<span class="agent" data-agent="${escapeHtml(m.agent_id)}">${escapeHtml(m.agent_id)}</span></div>` +
+            `<span class="agent" data-agent="${escapeHtml(m.agent_id)}">${escapeHtml(m.agent_id)}</span>${sigIcon}</div>` +
             `<div class="text"></div>`;
           article.querySelector('.text').textContent = m.text;
           messagesEl.appendChild(article);
@@ -370,6 +378,33 @@
         setTimeout(() => { refreshStatus.hidden = true; }, 8000);
       }
     });
+
+    // Verify button — call POST /verify and show CLEAN / REFUTED / INCONCLUSIVE.
+    const verifyBtn = document.getElementById('verify-btn');
+    const verifyStatus = document.getElementById('verify-status');
+    if (verifyBtn) {
+      verifyBtn.addEventListener('click', async () => {
+        verifyBtn.disabled = true;
+        verifyStatus.hidden = false;
+        verifyStatus.className = 'muted refresh-status';
+        verifyStatus.textContent = '{{ t.verify_running }}';
+        try {
+          const res = await fetch(`/api/rooms/${ROOM_UUID}/verify`, {method: 'POST'});
+          const d = await res.json();
+          verifyStatus.className = 'refresh-status verdict-' + (d.verdict || 'unknown').toLowerCase();
+          const label = {
+            CLEAN: '{{ t.verdict_clean }}',
+            REFUTED: '{{ t.verdict_refuted }}',
+            INCONCLUSIVE: '{{ t.verdict_inconclusive }}',
+          }[d.verdict] || d.verdict;
+          verifyStatus.textContent = `${label} — ${d.explanation}`;
+        } catch (e) {
+          verifyStatus.textContent = '{{ t.verify_error }}: ' + e.message;
+        } finally {
+          verifyBtn.disabled = false;
+        }
+      });
+    }
 
     loadContext();
     setInterval(loadContext, 10000);

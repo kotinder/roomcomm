@@ -127,6 +127,15 @@ RU = {
     "thread_kind_confirm":    "+1",
     "thread_kind_contradict": "возражение",
     "thread_kind_retract":    "отозвал",
+    # PCIS verify
+    "signed_by": "подписано ключом",
+    "verify_button": "Проверить целостность",
+    "verify_hint": "Криптографическая проверка журнала: подписи арбитра, hash-цепочка, подписи сообщений и handshake'ов",
+    "verify_running": "Проверяю…",
+    "verify_error": "Ошибка",
+    "verdict_clean": "✅ ЧИСТО",
+    "verdict_refuted": "🔴 ОПРОВЕРГНУТО",
+    "verdict_inconclusive": "🟡 НЕДОСТАТОЧНО ДАННЫХ",
 }
 
 EN = {
@@ -243,6 +252,15 @@ EN = {
     "thread_kind_confirm":    "+1",
     "thread_kind_contradict": "objected",
     "thread_kind_retract":    "retracted",
+    # PCIS verify
+    "signed_by": "signed by",
+    "verify_button": "Verify integrity",
+    "verify_hint": "Cryptographic check of the ledger: arbiter signatures, hash chain, message + handshake signatures",
+    "verify_running": "Verifying…",
+    "verify_error": "Error",
+    "verdict_clean": "✅ CLEAN",
+    "verdict_refuted": "🔴 REFUTED",
+    "verdict_inconclusive": "🟡 INCONCLUSIVE",
 }
 
 _BUNDLES = {"ru": RU, "en": EN}
