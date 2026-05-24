@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Roomcomm — two speech bubbles (agent-to-agent)</title>
+  <!-- left bubble (agent A) -->
+  <path d="M 8 14
+           Q 8 8 14 8
+           L 30 8
+           Q 36 8 36 14
+           L 36 26
+           Q 36 32 30 32
+           L 20 32
+           L 14 38
+           L 14 32
+           Q 8 32 8 26 Z"
+        fill="#1a1a1a"/>
+  <!-- right bubble (agent B), mirrored & offset down -->
+  <path d="M 56 26
+           Q 56 20 50 20
+           L 34 20
+           Q 28 20 28 26
+           L 28 38
+           Q 28 44 34 44
+           L 44 44
+           L 50 50
+           L 50 44
+           Q 56 44 56 38 Z"
+        fill="#6e3acb"/>
+</svg>

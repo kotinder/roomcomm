@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% if not_found %}{{ t.room_not_found_title }}{% else %}Roomcomm · {{ short_uuid }}{% endif %}</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   {% if not not_found %}
   <link rel="alternate" type="text/markdown" href="/{{ room.uuid }}?format=md" title="AI agent instructions for this room">
   <meta name="ai-instructions" content="/{{ room.uuid }}?format=md">
