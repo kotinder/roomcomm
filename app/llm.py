@@ -147,9 +147,11 @@ async def _call_openai_compat(
             {"role": "user", "content": user_payload},
         ],
         "temperature": 0.0,
-        # Per-message processing keeps responses small. 4000 is plenty even
-        # with some reasoning models burning tokens on thinking.
-        "max_tokens": 4000,
+        # Per-message processing keeps responses small for typical messages,
+        # but "consolidation" / "summary" messages with 10+ items can blow
+        # past 4000 when DeepSeek pre-formats with indentation. 8000 + the
+        # salvage fallback handle the edge case.
+        "max_tokens": 8000,
         "response_format": {"type": "json_object"},
     }
     async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
@@ -179,10 +181,70 @@ async def _call_openai_compat(
             except json.JSONDecodeError:
                 pass
     fr = data["choices"][0].get("finish_reason")
+    # Salvage: if the response was truncated by max_tokens, harvest any
+    # complete `new_claims` / `updates` objects from the partial JSON.
+    if fr == "length" and content.strip().startswith("{"):
+        salvaged = _salvage_partial_ledger(content)
+        if salvaged is not None:
+            return salvaged
     raise LLMUnavailable(
         f"no JSON found in response; content[:200]={content[:200]!r}, "
         f"finish_reason={fr!r}"
     )
+
+
+def _salvage_partial_ledger(content: str) -> Optional[dict]:
+    """Parse the longest valid prefix of a truncated JSON response.
+
+    The LLM was producing `{"new_claims": [...], "updates": [...], "discrepancies": [...]}`
+    when its token budget ran out mid-array. We extract whatever complete
+    objects are in each array and synthesize a valid response.
+    """
+    import re as _re
+
+    def extract_array(name: str) -> list:
+        m = _re.search(rf'"{name}"\s*:\s*\[', content)
+        if not m:
+            return []
+        i = m.end()
+        items = []
+        n = len(content)
+        while i < n:
+            while i < n and content[i] in " ,\n\r\t":
+                i += 1
+            if i >= n or content[i] != "{":
+                break
+            depth, j, in_str, esc = 1, i + 1, False, False
+            while j < n and depth > 0:
+                c = content[j]
+                if in_str:
+                    if esc: esc = False
+                    elif c == "\\": esc = True
+                    elif c == '"': in_str = False
+                else:
+                    if c == '"': in_str = True
+                    elif c == "{": depth += 1
+                    elif c == "}": depth -= 1
+                j += 1
+            if depth != 0:
+                break
+            try:
+                items.append(json.loads(content[i:j]))
+            except json.JSONDecodeError:
+                break
+            i = j
+        return items
+
+    new_claims = extract_array("new_claims")
+    updates = extract_array("updates")
+    discrepancies = extract_array("discrepancies")
+    if not (new_claims or updates or discrepancies):
+        return None
+    log.warning(
+        "salvaged truncated LLM response: new_claims=%d updates=%d discrepancies=%d",
+        len(new_claims), len(updates), len(discrepancies),
+    )
+    return {"new_claims": new_claims, "updates": updates, "discrepancies": discrepancies}
 
 
 ALLOWED_KINDS_NEW = {"propose"}
