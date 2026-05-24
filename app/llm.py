@@ -34,7 +34,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.environ.get("ROOMCOMM_DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-TIMEOUT_SECONDS = 90.0
+TIMEOUT_SECONDS = 40.0
 MAX_CHARS_PER_MESSAGE = 2000
 MAX_THREADS_IN_PROMPT = 60  # cap to keep prompt bounded for large rooms
 
