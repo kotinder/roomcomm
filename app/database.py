@@ -46,6 +46,19 @@ def _migrate_sqlite() -> None:
                 "ALTER TABLE rooms ADD COLUMN protocol_mode VARCHAR(20) NOT NULL DEFAULT 'standard'"
             )
             conn.commit()
+        if "last_extracted_msg_id" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN last_extracted_msg_id INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+        # Ledger model migration: the old flat `claims` table and `claim_acks`
+        # are incompatible with the new thread+revisions schema. Detect and
+        # drop them — pre-redesign data was test-only.
+        claim_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(claims)").fetchall()}
+        if claim_cols and "subject_key" not in claim_cols:
+            conn.exec_driver_sql("DROP TABLE IF EXISTS claim_acks")
+            conn.exec_driver_sql("DROP TABLE IF EXISTS claims")
+            conn.commit()
 
 
 def get_session():

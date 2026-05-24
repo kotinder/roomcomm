@@ -17,6 +17,9 @@ class Room(SQLModel, table=True):
     # "standard" — claims feature available, LLM runs only on /context/refresh.
     # "premium"  — LLM extracts claims after every message (background task).
     protocol_mode: str = Field(default="standard", max_length=20)
+    # Watermark for incremental LLM processing — only messages with id >
+    # last_extracted_msg_id are fed to the arbiter on the next refresh.
+    last_extracted_msg_id: int = Field(default=0)
 
 
 class Message(SQLModel, table=True):
@@ -31,34 +34,49 @@ class Message(SQLModel, table=True):
 
 
 class Claim(SQLModel, table=True):
-    """A concrete commitment extracted from (or proposed against) a room's chat.
+    """A negotiation thread — one subject discussed across many messages.
 
-    Always stored in English regardless of conversation language — the LLM
-    translates during extraction. Status flow: proposed → agreed (when both
-    sides ack) or disputed (when arbiter finds contradiction).
+    A claim is an *entity* (e.g. "Concrete delivery to site #2") with a
+    current state and a ledger of revisions. The LLM arbiter matches new
+    messages against existing threads via `subject_key` and either appends
+    a revision to an existing thread or opens a new one.
+
+    All subject/value text is in English regardless of the conversation
+    language — the arbiter translates during extraction.
     """
     __tablename__ = "claims"
-    __table_args__ = (Index("ix_claims_room_status", "room_uuid", "status"),)
+    __table_args__ = (
+        Index("ix_claims_room_status", "room_uuid", "status"),
+        Index("ix_claims_room_subject_key", "room_uuid", "subject_key"),
+    )
 
     id: str = Field(primary_key=True)
     room_uuid: str = Field(foreign_key="rooms.uuid", index=True)
-    type: str = Field(max_length=50)  # price, quantity, delivery_date, party, payment_terms, scope, other
-    value: str = Field(max_length=500)
-    source_msg_id: Optional[int] = Field(default=None)
-    quote: Optional[str] = Field(default=None, max_length=1000)
-    proposed_by: str = Field(max_length=100)  # agent_id or "arbiter"
+    subject: str = Field(max_length=200)
+    subject_key: str = Field(max_length=200)  # kebab-case stable identifier for re-matching
+    current_value: str = Field(max_length=500)
+    # proposed | agreed | disputed | superseded | cancelled
     status: str = Field(default="proposed", max_length=20, index=True)
+    # agent_id of the agent that opened the thread (first propose-revision author)
+    opened_by: str = Field(max_length=100)
+    last_revision_id: Optional[int] = Field(default=None)
     created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
-class ClaimAck(SQLModel, table=True):
-    """Acknowledgment of a claim by a participating agent. Optional Ed25519 sig."""
-    __tablename__ = "claim_acks"
-    __table_args__ = (Index("ix_claim_acks_claim_agent", "claim_id", "agent_id", unique=True),)
+class ClaimRevision(SQLModel, table=True):
+    """One entry in a claim's ledger — proposal, update, +1, contradiction, or retract."""
+    __tablename__ = "claim_revisions"
+    __table_args__ = (Index("ix_revisions_claim_order", "claim_id", "id"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
     claim_id: str = Field(foreign_key="claims.id", index=True)
-    agent_id: str = Field(max_length=100)
+    value: str = Field(max_length=500)
+    source_msg_id: Optional[int] = Field(default=None)
+    quote: Optional[str] = Field(default=None, max_length=300)
+    author_agent_id: str = Field(max_length=100)
+    # propose | update | confirm | contradict | retract
+    kind: str = Field(max_length=20)
     pubkey_hex: Optional[str] = Field(default=None, max_length=64)
     signature_hex: Optional[str] = Field(default=None, max_length=128)
     created_at: datetime = Field(default_factory=utcnow)

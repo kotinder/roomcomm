@@ -48,37 +48,69 @@ class RoomInfoOut(BaseModel):
         return v.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ----- Protocol / Claims -----
+# ----- Protocol / Claims (ledger model) -----
 
 class ClaimIn(BaseModel):
-    """Agent-proposed claim. All text in English."""
-    type: str = Field(min_length=1, max_length=50)
+    """Manually open a new thread. All text in English."""
+    subject: str = Field(min_length=1, max_length=200)
     value: str = Field(min_length=1, max_length=500)
-    proposed_by: str = Field(min_length=1, max_length=100)
+    opened_by: str = Field(min_length=1, max_length=100)
+    subject_key: Optional[str] = Field(default=None, max_length=200)
     source_msg_id: Optional[int] = None
-    quote: Optional[str] = Field(default=None, max_length=1000)
+    quote: Optional[str] = Field(default=None, max_length=300)
 
 
-class ClaimOut(BaseModel):
-    id: str
-    type: str
+class RevisionIn(BaseModel):
+    """Append a revision to an existing thread."""
+    agent_id: str = Field(min_length=1, max_length=100)
+    value: str = Field(min_length=1, max_length=500)
+    kind: str = Field(pattern="^(update|confirm|contradict|retract)$")
+    source_msg_id: Optional[int] = None
+    quote: Optional[str] = Field(default=None, max_length=300)
+    pubkey_hex: Optional[str] = None
+    signature_hex: Optional[str] = None
+
+
+class RevisionOut(BaseModel):
+    id: int
+    claim_id: str
     value: str
-    proposed_by: str
-    status: str
+    kind: str
+    author_agent_id: str
     source_msg_id: Optional[int]
     quote: Optional[str]
+    pubkey_hex: Optional[str]
+    signature_hex: Optional[str]
     created_at: datetime
-    acks: list[dict]
 
     @field_serializer("created_at")
     def _ser(self, v: datetime) -> str:
         return v.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class ClaimAckIn(BaseModel):
-    agent_id: str = Field(min_length=1, max_length=100)
-    pubkey_hex: Optional[str] = None
-    signature_hex: Optional[str] = None
+class ThreadOut(BaseModel):
+    id: str
+    subject: str
+    subject_key: str
+    current_value: str
+    status: str
+    opened_by: str
+    revisions_count: int
+    last_revision: Optional[RevisionOut]
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at")
+    def _ser_c(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @field_serializer("updated_at")
+    def _ser_u(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class ThreadDetailOut(ThreadOut):
+    revisions: list[RevisionOut]
 
 
 class DiscrepancyOut(BaseModel):
@@ -98,15 +130,10 @@ class DiscrepancyOut(BaseModel):
 class ContextOut(BaseModel):
     room_uuid: str
     protocol_mode: str
-    agreed: list[ClaimOut]
-    proposed: list[ClaimOut]
+    threads: list[ThreadOut]
     discrepancies: list[DiscrepancyOut]
-    context_hash: str  # sha256 of canonical agreed snapshot — used for handshake
-    last_refreshed_at: Optional[datetime] = None
-
-    @field_serializer("last_refreshed_at")
-    def _ser(self, v: Optional[datetime]) -> Optional[str]:
-        return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
+    context_hash: str
+    last_extracted_msg_id: int
 
 
 class HandshakeIn(BaseModel):

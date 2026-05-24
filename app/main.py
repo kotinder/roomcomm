@@ -124,11 +124,9 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
 
 from . import i18n, llm
 from .database import SKILLS_DIR, engine, get_session, init_db
-from .models import Claim, ClaimAck, Discrepancy, Handshake, Message, Room, Skill
+from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room, Skill
 from .schemas import (
-    ClaimAckIn,
     ClaimIn,
-    ClaimOut,
     ContextOut,
     DiscrepancyOut,
     HandshakeIn,
@@ -137,6 +135,8 @@ from .schemas import (
     MessageOut,
     MessagesPage,
     RefreshOut,
+    RevisionIn,
+    RevisionOut,
     RoomCreate,
     RoomCreateOut,
     RoomInfoOut,
@@ -144,6 +144,8 @@ from .schemas import (
     RoomListPage,
     SkillInfoOut,
     SkillUploadOut,
+    ThreadDetailOut,
+    ThreadOut,
 )
 
 log = logging.getLogger("roomcomm")
@@ -361,80 +363,303 @@ def post_message(
     return MessageOut(id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp)
 
 
-# ---------- Protocol (claims / context / handshake) ----------
+# ---------- Protocol (ledger: threads + revisions + handshake) ----------
 
-def _gather_messages(session: Session, room_uuid: str, limit: int = 200) -> list[dict]:
-    rows = session.exec(
-        select(Message).where(Message.room_uuid == room_uuid).order_by(Message.id.asc())
-    ).all()
-    rows = rows[-limit:]
-    return [{"id": m.id, "agent_id": m.agent_id, "text": m.text} for m in rows]
+REVISION_KINDS_FOR_OTHER = {"confirm", "contradict"}
+REVISION_KINDS_FOR_OWNER = {"update", "retract"}
+ALL_REVISION_KINDS = {"propose"} | REVISION_KINDS_FOR_OTHER | REVISION_KINDS_FOR_OWNER
 
 
-def _gather_claims(session: Session, room_uuid: str) -> tuple[list[Claim], list[Claim]]:
-    rows = session.exec(
+def _msg_dict(m: Message) -> dict:
+    return {"id": m.id, "agent_id": m.agent_id, "text": m.text}
+
+
+def _gather_threads(session: Session, room_uuid: str) -> list[Claim]:
+    return session.exec(
         select(Claim).where(Claim.room_uuid == room_uuid).order_by(Claim.created_at.asc())
     ).all()
-    agreed = [c for c in rows if c.status == "agreed"]
-    proposed = [c for c in rows if c.status == "proposed"]
-    return agreed, proposed
 
 
-def _claim_acks(session: Session, claim_id: str) -> list[dict]:
-    rows = session.exec(select(ClaimAck).where(ClaimAck.claim_id == claim_id)).all()
+def _thread_summaries(threads: list[Claim]) -> list[dict]:
+    """Compact list passed to the LLM."""
     return [
         {
-            "agent_id": a.agent_id,
-            "pubkey_hex": a.pubkey_hex,
-            "signed": bool(a.signature_hex),
-            "created_at": a.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "id": c.id,
+            "subject": c.subject,
+            "subject_key": c.subject_key,
+            "current_value": c.current_value,
+            "status": c.status,
+            "opened_by": c.opened_by,
         }
-        for a in rows
+        for c in threads
     ]
 
 
-def _claim_to_out(session: Session, c: Claim) -> ClaimOut:
-    return ClaimOut(
-        id=c.id, type=c.type, value=c.value, proposed_by=c.proposed_by,
-        status=c.status, source_msg_id=c.source_msg_id, quote=c.quote,
-        created_at=c.created_at, acks=_claim_acks(session, c.id),
+def _revisions_of(session: Session, claim_id: str) -> list[ClaimRevision]:
+    return session.exec(
+        select(ClaimRevision).where(ClaimRevision.claim_id == claim_id).order_by(ClaimRevision.id.asc())
+    ).all()
+
+
+def _revision_to_out(r: ClaimRevision) -> RevisionOut:
+    return RevisionOut(
+        id=r.id, claim_id=r.claim_id, value=r.value, kind=r.kind,
+        author_agent_id=r.author_agent_id, source_msg_id=r.source_msg_id,
+        quote=r.quote, pubkey_hex=r.pubkey_hex, signature_hex=r.signature_hex,
+        created_at=r.created_at,
     )
 
 
-def _canonical_context_hash(agreed: list[Claim]) -> str:
-    """Stable sha256 over agreed claims — used as handshake target."""
+def _thread_to_out(session: Session, c: Claim, include_revisions: bool = False) -> ThreadOut:
+    revs = _revisions_of(session, c.id)
+    last = _revision_to_out(revs[-1]) if revs else None
+    base = dict(
+        id=c.id, subject=c.subject, subject_key=c.subject_key,
+        current_value=c.current_value, status=c.status, opened_by=c.opened_by,
+        revisions_count=len(revs), last_revision=last,
+        created_at=c.created_at, updated_at=c.updated_at,
+    )
+    if include_revisions:
+        return ThreadDetailOut(**base, revisions=[_revision_to_out(r) for r in revs])
+    return ThreadOut(**base)
+
+
+def _canonical_threads_hash(threads: list[Claim]) -> str:
+    """Stable sha256 over current state of all non-cancelled threads.
+
+    Used as the handshake target — both sides sign the same hash to lock the
+    deal. Hash changes any time a thread's current_value or status flips.
+    """
     snapshot = [
-        {"id": c.id, "type": c.type, "value": c.value, "source_msg_id": c.source_msg_id}
-        for c in sorted(agreed, key=lambda x: x.created_at)
+        {
+            "id": c.id,
+            "subject": c.subject,
+            "subject_key": c.subject_key,
+            "current_value": c.current_value,
+            "status": c.status,
+        }
+        for c in sorted(
+            [t for t in threads if t.status != "cancelled"],
+            key=lambda x: x.created_at,
+        )
     ]
     return hashlib.sha256(
         json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
-def _maybe_promote_to_agreed(session: Session, claim: Claim) -> None:
-    """A claim moves to 'agreed' when ≥ 2 distinct agents have acked it, and
-    at least one of them is not the original proposer (so the proposer
-    cannot self-confirm)."""
-    if claim.status == "agreed":
-        return
-    ack_agents = {
-        a.agent_id for a in session.exec(
-            select(ClaimAck).where(ClaimAck.claim_id == claim.id)
+def _add_revision(
+    session: Session,
+    claim: Claim,
+    *,
+    value: str,
+    kind: str,
+    author_agent_id: str,
+    source_msg_id: Optional[int] = None,
+    quote: Optional[str] = None,
+    pubkey_hex: Optional[str] = None,
+    signature_hex: Optional[str] = None,
+) -> ClaimRevision:
+    """Append a revision and update the thread's current_value / status.
+
+    Status rules (see plan):
+      • propose     → status starts as 'proposed' (handled at thread creation)
+      • update by owner: if was 'agreed', drop back to 'proposed' (needs re-confirm)
+      • confirm by ≥ 2 distinct non-owners → 'agreed'
+      • contradict by anyone other than owner on 'agreed' → 'disputed'
+      • retract by owner → 'cancelled'
+    """
+    rev = ClaimRevision(
+        claim_id=claim.id, value=value, kind=kind,
+        author_agent_id=author_agent_id,
+        source_msg_id=source_msg_id, quote=quote,
+        pubkey_hex=pubkey_hex, signature_hex=signature_hex,
+    )
+    session.add(rev)
+    session.flush()  # populate rev.id
+    claim.last_revision_id = rev.id
+    claim.updated_at = rev.created_at
+
+    if kind == "update":
+        claim.current_value = value
+        if claim.status == "agreed":
+            claim.status = "proposed"
+    elif kind == "retract":
+        claim.status = "cancelled"
+    elif kind == "contradict":
+        # arbiter emits this when an agent disagrees with current_value
+        if claim.status == "agreed":
+            claim.status = "disputed"
+    elif kind == "confirm":
+        # Promote to 'agreed' when ≥ 2 distinct confirmers exist and at least
+        # one isn't the opener.
+        confirm_agents = {
+            r.author_agent_id for r in _revisions_of(session, claim.id)
+            if r.kind == "confirm"
+        }
+        non_owner = confirm_agents - {claim.opened_by}
+        if len(confirm_agents) >= 2 and non_owner and claim.status in ("proposed", "disputed"):
+            claim.status = "agreed"
+    session.add(claim)
+    return rev
+
+
+def _open_thread(
+    session: Session,
+    room_uuid: str,
+    *,
+    subject: str,
+    subject_key: str,
+    value: str,
+    opened_by: str,
+    source_msg_id: Optional[int] = None,
+    quote: Optional[str] = None,
+) -> Claim:
+    """Create a new thread with an initial propose-revision."""
+    claim = Claim(
+        id=str(uuid_lib.uuid4()),
+        room_uuid=room_uuid,
+        subject=subject[:200],
+        subject_key=subject_key[:200],
+        current_value=value[:500],
+        status="proposed",
+        opened_by=opened_by,
+    )
+    session.add(claim)
+    session.flush()
+    _add_revision(
+        session, claim,
+        value=value[:500], kind="propose", author_agent_id=opened_by,
+        source_msg_id=source_msg_id, quote=quote,
+    )
+    return claim
+
+
+# ----- LLM processing -----
+
+async def _process_new_messages_for_room(session: Session, room_uuid: str, *, full: bool = False) -> dict:
+    """Incrementally feed new messages to the arbiter, applying its output.
+
+    Returns counters {processed_msgs, new_threads, revisions, discrepancies,
+    model_used, elapsed_ms}.
+    """
+    started = time.monotonic()
+    room = session.get(Room, room_uuid)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    if full:
+        room.last_extracted_msg_id = 0
+        session.add(room)
+        session.commit()
+
+    new_msgs = session.exec(
+        select(Message).where(
+            Message.room_uuid == room_uuid,
+            Message.id > room.last_extracted_msg_id,
+        ).order_by(Message.id.asc())
+    ).all()
+    if not new_msgs:
+        return {
+            "processed_msgs": 0, "new_threads": 0, "revisions": 0,
+            "discrepancies": 0, "model_used": "noop", "elapsed_ms": 0,
+        }
+
+    new_threads = 0
+    revisions = 0
+    discs = 0
+    last_model_used = "noop"
+
+    for msg in new_msgs:
+        threads = _gather_threads(session, room_uuid)
+        thread_payload = _thread_summaries(threads)
+        thread_by_id = {t.id: t for t in threads}
+
+        tail_rows = session.exec(
+            select(Message).where(
+                Message.room_uuid == room_uuid,
+                Message.id < msg.id,
+            ).order_by(Message.id.desc()).limit(4)
         ).all()
+        tail = [_msg_dict(m) for m in reversed(tail_rows)]
+
+        try:
+            out, model_used = await llm.process_message(_msg_dict(msg), tail, thread_payload)
+            last_model_used = model_used
+        except llm.LLMUnavailable as e:
+            log.warning("LLM unavailable while processing msg #%s: %r", msg.id, e)
+            # Don't update the watermark — try again next refresh.
+            break
+
+        for nc in out["new_claims"]:
+            _open_thread(
+                session, room_uuid,
+                subject=nc["subject"], subject_key=nc["subject_key"],
+                value=nc["value"], opened_by="arbiter",
+                source_msg_id=msg.id, quote=nc.get("quote"),
+            )
+            new_threads += 1
+
+        for upd in out["updates"]:
+            target = thread_by_id.get(upd["thread_id"])
+            if target is None:
+                continue
+            # The arbiter attributes the revision to the message author —
+            # it's a transcription of what the human/agent said.
+            _add_revision(
+                session, target,
+                value=upd["value"], kind=upd["kind"],
+                author_agent_id=msg.agent_id,
+                source_msg_id=msg.id, quote=upd.get("quote"),
+            )
+            revisions += 1
+
+        for d in out["discrepancies"]:
+            session.add(Discrepancy(
+                room_uuid=room_uuid,
+                description=d["description"], severity=d["severity"],
+                related_msg_id=msg.id, related_claim_id=d.get("related_thread_id"),
+            ))
+            discs += 1
+
+        room.last_extracted_msg_id = msg.id
+        session.add(room)
+        session.commit()
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    return {
+        "processed_msgs": len(new_msgs), "new_threads": new_threads,
+        "revisions": revisions, "discrepancies": discs,
+        "model_used": last_model_used, "elapsed_ms": elapsed_ms,
     }
-    others = ack_agents - {claim.proposed_by}
-    if len(ack_agents) >= 2 and others:
-        claim.status = "agreed"
-        session.add(claim)
 
 
-@app.post("/api/rooms/{room_uuid}/claims", response_model=ClaimOut, status_code=201)
-def propose_claim(
+async def _refresh_room_context_bg(room_uuid: str) -> None:
+    """Background variant — fresh session, swallows errors to log."""
+    try:
+        async with _refresh_locks[room_uuid]:
+            from .database import engine as _eng
+            with Session(_eng) as s:
+                out = await _process_new_messages_for_room(s, room_uuid)
+                log.info(
+                    "bg refresh %s: msgs=%d threads+%d revs+%d discs+%d model=%s %dms",
+                    room_uuid, out["processed_msgs"], out["new_threads"],
+                    out["revisions"], out["discrepancies"],
+                    out["model_used"], out["elapsed_ms"],
+                )
+    except Exception as e:
+        log.warning("background refresh failed for %s: %r", room_uuid, e)
+
+
+# ----- Manual claim/revision endpoints -----
+
+@app.post("/api/rooms/{room_uuid}/claims", response_model=ThreadOut, status_code=201)
+def open_claim(
     room_uuid: str,
     payload: ClaimIn,
     session: Session = Depends(get_session),
 ):
+    """Manually open a new thread with an initial propose-revision."""
     room_uuid = _validate_uuid(room_uuid)
     _get_room_or_404(session, room_uuid)
     if payload.source_msg_id is not None:
@@ -442,38 +667,76 @@ def propose_claim(
         if msg is None or msg.room_uuid != room_uuid:
             raise HTTPException(status_code=400,
                                 detail="source_msg_id does not belong to this room")
-    claim = Claim(
-        id=str(uuid_lib.uuid4()),
-        room_uuid=room_uuid,
-        type=payload.type.strip().lower()[:50],
-        value=payload.value.strip()[:500],
+    subject_key = (payload.subject_key or payload.subject).strip().lower()
+    import re
+    subject_key = re.sub(r"[^a-z0-9]+", "-", subject_key).strip("-")[:60] or "thread"
+
+    claim = _open_thread(
+        session, room_uuid,
+        subject=payload.subject.strip(), subject_key=subject_key,
+        value=payload.value.strip(), opened_by=payload.opened_by.strip(),
         source_msg_id=payload.source_msg_id,
         quote=(payload.quote or None),
-        proposed_by=payload.proposed_by.strip(),
-        status="proposed",
     )
-    session.add(claim)
-    # The proposer is auto-counted as having ack'd their own claim.
-    session.add(ClaimAck(
-        claim_id=claim.id, agent_id=claim.proposed_by,
-    ))
     session.commit()
     session.refresh(claim)
-    return _claim_to_out(session, claim)
+    return _thread_to_out(session, claim)
 
 
-@app.post("/api/rooms/{room_uuid}/claims/{claim_id}/ack", response_model=ClaimOut)
-def ack_claim(
+@app.get("/api/rooms/{room_uuid}/claims/{claim_id}", response_model=ThreadDetailOut)
+def get_claim(
     room_uuid: str,
     claim_id: str,
-    payload: ClaimAckIn,
     session: Session = Depends(get_session),
 ):
     room_uuid = _validate_uuid(room_uuid)
     _get_room_or_404(session, room_uuid)
     claim = session.get(Claim, claim_id)
     if claim is None or claim.room_uuid != room_uuid:
-        raise HTTPException(status_code=404, detail="claim not found in this room")
+        raise HTTPException(status_code=404, detail="thread not found in this room")
+    return _thread_to_out(session, claim, include_revisions=True)
+
+
+@app.get("/api/rooms/{room_uuid}/claims/{claim_id}/revisions", response_model=list[RevisionOut])
+def list_revisions(
+    room_uuid: str,
+    claim_id: str,
+    session: Session = Depends(get_session),
+):
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    claim = session.get(Claim, claim_id)
+    if claim is None or claim.room_uuid != room_uuid:
+        raise HTTPException(status_code=404, detail="thread not found in this room")
+    return [_revision_to_out(r) for r in _revisions_of(session, claim_id)]
+
+
+@app.post("/api/rooms/{room_uuid}/claims/{claim_id}/revisions",
+          response_model=ThreadDetailOut, status_code=201)
+def append_revision(
+    room_uuid: str,
+    claim_id: str,
+    payload: RevisionIn,
+    session: Session = Depends(get_session),
+):
+    """Manually append a revision (update / confirm / contradict / retract)."""
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    claim = session.get(Claim, claim_id)
+    if claim is None or claim.room_uuid != room_uuid:
+        raise HTTPException(status_code=404, detail="thread not found in this room")
+
+    agent_id = payload.agent_id.strip()
+    kind = payload.kind
+
+    # Owner-only kinds.
+    if kind in REVISION_KINDS_FOR_OWNER and agent_id != claim.opened_by:
+        raise HTTPException(status_code=403,
+                            detail=f"only the thread owner ({claim.opened_by}) can {kind} it")
+    # Other-side kinds: opener shouldn't confirm their own.
+    if kind == "confirm" and agent_id == claim.opened_by:
+        raise HTTPException(status_code=400,
+                            detail="the opener cannot confirm their own thread")
 
     if (payload.pubkey_hex is None) != (payload.signature_hex is None):
         raise HTTPException(status_code=400,
@@ -482,41 +745,34 @@ def ack_claim(
         raise HTTPException(status_code=400, detail="pubkey_hex must be 64 hex chars")
     if payload.signature_hex and not _HEX128_RE.match(payload.signature_hex):
         raise HTTPException(status_code=400, detail="signature_hex must be 128 hex chars")
-
-    # If signed, verify against canonical claim string.
     if payload.pubkey_hex and payload.signature_hex:
-        canonical = f"{claim.id}|{claim.type}|{claim.value}".encode("utf-8")
+        canonical = f"{claim.id}|{kind}|{payload.value}".encode("utf-8")
         if not _verify_ed25519_sig(payload.pubkey_hex, canonical, payload.signature_hex):
             raise HTTPException(status_code=400,
-                                detail="signature does not verify against claim canonical bytes")
+                                detail="signature does not verify against revision canonical bytes")
 
-    # Idempotent ack — one per (claim, agent).
-    existing = session.exec(
-        select(ClaimAck).where(
-            ClaimAck.claim_id == claim_id,
-            ClaimAck.agent_id == payload.agent_id.strip(),
-        )
-    ).first()
-    if existing is None:
-        session.add(ClaimAck(
-            claim_id=claim_id,
-            agent_id=payload.agent_id.strip(),
-            pubkey_hex=payload.pubkey_hex,
-            signature_hex=payload.signature_hex,
-        ))
-        session.commit()
+    if payload.source_msg_id is not None:
+        msg = session.get(Message, payload.source_msg_id)
+        if msg is None or msg.room_uuid != room_uuid:
+            raise HTTPException(status_code=400,
+                                detail="source_msg_id does not belong to this room")
 
-    _maybe_promote_to_agreed(session, claim)
+    _add_revision(
+        session, claim,
+        value=payload.value.strip(), kind=kind, author_agent_id=agent_id,
+        source_msg_id=payload.source_msg_id, quote=(payload.quote or None),
+        pubkey_hex=payload.pubkey_hex, signature_hex=payload.signature_hex,
+    )
     session.commit()
     session.refresh(claim)
-    return _claim_to_out(session, claim)
+    return _thread_to_out(session, claim, include_revisions=True)
 
 
 @app.get("/api/rooms/{room_uuid}/context", response_model=ContextOut)
 def get_context(room_uuid: str, session: Session = Depends(get_session)):
     room_uuid = _validate_uuid(room_uuid)
     room = _get_room_or_404(session, room_uuid)
-    agreed, proposed = _gather_claims(session, room_uuid)
+    threads = _gather_threads(session, room_uuid)
     discs = session.exec(
         select(Discrepancy).where(
             Discrepancy.room_uuid == room_uuid,
@@ -526,8 +782,7 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
     return ContextOut(
         room_uuid=room_uuid,
         protocol_mode=room.protocol_mode,
-        agreed=[_claim_to_out(session, c) for c in agreed],
-        proposed=[_claim_to_out(session, c) for c in proposed],
+        threads=[_thread_to_out(session, c) for c in threads],
         discrepancies=[
             DiscrepancyOut(
                 id=d.id, description=d.description, severity=d.severity,
@@ -536,80 +791,18 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
             )
             for d in discs
         ],
-        context_hash=_canonical_context_hash(agreed),
+        context_hash=_canonical_threads_hash(threads),
+        last_extracted_msg_id=room.last_extracted_msg_id,
     )
-
-
-async def _refresh_room_context_bg(room_uuid: str) -> None:
-    """Background variant — uses its own session, swallows errors to log."""
-    try:
-        async with _refresh_locks[room_uuid]:
-            from .database import engine as _eng
-            with Session(_eng) as s:
-                extracted, discs, model_used, ms = await _do_refresh(s, room_uuid)
-                log.info(
-                    "bg refresh %s: +%d claims, +%d discrepancies, model=%s, %dms",
-                    room_uuid, extracted, discs, model_used, ms,
-                )
-    except Exception as e:
-        log.warning("background refresh failed for %s: %r", room_uuid, e)
-
-
-async def _do_refresh(session: Session, room_uuid: str) -> tuple[int, int, str, int]:
-    """Call LLM, insert new claims/discrepancies. Returns (extracted, discs, model, ms)."""
-    started = time.monotonic()
-    msgs = _gather_messages(session, room_uuid, limit=200)
-    if not msgs:
-        return 0, 0, "noop", 0
-    agreed, proposed = _gather_claims(session, room_uuid)
-    agreed_payload = [
-        {"id": c.id, "type": c.type, "value": c.value} for c in agreed
-    ]
-    proposed_payload = [
-        {"id": c.id, "type": c.type, "value": c.value, "proposed_by": c.proposed_by}
-        for c in proposed
-    ]
-    output, model_used = await llm.extract_claims(msgs, agreed_payload, proposed_payload)
-
-    # Dedup against existing claims by (type, normalized value).
-    existing_keys = {(c.type, c.value.strip().lower()) for c in agreed + proposed}
-    new_claims = 0
-    for item in output["extracted"]:
-        key = (item["type"], item["value"].strip().lower())
-        if key in existing_keys:
-            continue
-        existing_keys.add(key)
-        session.add(Claim(
-            id=str(uuid_lib.uuid4()),
-            room_uuid=room_uuid,
-            type=item["type"], value=item["value"],
-            source_msg_id=item["source_msg_id"], quote=item.get("quote"),
-            proposed_by="arbiter",
-            status="proposed",
-        ))
-        new_claims += 1
-
-    new_discs = 0
-    for item in output["discrepancies"]:
-        session.add(Discrepancy(
-            room_uuid=room_uuid,
-            description=item["description"],
-            severity=item["severity"],
-            related_msg_id=item.get("related_msg_id"),
-            related_claim_id=item.get("related_claim_id"),
-        ))
-        new_discs += 1
-
-    session.commit()
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    return new_claims, new_discs, model_used, elapsed_ms
 
 
 @app.post("/api/rooms/{room_uuid}/context/refresh", response_model=RefreshOut)
 async def refresh_context(
     room_uuid: str,
+    full: bool = Query(default=False),
     session: Session = Depends(get_session),
 ):
+    """Run the LLM arbiter against new messages (or all, with `?full=true`)."""
     room_uuid = _validate_uuid(room_uuid)
     _get_room_or_404(session, room_uuid)
     if not llm.is_configured():
@@ -617,12 +810,14 @@ async def refresh_context(
                             detail="LLM arbiter not configured on this server")
     async with _refresh_locks[room_uuid]:
         try:
-            extracted, discs, model_used, ms = await _do_refresh(session, room_uuid)
+            out = await _process_new_messages_for_room(session, room_uuid, full=full)
         except llm.LLMUnavailable as e:
             raise HTTPException(status_code=502, detail=f"LLM arbiter failed: {e}")
     return RefreshOut(
-        extracted=extracted, discrepancies_found=discs,
-        model_used=model_used, elapsed_ms=ms,
+        extracted=out["new_threads"] + out["revisions"],
+        discrepancies_found=out["discrepancies"],
+        model_used=out["model_used"],
+        elapsed_ms=out["elapsed_ms"],
     )
 
 
@@ -632,7 +827,7 @@ def handshake(
     payload: HandshakeIn,
     session: Session = Depends(get_session),
 ):
-    """Record one agent's final signature over the agreed-context hash.
+    """Record one agent's final signature over the canonical threads hash.
 
     Two distinct handshakes (different agent_id) with matching context_hash =
     the deal is sealed. Server only stores and verifies signature shape; it
@@ -640,8 +835,8 @@ def handshake(
     """
     room_uuid = _validate_uuid(room_uuid)
     _get_room_or_404(session, room_uuid)
-    agreed, _ = _gather_claims(session, room_uuid)
-    current_hash = _canonical_context_hash(agreed)
+    threads = _gather_threads(session, room_uuid)
+    current_hash = _canonical_threads_hash(threads)
     if payload.context_hash != current_hash:
         raise HTTPException(
             status_code=409,
@@ -1058,14 +1253,14 @@ def admin_delete_room(
     room = session.get(Room, room_uuid)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
-    # cascade: ack rows reference claims; delete acks first, then dependents
+    # cascade: revisions FK claims; delete child rows first
     claim_ids = [
         c.id for c in session.exec(
             select(Claim).where(Claim.room_uuid == room_uuid)
         ).all()
     ]
     if claim_ids:
-        session.exec(delete(ClaimAck).where(ClaimAck.claim_id.in_(claim_ids)))
+        session.exec(delete(ClaimRevision).where(ClaimRevision.claim_id.in_(claim_ids)))
     session.exec(delete(Claim).where(Claim.room_uuid == room_uuid))
     session.exec(delete(Discrepancy).where(Discrepancy.room_uuid == room_uuid))
     session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))

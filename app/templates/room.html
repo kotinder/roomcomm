@@ -75,13 +75,8 @@
           </p>
 
           <section class="context-section">
-            <h3>✅ <span>{{ t.context_agreed }}</span> <span id="agreed-count" class="count">0</span></h3>
-            <ul id="agreed-list" class="claim-list"></ul>
-          </section>
-
-          <section class="context-section">
-            <h3>🟡 <span>{{ t.context_proposed }}</span> <span id="proposed-count" class="count">0</span></h3>
-            <ul id="proposed-list" class="claim-list"></ul>
+            <h3>📋 <span>{{ t.context_threads }}</span> <span id="threads-count" class="count">0</span></h3>
+            <ul id="threads-list" class="thread-list"></ul>
           </section>
 
           <section class="context-section">
@@ -170,57 +165,134 @@
     }
     setInterval(poll, 3000);
 
-    // ---------- Room Context panel ----------
+    // ---------- Room Context panel (ledger model) ----------
     const T_REFRESHING = "{{ t.context_refreshing }}";
     const T_REFRESH_OK = "{{ t.context_refresh_ok }}";
     const T_REFRESH_ERR = "{{ t.context_refresh_err }}";
     const T_REFRESH_DISABLED = "{{ t.context_refresh_disabled }}";
-    const T_NO_CLAIMS = "{{ t.context_no_claims }}";
+    const T_NO_THREADS = "{{ t.context_no_threads }}";
     const T_NO_DISC = "{{ t.context_no_disc }}";
     const T_FROM_MSG = "{{ t.context_from_msg }}";
     const T_ARBITER = "{{ t.context_arbiter }}";
-    const T_ACKED_BY = "{{ t.context_acked_by }}";
+    const T_REVISIONS = "{{ t.context_revisions }}";
+    const T_OPENED_BY = "{{ t.context_opened_by }}";
+    const T_STATUS = {
+      proposed:   "{{ t.thread_status_proposed }}",
+      agreed:     "{{ t.thread_status_agreed }}",
+      disputed:   "{{ t.thread_status_disputed }}",
+      cancelled:  "{{ t.thread_status_cancelled }}",
+      superseded: "{{ t.thread_status_superseded }}",
+    };
+    const T_KIND = {
+      propose:    "{{ t.thread_kind_propose }}",
+      update:     "{{ t.thread_kind_update }}",
+      confirm:    "{{ t.thread_kind_confirm }}",
+      contradict: "{{ t.thread_kind_contradict }}",
+      retract:    "{{ t.thread_kind_retract }}",
+    };
 
-    function renderClaim(c) {
+    function jumpToMsg(msgId) {
+      const el = document.querySelector(`article.message[data-id="${msgId}"]`);
+      if (el) {
+        el.scrollIntoView({behavior: 'smooth', block: 'center'});
+        el.classList.add('msg-highlight');
+        setTimeout(() => el.classList.remove('msg-highlight'), 2000);
+      }
+    }
+
+    function msgLink(msgId) {
+      const a = document.createElement('a');
+      a.className = 'claim-src';
+      a.href = '#msg-' + msgId;
+      a.textContent = T_FROM_MSG + ' #' + msgId;
+      a.addEventListener('click', (e) => { e.preventDefault(); jumpToMsg(msgId); });
+      return a;
+    }
+
+    function statusBadge(status) {
+      const span = document.createElement('span');
+      span.className = 'thread-status thread-status-' + status;
+      span.textContent = T_STATUS[status] || status;
+      return span;
+    }
+
+    function renderRevision(r, isCurrent) {
       const li = document.createElement('li');
-      li.className = 'claim';
-      const author = c.proposed_by === 'arbiter' ? `🤖 ${T_ARBITER}` : c.proposed_by;
+      li.className = 'revision revision-' + r.kind + (isCurrent ? ' revision-current' : '');
       const head = document.createElement('div');
-      head.className = 'claim-head';
-      head.innerHTML = `<span class="claim-type">${escapeHtml(c.type)}</span> <span class="claim-author">${escapeHtml(author)}</span>`;
-      const val = document.createElement('div');
-      val.className = 'claim-value';
-      val.textContent = c.value;
+      head.className = 'revision-head';
+      const author = r.author_agent_id === 'arbiter' ? `🤖 ${T_ARBITER}` : r.author_agent_id;
+      head.innerHTML =
+        `<span class="revision-kind">${escapeHtml(T_KIND[r.kind] || r.kind)}</span>` +
+        ` <span class="revision-author">${escapeHtml(author)}</span>` +
+        (r.signature_hex ? ' 🔏' : '');
       li.appendChild(head);
+      const val = document.createElement('div');
+      val.className = 'revision-value';
+      val.textContent = r.value;
       li.appendChild(val);
-      if (c.quote) {
+      if (r.quote) {
         const q = document.createElement('blockquote');
         q.className = 'claim-quote';
-        q.textContent = '« ' + c.quote + ' »';
+        q.textContent = '« ' + r.quote + ' »';
         li.appendChild(q);
       }
-      if (c.source_msg_id) {
-        const src = document.createElement('a');
-        src.className = 'claim-src';
-        src.href = '#msg-' + c.source_msg_id;
-        src.textContent = T_FROM_MSG + ' #' + c.source_msg_id;
-        src.addEventListener('click', (e) => {
-          e.preventDefault();
-          const el = document.querySelector(`article.message[data-id="${c.source_msg_id}"]`);
-          if (el) {
-            el.scrollIntoView({behavior: 'smooth', block: 'center'});
-            el.classList.add('msg-highlight');
-            setTimeout(() => el.classList.remove('msg-highlight'), 2000);
-          }
-        });
-        li.appendChild(src);
+      if (r.source_msg_id) li.appendChild(msgLink(r.source_msg_id));
+      return li;
+    }
+
+    function renderThread(t) {
+      const li = document.createElement('li');
+      li.className = 'thread thread-' + t.status;
+      const head = document.createElement('div');
+      head.className = 'thread-head';
+      head.appendChild(statusBadge(t.status));
+      const subj = document.createElement('span');
+      subj.className = 'thread-subject';
+      subj.textContent = t.subject;
+      head.appendChild(subj);
+      li.appendChild(head);
+
+      const val = document.createElement('div');
+      val.className = 'thread-value';
+      val.textContent = t.current_value;
+      li.appendChild(val);
+
+      const meta = document.createElement('div');
+      meta.className = 'thread-meta muted';
+      const opener = t.opened_by === 'arbiter' ? `🤖 ${T_ARBITER}` : t.opened_by;
+      meta.textContent = `${T_OPENED_BY} ${opener} · ${t.revisions_count} ${T_REVISIONS}`;
+      if (t.last_revision && t.last_revision.source_msg_id) {
+        meta.appendChild(document.createTextNode(' · '));
+        meta.appendChild(msgLink(t.last_revision.source_msg_id));
       }
-      const acks = (c.acks || []).map(a => a.agent_id + (a.signed ? ' 🔏' : ''));
-      if (acks.length) {
-        const ackEl = document.createElement('div');
-        ackEl.className = 'claim-acks muted';
-        ackEl.textContent = T_ACKED_BY + ': ' + acks.join(', ');
-        li.appendChild(ackEl);
+      li.appendChild(meta);
+
+      // Expandable ledger
+      if (t.revisions_count > 0) {
+        const details = document.createElement('details');
+        details.className = 'thread-ledger';
+        const summary = document.createElement('summary');
+        summary.textContent = `▾ ${T_REVISIONS} (${t.revisions_count})`;
+        details.appendChild(summary);
+        const ledgerList = document.createElement('ol');
+        ledgerList.className = 'revision-list';
+        details.appendChild(ledgerList);
+        details.addEventListener('toggle', async (e) => {
+          if (!details.open || ledgerList.dataset.loaded === '1') return;
+          ledgerList.innerHTML = '';
+          try {
+            const res = await fetch(`/api/rooms/${ROOM_UUID}/claims/${t.id}/revisions`);
+            if (!res.ok) return;
+            const revs = await res.json();
+            const lastId = revs.length ? revs[revs.length - 1].id : null;
+            for (const r of revs) {
+              ledgerList.appendChild(renderRevision(r, r.id === lastId));
+            }
+            ledgerList.dataset.loaded = '1';
+          } catch (_) {}
+        });
+        li.appendChild(details);
       }
       return li;
     }
@@ -236,22 +308,7 @@
       desc.textContent = d.description;
       li.appendChild(sev);
       li.appendChild(desc);
-      if (d.related_msg_id) {
-        const src = document.createElement('a');
-        src.className = 'claim-src';
-        src.href = '#msg-' + d.related_msg_id;
-        src.textContent = T_FROM_MSG + ' #' + d.related_msg_id;
-        src.addEventListener('click', (e) => {
-          e.preventDefault();
-          const el = document.querySelector(`article.message[data-id="${d.related_msg_id}"]`);
-          if (el) {
-            el.scrollIntoView({behavior: 'smooth', block: 'center'});
-            el.classList.add('msg-highlight');
-            setTimeout(() => el.classList.remove('msg-highlight'), 2000);
-          }
-        });
-        li.appendChild(src);
-      }
+      if (d.related_msg_id) li.appendChild(msgLink(d.related_msg_id));
       return li;
     }
 
@@ -260,30 +317,27 @@
         const res = await fetch(`/api/rooms/${ROOM_UUID}/context`);
         if (!res.ok) return;
         const ctx = await res.json();
-        const agreedList = document.getElementById('agreed-list');
-        const proposedList = document.getElementById('proposed-list');
+        const threadsList = document.getElementById('threads-list');
         const discList = document.getElementById('disc-list');
-        agreedList.innerHTML = '';
-        proposedList.innerHTML = '';
+        threadsList.innerHTML = '';
         discList.innerHTML = '';
 
-        if (!ctx.agreed.length) {
-          agreedList.innerHTML = `<li class="muted empty">${T_NO_CLAIMS}</li>`;
+        if (!ctx.threads.length) {
+          threadsList.innerHTML = `<li class="muted empty">${T_NO_THREADS}</li>`;
         } else {
-          for (const c of ctx.agreed) agreedList.appendChild(renderClaim(c));
-        }
-        if (!ctx.proposed.length) {
-          proposedList.innerHTML = `<li class="muted empty">${T_NO_CLAIMS}</li>`;
-        } else {
-          for (const c of ctx.proposed) proposedList.appendChild(renderClaim(c));
+          // Sort: agreed first, then proposed/disputed, then cancelled last; within group by updated_at desc
+          const order = {agreed: 0, disputed: 1, proposed: 2, superseded: 3, cancelled: 4};
+          const sorted = [...ctx.threads].sort((a, b) =>
+            (order[a.status] ?? 9) - (order[b.status] ?? 9) ||
+            (b.updated_at || '').localeCompare(a.updated_at || ''));
+          for (const t of sorted) threadsList.appendChild(renderThread(t));
         }
         if (!ctx.discrepancies.length) {
           discList.innerHTML = `<li class="muted empty">${T_NO_DISC}</li>`;
         } else {
           for (const d of ctx.discrepancies) discList.appendChild(renderDisc(d));
         }
-        document.getElementById('agreed-count').textContent = ctx.agreed.length;
-        document.getElementById('proposed-count').textContent = ctx.proposed.length;
+        document.getElementById('threads-count').textContent = ctx.threads.length;
         document.getElementById('disc-count').textContent = ctx.discrepancies.length;
         document.getElementById('context-hash-val').textContent = ctx.context_hash.slice(0, 16) + '…';
         document.getElementById('context-hash-val').title = ctx.context_hash;

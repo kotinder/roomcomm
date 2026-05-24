@@ -206,7 +206,8 @@ def test_skill_signature_valid_and_invalid():
     assert r2.status_code == 400
 
 
-# ---------- Protocol / claims / arbiter ----------
+# ---------- Protocol / ledger (threads + revisions) ----------
+
 
 def test_room_protocol_mode_default_and_premium():
     r = client.post("/api/rooms", json={"description": "x"})
@@ -215,62 +216,112 @@ def test_room_protocol_mode_default_and_premium():
     assert r2.status_code == 201 and r2.json()["protocol_mode"] == "premium"
 
 
-def test_propose_and_ack_claim_promotes_to_agreed():
+def test_open_thread_and_confirm_promotes_to_agreed():
     uid = _new_room()
-    # propose by alice
+    # alice opens a thread
     r = client.post(f"/api/rooms/{uid}/claims", json={
-        "type": "price", "value": "1000 USD", "proposed_by": "alice",
+        "subject": "Project deadline", "value": "deliver by Friday", "opened_by": "alice",
     })
-    assert r.status_code == 201
-    claim_id = r.json()["id"]
+    assert r.status_code == 201, r.text
+    cid = r.json()["id"]
     assert r.json()["status"] == "proposed"
-    # ack by bob (a different agent) — should auto-promote to agreed
-    r2 = client.post(f"/api/rooms/{uid}/claims/{claim_id}/ack",
-                     json={"agent_id": "bob"})
-    assert r2.status_code == 200
-    assert r2.json()["status"] == "agreed"
+    assert r.json()["revisions_count"] == 1
 
-
-def test_self_ack_does_not_promote():
-    uid = _new_room()
-    r = client.post(f"/api/rooms/{uid}/claims", json={
-        "type": "quantity", "value": "100 units", "proposed_by": "alice",
+    # bob confirms — still proposed (need 2 distinct confirmers)
+    r2 = client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "bob", "value": "deliver by Friday", "kind": "confirm",
     })
-    claim_id = r.json()["id"]
-    # alice acks her own claim — should remain proposed
-    r2 = client.post(f"/api/rooms/{uid}/claims/{claim_id}/ack",
-                     json={"agent_id": "alice"})
+    assert r2.status_code == 201
     assert r2.json()["status"] == "proposed"
 
+    # carol confirms — now ≥ 2 distinct non-owner confirmers → agreed
+    r3 = client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "carol", "value": "deliver by Friday", "kind": "confirm",
+    })
+    assert r3.json()["status"] == "agreed"
+    assert r3.json()["revisions_count"] == 3
 
-def test_context_shape_and_hash():
+
+def test_owner_cannot_confirm_own_thread():
     uid = _new_room()
-    r = client.get(f"/api/rooms/{uid}/context")
-    assert r.status_code == 200
-    body = r.json()
-    assert set(body) >= {"room_uuid", "agreed", "proposed", "discrepancies", "context_hash"}
-    # empty context hash is stable
+    r = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "Topic", "value": "value", "opened_by": "alice",
+    })
+    cid = r.json()["id"]
+    r2 = client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "alice", "value": "value", "kind": "confirm",
+    })
+    assert r2.status_code == 400
+
+
+def test_owner_update_demotes_agreed_back_to_proposed():
+    uid = _new_room()
+    r = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "Deadline", "value": "Friday", "opened_by": "alice",
+    })
+    cid = r.json()["id"]
+    for ag in ["bob", "carol"]:
+        client.post(f"/api/rooms/{uid}/claims/{cid}/revisions",
+                    json={"agent_id": ag, "value": "Friday", "kind": "confirm"})
+    assert client.get(f"/api/rooms/{uid}/claims/{cid}").json()["status"] == "agreed"
+
+    # alice changes her mind
+    r2 = client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "alice", "value": "Monday", "kind": "update",
+    })
+    body = r2.json()
+    assert body["status"] == "proposed"
+    assert body["current_value"] == "Monday"
+
+
+def test_retract_cancels_thread():
+    uid = _new_room()
+    cid = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "T", "value": "v", "opened_by": "alice",
+    }).json()["id"]
+    r = client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "alice", "value": "withdrawn", "kind": "retract",
+    })
+    assert r.json()["status"] == "cancelled"
+
+
+def test_only_owner_can_update_or_retract():
+    uid = _new_room()
+    cid = client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "T", "value": "v", "opened_by": "alice",
+    }).json()["id"]
+    r = client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json={
+        "agent_id": "mallory", "value": "hacked", "kind": "update",
+    })
+    assert r.status_code == 403
+
+
+def test_context_shape_and_hash_threads():
+    uid = _new_room()
+    body = client.get(f"/api/rooms/{uid}/context").json()
+    assert set(body) >= {"room_uuid", "threads", "discrepancies", "context_hash", "last_extracted_msg_id"}
     h1 = body["context_hash"]
+    # adding a thread changes the hash
+    client.post(f"/api/rooms/{uid}/claims", json={
+        "subject": "X", "value": "v", "opened_by": "alice",
+    })
     h2 = client.get(f"/api/rooms/{uid}/context").json()["context_hash"]
-    assert h1 == h2 and len(h1) == 64
+    assert h1 != h2 and len(h2) == 64
 
 
 def test_handshake_requires_current_hash():
     uid = _new_room()
-    # bogus hash
-    r = client.post(f"/api/rooms/{uid}/handshake", json={
-        "agent_id": "alice", "context_hash": "0" * 64,
-    })
-    # at this point context is empty → current hash is some specific value.
-    # if user gave wrong one, expect 409.
     ctx_hash = client.get(f"/api/rooms/{uid}/context").json()["context_hash"]
-    if "0" * 64 != ctx_hash:
-        assert r.status_code == 409
-    # correct hash → 201
-    r2 = client.post(f"/api/rooms/{uid}/handshake", json={
+    # bogus hash → 409
+    bogus = "0" * 64
+    if bogus != ctx_hash:
+        assert client.post(f"/api/rooms/{uid}/handshake", json={
+            "agent_id": "alice", "context_hash": bogus,
+        }).status_code == 409
+    # correct → 201
+    assert client.post(f"/api/rooms/{uid}/handshake", json={
         "agent_id": "alice", "context_hash": ctx_hash,
-    })
-    assert r2.status_code == 201
+    }).status_code == 201
 
 
 def test_refresh_disabled_without_llm_key(monkeypatch):
@@ -281,51 +332,122 @@ def test_refresh_disabled_without_llm_key(monkeypatch):
     assert r.status_code == 503
 
 
-def test_refresh_with_mocked_llm(monkeypatch):
-    """Inject a fake extract_claims and verify claims+discrepancies are persisted."""
-    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake-key")
+def test_refresh_creates_thread_from_first_message(monkeypatch):
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake")
 
-    async def fake_extract(messages, agreed, proposed):
+    async def fake_process(new_message, tail, threads):
         return {
-            "extracted": [
-                {"type": "price", "value": "5000 EUR",
-                 "source_msg_id": messages[-1]["id"] if messages else None,
-                 "quote": "we agree on 5000 EUR"},
-            ],
-            "discrepancies": [
-                {"description": "alice said 4000, bob said 5000",
-                 "severity": "high", "related_msg_id": None, "related_claim_id": None},
-            ],
-        }, "nvidia:test-model"
+            "new_claims": [{
+                "subject": "Concrete delivery to site #2",
+                "subject_key": "concrete-delivery-site-2",
+                "value": "delivery on 2026-05-20",
+                "kind": "propose",
+                "quote": "delivery on May 20",
+            }],
+            "updates": [],
+            "discrepancies": [],
+        }, "fake:model"
 
-    monkeypatch.setattr("app.llm.extract_claims", fake_extract)
-
+    monkeypatch.setattr("app.llm.process_message", fake_process)
     uid = _new_room()
     client.post(f"/api/rooms/{uid}/messages",
-                json={"agent_id": "alice", "text": "I propose 5000 EUR"})
+                json={"agent_id": "alice", "text": "I'll deliver concrete on May 20"})
     r = client.post(f"/api/rooms/{uid}/context/refresh")
     assert r.status_code == 200, r.text
-    assert r.json()["extracted"] == 1 and r.json()["discrepancies_found"] == 1
+    assert r.json()["extracted"] == 1
     ctx = client.get(f"/api/rooms/{uid}/context").json()
-    assert len(ctx["proposed"]) == 1
-    assert ctx["proposed"][0]["proposed_by"] == "arbiter"
-    assert ctx["proposed"][0]["value"] == "5000 EUR"
-    assert len(ctx["discrepancies"]) == 1
-    assert ctx["discrepancies"][0]["severity"] == "high"
+    assert len(ctx["threads"]) == 1
+    t = ctx["threads"][0]
+    assert t["subject"] == "Concrete delivery to site #2"
+    assert t["current_value"] == "delivery on 2026-05-20"
+    assert t["status"] == "proposed"
+    assert t["opened_by"] == "arbiter"
+    assert t["revisions_count"] == 1
 
 
-def test_refresh_dedups_by_type_and_value(monkeypatch):
-    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake-key")
-    same = [{"type": "price", "value": "100 USD", "source_msg_id": None, "quote": None}]
-
-    async def fake_extract(messages, agreed, proposed):
-        return {"extracted": same, "discrepancies": []}, "test"
-
-    monkeypatch.setattr("app.llm.extract_claims", fake_extract)
+def test_refresh_routes_update_to_existing_thread(monkeypatch):
+    """Two messages: first opens a thread, second updates it via the arbiter."""
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake")
     uid = _new_room()
-    client.post(f"/api/rooms/{uid}/messages",
-                json={"agent_id": "x", "text": "stuff"})
-    client.post(f"/api/rooms/{uid}/context/refresh")
-    client.post(f"/api/rooms/{uid}/context/refresh")
+    m1 = client.post(f"/api/rooms/{uid}/messages",
+                     json={"agent_id": "alice", "text": "deliver concrete May 20"}).json()["id"]
+    m2 = client.post(f"/api/rooms/{uid}/messages",
+                     json={"agent_id": "alice", "text": "moved to May 22"}).json()["id"]
+
+    # The mock returns different output depending on whether existing threads exist.
+    async def fake_process(new_message, tail, threads):
+        if not threads:
+            return {
+                "new_claims": [{
+                    "subject": "Concrete delivery", "subject_key": "concrete-delivery",
+                    "value": "delivery on 2026-05-20", "kind": "propose",
+                    "quote": "May 20",
+                }],
+                "updates": [], "discrepancies": [],
+            }, "fake:model"
+        return {
+            "new_claims": [],
+            "updates": [{
+                "thread_id": threads[0]["id"],
+                "value": "delivery on 2026-05-22",
+                "kind": "update",
+                "quote": "moved to May 22",
+            }],
+            "discrepancies": [],
+        }, "fake:model"
+
+    monkeypatch.setattr("app.llm.process_message", fake_process)
+    r = client.post(f"/api/rooms/{uid}/context/refresh")
+    assert r.status_code == 200, r.text
     ctx = client.get(f"/api/rooms/{uid}/context").json()
-    assert len(ctx["proposed"]) == 1  # second refresh deduped
+    assert len(ctx["threads"]) == 1
+    t = ctx["threads"][0]
+    assert t["current_value"] == "delivery on 2026-05-22"
+    assert t["revisions_count"] == 2
+    # verify ledger
+    revs = client.get(f"/api/rooms/{uid}/claims/{t['id']}/revisions").json()
+    assert revs[0]["kind"] == "propose" and revs[0]["source_msg_id"] == m1
+    assert revs[1]["kind"] == "update" and revs[1]["source_msg_id"] == m2
+    assert revs[1]["author_agent_id"] == "alice"
+
+
+def test_refresh_is_incremental(monkeypatch):
+    """Second refresh with no new messages should not re-process old ones."""
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake")
+    calls = []
+
+    async def fake_process(new_message, tail, threads):
+        calls.append(new_message["id"])
+        return {"new_claims": [], "updates": [], "discrepancies": []}, "fake:model"
+
+    monkeypatch.setattr("app.llm.process_message", fake_process)
+    uid = _new_room()
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "one"})
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 1
+    # Second refresh with no new messages → no additional LLM calls.
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 1
+    # Add a new message → exactly one new call.
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "two"})
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 2
+
+
+def test_refresh_full_reprocesses_all(monkeypatch):
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake")
+    calls = []
+
+    async def fake_process(new_message, tail, threads):
+        calls.append(new_message["id"])
+        return {"new_claims": [], "updates": [], "discrepancies": []}, "fake:model"
+
+    monkeypatch.setattr("app.llm.process_message", fake_process)
+    uid = _new_room()
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "one"})
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "two"})
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 2
+    # ?full=true should reset watermark and reprocess everything
+    client.post(f"/api/rooms/{uid}/context/refresh?full=true")
+    assert len(calls) == 4
