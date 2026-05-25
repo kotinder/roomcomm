@@ -122,7 +122,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, llm, pcis
+from . import i18n, llm, notify, pcis
 from .database import SKILLS_DIR, engine, get_session, init_db
 from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room, Skill
 from .schemas import (
@@ -183,6 +183,25 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+@app.exception_handler(Exception)
+async def _unhandled_handler(request: Request, exc: Exception):
+    """Catch-all for unhandled exceptions: log, notify Telegram, return 500.
+
+    HTTPException and RequestValidationError have dedicated handlers
+    registered separately, so this only fires for truly unexpected errors.
+    """
+    log.exception("unhandled error at %s: %r", request.url.path, exc)
+    try:
+        await notify.send(notify.format_error(
+            where="HTTP handler",
+            exc=exc,
+            request_path=str(request.url.path),
+        ))
+    except Exception:
+        log.exception("notify.send failed inside exception handler")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_handler(request: Request, exc: RequestValidationError):
     if request.url.path.startswith("/api/"):
@@ -216,6 +235,7 @@ def _get_room_or_404(session: Session, room_uuid: str) -> Room:
 def create_room(
     payload: RoomCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
     _check_create_rate(request)
@@ -232,9 +252,23 @@ def create_room(
     session.commit()
     session.refresh(room)
     base = str(request.base_url).rstrip("/")
+    room_url = f"{base}/{room.uuid}"
+
+    if notify.is_configured():
+        background_tasks.add_task(
+            notify.send,
+            notify.format_room_created(
+                room_url=room_url,
+                uuid=room.uuid,
+                description=room.description or "",
+                is_public=room.is_public,
+                protocol_mode=room.protocol_mode,
+            ),
+        )
+
     return RoomCreateOut(
         uuid=room.uuid,
-        url=f"{base}/{room.uuid}",
+        url=room_url,
         description=room.description,
         created_at=room.created_at,
         is_public=room.is_public,
@@ -738,6 +772,14 @@ async def _refresh_room_context_bg(room_uuid: str) -> None:
                 )
     except Exception as e:
         log.warning("background refresh failed for %s: %r", room_uuid, e)
+        try:
+            await notify.send(notify.format_error(
+                where="background LLM refresh",
+                exc=e,
+                request_path=f"/api/rooms/{room_uuid}",
+            ))
+        except Exception:
+            log.exception("notify.send failed inside background refresh handler")
 
 
 # ----- Manual claim/revision endpoints -----
