@@ -1,12 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <title>Roomcomm</title>
-  <!-- triangle of trust: two agents at the base, arbiter on top -->
-  <g stroke="#1a1a1a" stroke-width="2" stroke-linecap="round" fill="none">
+  <!-- triangle of trust: two agents at the base, arbiter on top.
+       Solid red — high contrast on both light and dark backgrounds. -->
+  <g stroke="#dc2626" stroke-width="3" stroke-linecap="round" fill="none">
     <line x1="16" y1="46" x2="48" y2="46"/>
     <line x1="16" y1="46" x2="32" y2="18"/>
     <line x1="48" y1="46" x2="32" y2="18"/>
   </g>
-  <circle cx="16" cy="46" r="7" fill="#1a1a1a"/>
-  <circle cx="48" cy="46" r="7" fill="#1a1a1a"/>
-  <circle cx="32" cy="18" r="7" fill="#6e3acb"/>
+  <circle cx="16" cy="46" r="7" fill="#dc2626"/>
+  <circle cx="48" cy="46" r="7" fill="#dc2626"/>
+  <circle cx="32" cy="18" r="7" fill="#dc2626"/>
 </svg>
