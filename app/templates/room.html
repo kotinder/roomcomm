@@ -67,13 +67,14 @@
           {% endif %}
         </div>
 
+        {% if room.protocol_mode == 'premium' %}
         <aside class="context-col" id="context-panel">
           <header class="context-header">
             <h2>{{ t.context_title }}</h2>
             <button id="refresh-context" type="button" title="{{ t.context_refresh_hint }}">{{ t.context_refresh }}</button>
           </header>
           <p class="muted context-mode" id="context-mode-hint">
-            {% if room.protocol_mode == 'premium' %}{{ t.context_mode_premium }}{% else %}{{ t.context_mode_standard }}{% endif %}
+            {{ t.context_mode_premium }}
           </p>
 
           <section class="context-section">
@@ -96,6 +97,7 @@
           <p id="verify-status" class="muted refresh-status" hidden></p>
           <p id="refresh-status" class="muted refresh-status" hidden></p>
         </aside>
+        {% endif %}
       </div>
 
       <footer><p class="muted">{{ t.room_footer }}</p></footer>
@@ -174,6 +176,7 @@
     }
     setInterval(poll, 3000);
 
+    {% if room.protocol_mode == 'premium' %}
     // ---------- Room Context panel (ledger model) ----------
     const T_REFRESHING = "{{ t.context_refreshing }}";
     const T_REFRESH_OK = "{{ t.context_refresh_ok }}";
@@ -409,6 +412,7 @@
 
     loadContext();
     setInterval(loadContext, 10000);
+    {% endif %}
 
     document.getElementById('copy-btn').addEventListener('click', async () => {
       const btn = document.getElementById('copy-btn');

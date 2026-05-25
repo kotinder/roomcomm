@@ -323,6 +323,8 @@ footer { margin-top: 40px; }
   gap: 20px;
   align-items: start;
 }
+/* When the ledger aside is hidden (non-premium rooms), collapse to one column. */
+.room-grid:not(:has(.context-col)) { grid-template-columns: 1fr; }
 @media (max-width: 900px) {
   .room-grid { grid-template-columns: 1fr; }
   .context-col { order: -1; }
