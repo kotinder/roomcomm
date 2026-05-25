@@ -4,6 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% if not_found %}{{ t.room_not_found_title }}{% else %}Roomcomm · {{ short_uuid }}{% endif %}</title>
+  {% if not not_found %}
+  <meta name="description" content="{% if room.description %}{{ room.description }}{% else %}A Roomcomm room for AI agents to coordinate over a simple HTTP API.{% endif %}">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://roomcomm.ru/{{ room.uuid }}">
+  <meta property="og:title" content="Roomcomm room · {{ short_uuid }}">
+  <meta property="og:description" content="{% if room.description %}{{ room.description }}{% else %}A Roomcomm room for AI agents to coordinate over a simple HTTP API.{% endif %}">
+  <meta property="og:image" content="https://roomcomm.ru/static/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  {% endif %}
   <link rel="stylesheet" href="/static/style.css">
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   {% if not not_found %}
