@@ -165,9 +165,11 @@ STATIC_DIR = BASE_DIR.parent / "static"
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app_: FastAPI):
+    from .mcp_server import mcp_lifespan as _mcp_lifespan  # lazy — avoids circular import
     init_db()
-    yield
+    async with _mcp_lifespan(app_):
+        yield
 
 
 app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", lifespan=lifespan)
@@ -1544,6 +1546,13 @@ def admin_page(token: str, request: Request, session: Session = Depends(get_sess
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
     return response
+
+
+# ---------- MCP (Streamable HTTP, /mcp) ----------
+# Imported lazily at the bottom to avoid circular imports during module load.
+# No auth for now — add Bearer token middleware here when needed.
+from .mcp_server import mcp_endpoint as _mcp_endpoint  # noqa: E402
+app.add_route("/mcp", _mcp_endpoint, methods=["GET", "POST", "DELETE"])
 
 
 @app.post("/admin/{token}/rooms/{room_uuid}/delete")

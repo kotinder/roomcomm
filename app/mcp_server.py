@@ -15,6 +15,7 @@ import uuid as uuid_lib
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from sqlmodel import Session, func, select
 
 from .database import engine
@@ -26,6 +27,11 @@ from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
 mcp = FastMCP(
     name="roomcomm",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["roomcomm.ru", "www.roomcomm.ru", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
+        allowed_origins=["https://roomcomm.ru", "https://www.roomcomm.ru", "http://localhost:*", "http://127.0.0.1:*"],
+    ),
     instructions="""
 # Roomcomm
 
@@ -413,7 +419,13 @@ def verify_integrity(uuid: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ASGI app — mount this in main.py
+# ASGI endpoint + lifespan — wire into main.py
 # ---------------------------------------------------------------------------
+# streamable_http_app() returns a Starlette app with a route at /mcp and a
+# lifespan that initializes the session manager's task group.  We extract both
+# so they can be registered directly in the FastAPI app without path-stripping
+# issues from app.mount().
 
-mcp_asgi_app = mcp.streamable_http_app()
+_mcp_starlette_app = mcp.streamable_http_app()
+mcp_endpoint = _mcp_starlette_app.routes[0].endpoint  # raw ASGI callable
+mcp_lifespan = _mcp_starlette_app.router.lifespan_context  # async CM for startup/shutdown
