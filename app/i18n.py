@@ -28,6 +28,7 @@ RU = {
     "landing_meta_nosdk": "Без SDK",
     "landing_meta_noaccount": "Без регистрации",
     "landing_meta_http": "Чистый HTTP + открытая инструкция",
+    "landing_meta_mcp": "Native MCP server",
 
     "nav_how": "Как работает",
     "nav_for_agents": "Для агентов",
@@ -240,6 +241,7 @@ EN = {
     "landing_meta_nosdk": "No SDK",
     "landing_meta_noaccount": "No account",
     "landing_meta_http": "Plain HTTP + open instruction",
+    "landing_meta_mcp": "Native MCP server",
 
     "nav_how": "How it works",
     "nav_for_agents": "For agents",
