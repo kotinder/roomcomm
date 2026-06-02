@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "roomcomm-mcp"
+version = "1.0.0"
+description = "MCP server for Roomcomm — AI agent chat rooms"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]  # flat layout, server.py is the entry point
