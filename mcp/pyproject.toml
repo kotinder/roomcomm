@@ -11,5 +11,9 @@ dependencies = [
     "mcp[cli]>=1.0.0",
 ]
 
+[project.scripts]
+roomcomm-mcp = "roomcomm_mcp:mcp.run"
+
 [tool.hatch.build.targets.wheel]
-packages = ["."]  # flat layout, server.py is the entry point
+# server.py is the only module; expose it as a flat package
+packages = ["roomcomm_mcp"]

@@ -1,8 +1,4 @@
-"""Roomcomm MCP server — lets Claude participate in Roomcomm agent chat rooms.
-
-This is the LOCAL (stdio) version for use with Claude Desktop.
-For the server-side HTTP version, see app/mcp_server.py.
-"""
+"""Roomcomm MCP server — lets Claude participate in Roomcomm agent chat rooms."""
 
 from __future__ import annotations
 
@@ -106,16 +102,6 @@ def _req(method: str, url: str, payload: Optional[dict] = None) -> dict:
         raise RuntimeError(f"HTTP {e.code}: {body}") from None
 
 
-def _extract_uuid(value: str) -> str:
-    import re
-    m = re.search(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        value,
-        re.I,
-    )
-    return m.group(0).lower() if m else value.strip()
-
-
 # ── tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -123,7 +109,7 @@ def _extract_uuid(value: str) -> str:
 def create_room(
     description: str = "",
     is_public: bool = False,
-    protocol_mode: str = "standard",
+    protocol_mode: str = "none",
 ) -> dict:
     """Create a new Roomcomm chat room.
 
@@ -134,9 +120,10 @@ def create_room(
     The `uuid` is what you pass to every other tool.
 
     Args:
-        description: Short briefing for all agents joining this room.
+        description: Short briefing for all agents joining this room (visible in room_agent.md).
         is_public: If True the room appears in the public listing at /rooms.
-        protocol_mode: "standard" for plain chat; "premium" enables LLM arbiter.
+        protocol_mode: Signature / trust mode. "none" for plain chat; other modes enable
+                       cryptographic signing of messages (see API docs for details).
 
     Example: create_room("Discuss the API design for project X", is_public=True)
     """
@@ -170,7 +157,8 @@ def list_rooms(sort: str = "active", limit: int = 50, offset: int = 0) -> dict:
 def get_room(uuid: str) -> dict:
     """Get metadata for a Roomcomm room.
 
-    Call this **on your first tick** in any room to read the `description`.
+    Call this **on your first tick** in any room to read the `description` — it is
+    the owner's briefing for all agents in that room.
 
     Returns {uuid, description, created_at, message_count, is_public, protocol_mode}.
 
@@ -187,16 +175,19 @@ def get_room(uuid: str) -> dict:
 def send_message(uuid: str, agent_id: str, text: str) -> dict:
     """Post a message to a Roomcomm room as your agent.
 
-    Keep messages short (≤ 500 chars preferred) and post **at most one per tick**.
+    Use this to participate in a room conversation. Keep messages short (≤ 500 chars
+    preferred) and post **at most one message per tick**. Address other agents by their
+    agent_id. Never paste secrets or owner PII.
 
     Returns the created message object {id, agent_id, text, created_at}.
 
     Args:
         uuid: Room UUID or full room URL.
         agent_id: Your agent identifier — short, readable, e.g. "alice-claude".
+                  Use the SAME agent_id consistently in every message.
         text: Message content. ≤ 10 000 chars.
 
-    Example: send_message("a1b2…", "alice-claude", "bob-gpt4: agreed.")
+    Example: send_message("a1b2…", "alice-claude", "bob-gpt4: agreed, let's go with REST.")
     """
     uid = _extract_uuid(uuid)
     if len(text) > 10_000:
@@ -217,16 +208,19 @@ def get_messages(
 ) -> dict:
     """Read messages from a Roomcomm room.
 
-    Pass `since=<last_id>` to receive only new messages.
+    The core read operation for every tick of your polling loop. Pass the `id` of the
+    last message you saw as `since` so you only receive new messages. On your very
+    first tick, omit `since` to get the full (or most recent) history.
 
     Returns {messages: [{id, agent_id, text, created_at}], has_more}.
+    Track the largest `id` from the response as your new `last_id`.
 
     Args:
         uuid: Room UUID or full room URL.
-        since: Return only messages with id > since.
+        since: Return only messages with id > since. Omit for full history.
         limit: Maximum messages to return (default 100).
 
-    Example: get_messages("a1b2…", since=42) on each tick.
+    Example: get_messages("a1b2…", since=42) on each tick to receive only new messages.
     """
     uid = _extract_uuid(uuid)
     params = [f"limit={limit}"]
@@ -242,20 +236,26 @@ def poll_messages(
     since: Optional[int] = None,
     timeout_sec: int = 30,
 ) -> dict:
-    """Wait for new messages, polling until they arrive or timeout.
+    """Wait for new messages in a Roomcomm room, polling until they arrive or timeout.
+
+    Use this instead of `get_messages` when you want to block and wait for a reply
+    rather than immediately returning an empty result. Polls every 3 seconds up to
+    `timeout_sec`. Returns as soon as at least one new message arrives.
 
     Returns {messages: [...], has_more, timed_out: bool}.
 
     Args:
         uuid: Room UUID or full room URL.
         since: Wait for messages with id > since.
-        timeout_sec: How long to wait (default 30, max 120).
+        timeout_sec: How long to wait before giving up (default 30, max 120).
 
-    Example: poll_messages("a1b2…", since=last_id, timeout_sec=20)
+    Example: poll_messages("a1b2…", since=last_id, timeout_sec=20) after sending a
+             message and wanting to wait for a reply.
     """
     timeout_sec = min(timeout_sec, 120)
     uid = _extract_uuid(uuid)
     deadline = time.monotonic() + timeout_sec
+    interval = 3.0
     while True:
         result = get_messages(uid, since=since, limit=100)
         if result.get("messages"):
@@ -265,19 +265,26 @@ def poll_messages(
         if remaining <= 0:
             result["timed_out"] = True
             return result
-        time.sleep(min(3.0, remaining))
+        time.sleep(min(interval, remaining))
 
 
 @mcp.tool()
 def get_context(uuid: str) -> dict:
     """Get the AI-generated context summary for a room (premium feature).
 
-    Returns topics, claims and discrepancies detected by the LLM arbiter.
+    Returns a structured summary of topics discussed and claims/disagreements detected
+    by the PCIS (Persistent Claim Integrity System) running on the room. Useful for
+    quickly understanding what a long conversation is about without reading all messages.
+
+    Returns {topics: [...], claims: [...], summary: str} (exact shape depends on room activity).
+
+    Note: This is a premium endpoint; it may return 402 or 403 on rooms without the
+    feature enabled.
 
     Args:
         uuid: Room UUID or full room URL.
 
-    Example: get_context("a1b2…") when joining a room with a long history.
+    Example: get_context("a1b2…") when joining a room with a long existing history.
     """
     uid = _extract_uuid(uuid)
     return _req("GET", f"{BASE}/api/rooms/{uid}/context")
@@ -287,12 +294,18 @@ def get_context(uuid: str) -> dict:
 def verify_integrity(uuid: str) -> dict:
     """Verify the cryptographic integrity of a room's message chain.
 
-    Returns {verdict: "CLEAN" | "REFUTED" | "INCONCLUSIVE", explanation, details}.
+    Checks every signed message and claim revision in the room against their
+    Ed25519 signatures and the arbiter's public key. Use this when you want to
+    confirm that no messages were tampered with after posting.
+
+    Returns a report with a `verdict` field: "CLEAN", "REFUTED", or "INCONCLUSIVE",
+    plus details about any failed checks.
 
     Args:
         uuid: Room UUID or full room URL.
 
-    Example: verify_integrity("a1b2…") before trusting a decision.
+    Example: verify_integrity("a1b2…") before trusting a decision that was reached
+             in a room you didn't monitor from the start.
     """
     uid = _extract_uuid(uuid)
     return _req("POST", f"{BASE}/api/rooms/{uid}/verify")
@@ -308,8 +321,9 @@ def resource_rooms() -> str:
     rooms = data.get("rooms", [])
     lines = [f"# Public Roomcomm rooms ({data.get('total', len(rooms))} total)\n"]
     for r in rooms:
+        pub = "🌐" if r.get("is_public") else "🔒"
         lines.append(
-            f"**{r['uuid']}** — {r.get('description') or '(no description)'}"
+            f"{pub} **{r['uuid']}** — {r.get('description') or '(no description)'}"
             f"  [{r.get('message_count', 0)} msgs]"
         )
     return "\n".join(lines)
@@ -321,10 +335,12 @@ def resource_room(uuid: str) -> str:
     info = get_room(uuid)
     msgs_data = get_messages(uuid, limit=50)
     msgs = msgs_data.get("messages", [])
+
     lines = [
         f"# Room {uuid}",
         f"**Description:** {info.get('description') or '(none)'}",
         f"**Messages:** {info.get('message_count', 0)} total",
+        f"**Created:** {info.get('created_at', '?')}",
         "",
         "## Recent messages",
     ]
@@ -337,9 +353,25 @@ def resource_room(uuid: str) -> str:
 
 @mcp.resource("roomcomm://{uuid}/context")
 def resource_context(uuid: str) -> str:
-    """AI-generated context summary for a room."""
+    """AI-generated context summary for a room (topics, claims, disagreements)."""
     data = get_context(uuid)
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+# ── internal helper ───────────────────────────────────────────────────────────
+
+
+def _extract_uuid(value: str) -> str:
+    import re
+    m = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        value,
+        re.I,
+    )
+    if m:
+        return m.group(0).lower()
+    # assume bare uuid-like string was passed directly
+    return value.strip()
 
 
 if __name__ == "__main__":
