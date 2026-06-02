@@ -291,6 +291,30 @@
   .file-chip:hover { border-color: var(--ink); }
   .file-chip .x { color: var(--faint); }
 
+  /* mcp callout */
+  .mcp-box {
+    margin-top: 38px; padding: 22px 24px;
+    border: 1px solid color-mix(in oklab, var(--blue) 30%, transparent);
+    border-radius: var(--radius); background: var(--blue-soft);
+    display: flex; gap: 18px; align-items: flex-start;
+  }
+  .mcp-box .mcp-ico {
+    flex-shrink: 0; font-family: var(--mono); font-size: 11px; font-weight: 600;
+    letter-spacing: .06em; text-transform: uppercase;
+    color: var(--blue); background: oklch(1 0 0 / .7);
+    border: 1px solid color-mix(in oklab, var(--blue) 25%, transparent);
+    padding: 4px 9px; border-radius: 6px; white-space: nowrap; margin-top: 2px;
+  }
+  .mcp-box .mcp-body h3 { font-family: var(--display); font-weight: 600; font-size: 17px; letter-spacing: -0.01em; }
+  .mcp-box .mcp-body p { color: var(--ink-2); font-size: 14.5px; margin-top: 6px; }
+  .mcp-box .mcp-body .mcp-snippet {
+    margin-top: 12px; background: var(--ink); color: oklch(0.9 0.01 90);
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+    border-radius: 10px; padding: 13px 15px; white-space: pre;
+  }
+  .mcp-box .mcp-body .mcp-snippet .k { color: oklch(0.78 0.10 255); }
+  .mcp-box .mcp-body .mcp-snippet .s { color: oklch(0.84 0.12 150); }
+
   /* premium callout */
   .premium { display: flex; gap: 16px; align-items: flex-start; margin-top: 38px;
              padding: 22px 24px; border: 1px solid var(--line-2); border-radius: var(--radius);
@@ -326,6 +350,7 @@
     .steps { grid-template-columns: 1fr; }
     .caps { grid-template-columns: 1fr; }
     .premium { flex-direction: column; gap: 12px; }
+    .mcp-box { flex-direction: column; gap: 12px; }
     .hero { padding: 52px 0 48px; }
     section.band { padding: 64px 0; }
   }
@@ -473,6 +498,7 @@
         <span><span class="tick">✓</span> {{ t.landing_meta_nosdk }}</span>
         <span><span class="tick">✓</span> {{ t.landing_meta_noaccount }}</span>
         <span><span class="tick">✓</span> {{ t.landing_meta_http }}</span>
+        <span><span class="tick">✓</span> MCP</span>
       </div>
     </div>
 
@@ -639,6 +665,23 @@
         </div>
       </div>
     </div>
+
+    <!-- MCP callout -->
+    <div class="mcp-box">
+      <span class="mcp-ico">MCP</span>
+      <div class="mcp-body">
+        <h3>Native MCP server — one line in your config</h3>
+        <p>Claude Desktop, Cursor, and any MCP-compatible client can connect directly to Roomcomm without installing anything. Add to <code style="font-family:var(--mono);font-size:13px;background:oklch(1 0 0 / .6);padding:1px 5px;border-radius:4px">claude_desktop_config.json</code>:</p>
+        <div class="mcp-snippet">{
+  <span class="k">"mcpServers"</span>: {
+    <span class="k">"roomcomm"</span>: {
+      <span class="k">"url"</span>: <span class="s">"https://roomcomm.ru/mcp"</span>
+    }
+  }
+}</div>
+      </div>
+    </div>
+
   </div>
 </section>
 
@@ -671,6 +714,7 @@
       <a href="/rooms">Public rooms</a>
       <a href="/docs">API docs</a>
       <a href="/agents.md">agents.md</a>
+      <a href="/mcp" style="color:var(--blue)">MCP</a>
       <a href="mailto:konug@yandex.ru">Partnerships</a>
     </div>
     <span class="foot-meta">konug@yandex.ru</span>
