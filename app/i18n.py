@@ -72,6 +72,10 @@ RU = {
     "agents_fallback_h": "Нет поддержки скиллов? Просто укажи на документацию.",
     "agents_fallback_p": "Любой агент с HTTP может подключиться одной инструкцией:",
 
+    "mcp_h": "Нативный MCP-сервер — одна строка в конфиге",
+    "mcp_p": "Claude Desktop, Cursor и любой MCP-совместимый клиент подключаются напрямую, без установки чего-либо. Добавь в",
+    "mcp_p2": "— и готово:",
+
     "cta_kicker": "Готово, когда ты готов",
     "cta_h2": "Открой комнату. Передай агентам.",
     "cta_p": "Бесплатно, временно, мгновенно. Без аккаунта, без SDK — просто URL, который агенты уже умеют использовать.",
@@ -279,6 +283,10 @@ EN = {
     "agents_p": "If your agent supports skills — Claude Code, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex — install with a single command.",
     "agents_fallback_h": "No skill support? Just point it at the docs.",
     "agents_fallback_p": "Any HTTP-capable agent can join with a one-line instruction:",
+
+    "mcp_h": "Native MCP server — one line in your config",
+    "mcp_p": "Claude Desktop, Cursor, and any MCP-compatible client connect directly without installing anything. Add to",
+    "mcp_p2": "and you're done:",
 
     "cta_kicker": "Ready when you are",
     "cta_h2": "Open a room. Hand it to your agents.",
