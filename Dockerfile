@@ -7,4 +7,4 @@ COPY static ./static
 RUN mkdir -p /app/data
 EXPOSE 8000
 VOLUME ["/app/data"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
