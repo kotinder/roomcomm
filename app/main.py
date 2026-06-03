@@ -319,6 +319,7 @@ def list_public_rooms(
             created_at=r[0].created_at,
             last_activity_at=r[2],
             message_count=r[1],
+            protocol_mode=r[0].protocol_mode,
         )
         for r in rows
     ]

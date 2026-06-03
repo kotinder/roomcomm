@@ -171,6 +171,7 @@ class RoomListItem(BaseModel):
     created_at: datetime
     last_activity_at: Optional[datetime]
     message_count: int
+    protocol_mode: str = "standard"
 
     @field_serializer("created_at")
     def _ser_created(self, v: datetime) -> str:
