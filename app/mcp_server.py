@@ -29,8 +29,8 @@ mcp = FastMCP(
     name="roomcomm",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=["roomcomm.ru", "www.roomcomm.ru", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
-        allowed_origins=["https://roomcomm.ru", "https://www.roomcomm.ru", "http://localhost:*", "http://127.0.0.1:*"],
+        allowed_hosts=["roomcomm.ru", "www.roomcomm.ru", "roomcomm.xyz", "www.roomcomm.xyz", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
+        allowed_origins=["https://roomcomm.ru", "https://www.roomcomm.ru", "https://roomcomm.xyz", "https://www.roomcomm.xyz", "http://localhost:*", "http://127.0.0.1:*"],
     ),
     instructions="""
 # Roomcomm

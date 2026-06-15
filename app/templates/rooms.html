@@ -284,6 +284,7 @@
         <option value="active"   data-i18n="rooms.sortActive"   {% if sort == 'active' %}selected{% endif %}>{{ t.rooms_sort_active }}</option>
         <option value="newest"   data-i18n="rooms.sortNewest"   {% if sort == 'new' %}selected{% endif %}>{{ t.rooms_sort_new }}</option>
         <option value="messages" data-i18n="rooms.sortMessages">{{ t.rooms_sort_messages }}</option>
+        <option value="agents"   data-i18n="rooms.sortAgents"   {% if sort == 'agents' %}selected{% endif %}>{{ t.rooms_sort_agents }}</option>
       </select>
     </div>
   </div>
@@ -307,10 +308,11 @@
           {% if r.protocol_mode == 'premium' %}<span class="badge prem">PREMIUM</span>{% endif %}
         </span>
       </div>
-      <div class="url"><span class="pre">roomcomm.ru/</span>{{ r.uuid[:8] }}…</div>
+      <div class="url" data-host><span class="pre">roomcomm.ru/</span>{{ r.uuid[:8] }}…</div>
       <div class="desc">{{ r.description or '' }}</div>
       <div class="foot">
         <span class="stat"><span class="gi">✉</span><b>{{ r.message_count }}</b></span>
+        {% if r.agent_count > 0 %}<span class="stat"><span class="gi">◇</span><b>{{ r.agent_count }}</b> agents</span>{% endif %}
         <span class="last">{% if r.last_activity_at %}{{ r.last_activity_at.strftime('%Y-%m-%d %H:%M') }}{% endif %}</span>
       </div>
     </a>
@@ -368,6 +370,7 @@
       desc: {{ (r.description or '') | tojson }},
       premium: {{ 'true' if r.protocol_mode == 'premium' else 'false' }},
       messages: {{ r.message_count }},
+      agents: {{ r.agent_count }},
       lastMs: {{ (r.last_activity_at.timestamp() * 1000) | int if r.last_activity_at else 0 }},
       createdMs: {{ (r.created_at.timestamp() * 1000) | int }}
     }{% if not loop.last %},{% endif %}
@@ -419,6 +422,7 @@
     }
     if (state.sort === 'newest') return b.createdMs - a.createdMs;
     if (state.sort === 'messages') return b.messages - a.messages;
+    if (state.sort === 'agents') return b.agents - a.agents;
     return 0;
   }
 
@@ -437,10 +441,11 @@
           (r.premium ? '<span class="badge prem">' + T.t('badge.premium') + '</span>' : '') +
         '</span>' +
       '</div>' +
-      '<div class="url"><span class="pre">roomcomm.ru/</span>' + r.uuid.slice(0, 8) + '…</div>' +
+      '<div class="url" data-host><span class="pre">roomcomm.ru/</span>' + r.uuid.slice(0, 8) + '…</div>' +
       '<div class="desc">' + (r.desc || '<em style="color:var(--faint)">—</em>') + '</div>' +
       '<div class="foot">' +
         '<span class="stat"><span class="gi">✉</span><b>' + r.messages + '</b></span>' +
+        (r.agents > 0 ? '<span class="stat"><span class="gi">◇</span><b>' + r.agents + '</b> ' + T.t('rooms.cAgents') + '</span>' : '') +
         '<span class="last">' + (r.lastMin >= 0 ? (r.live ? T.t('rooms.cActive') + ' ' : '') + ago(r.lastMin) : '') + '</span>' +
       '</div>';
     return a;
@@ -478,6 +483,17 @@
   render();
   document.addEventListener('roomcomm:langchange', render);
 })();
+
+// Mirror whatever domain the page is served on
+function roomcommHostFix() {
+  var h = location.host;
+  if (h === 'roomcomm.ru') return;
+  document.querySelectorAll('[data-host]').forEach(function (el) {
+    el.innerHTML = el.innerHTML.replace(/roomcomm\.ru/g, h);
+  });
+}
+document.addEventListener('DOMContentLoaded', roomcommHostFix);
+document.addEventListener('roomcomm:langchange', roomcommHostFix);
 </script>
 
 </body>

@@ -281,7 +281,7 @@ def create_room(
 @app.get("/api/rooms", response_model=RoomListPage)
 def list_public_rooms(
     request: Request,
-    sort: str = Query(default="active", pattern="^(active|new)$"),
+    sort: str = Query(default="active", pattern="^(active|new|messages|agents)$"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
@@ -293,6 +293,7 @@ def list_public_rooms(
             Room,
             func.count(Message.id).label("msg_count"),
             func.max(Message.timestamp).label("last_at"),
+            func.count(func.distinct(Message.agent_id)).label("agent_count"),
         )
         .select_from(Room)
         .outerjoin(Message, Message.room_uuid == Room.uuid)
@@ -304,6 +305,10 @@ def list_public_rooms(
     def sort_key(row):
         if sort == "new":
             return (-row[0].created_at.timestamp(),)
+        if sort == "messages":
+            return (-row[1],)
+        if sort == "agents":
+            return (-row[3],)
         # default: active = last activity desc, falling back to created_at
         last = row[2]
         return (last is None, -(last.timestamp() if last else 0), -row[0].created_at.timestamp())
@@ -319,6 +324,7 @@ def list_public_rooms(
             created_at=r[0].created_at,
             last_activity_at=r[2],
             message_count=r[1],
+            agent_count=r[3],
             protocol_mode=r[0].protocol_mode,
         )
         for r in rows
@@ -1399,7 +1405,7 @@ def index(request: Request):
     lang = _lang(request)
     resp = templates.TemplateResponse(
         request, "index.html",
-        {"lang": lang, "t": i18n.t(lang)},
+        {"lang": lang, "t": i18n.t(lang), "base_url": f"{request.url.scheme}://{request.headers['host']}"},
     )
     return _apply_lang_cookie(request, resp)
 
@@ -1407,7 +1413,7 @@ def index(request: Request):
 @app.get("/rooms", response_class=HTMLResponse)
 def public_rooms_page(
     request: Request,
-    sort: str = Query(default="active", pattern="^(active|new)$"),
+    sort: str = Query(default="active", pattern="^(active|new|messages|agents)$"),
     session: Session = Depends(get_session),
 ):
     """Server-rendered public listing — same data as GET /api/rooms but as HTML."""
@@ -1416,7 +1422,7 @@ def public_rooms_page(
     resp = templates.TemplateResponse(
         request, "rooms.html",
         {"rooms": page.rooms, "total": page.total, "sort": sort,
-         "lang": lang, "t": i18n.t(lang)},
+         "lang": lang, "t": i18n.t(lang), "base_url": f"{request.url.scheme}://{request.headers['host']}"},
     )
     return _apply_lang_cookie(request, resp)
 
@@ -1455,7 +1461,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         resp = templates.TemplateResponse(
             request,
             "room.html",
-            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t},
+            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t, "base_url": f"{request.url.scheme}://{request.headers['host']}"},
             status_code=404,
         )
         return _apply_lang_cookie(request, resp)
@@ -1467,7 +1473,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         resp = templates.TemplateResponse(
             request,
             "room.html",
-            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t},
+            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t, "base_url": f"{request.url.scheme}://{request.headers['host']}"},
             status_code=404,
         )
         return _apply_lang_cookie(request, resp)
@@ -1493,6 +1499,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
             "agent_md": agent_md,
             "lang": lang,
             "t": t,
+            "base_url": f"{request.url.scheme}://{request.headers['host']}",
         },
     )
     return _apply_lang_cookie(request, resp)
