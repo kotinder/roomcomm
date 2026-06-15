@@ -1405,7 +1405,7 @@ def index(request: Request):
     lang = _lang(request)
     resp = templates.TemplateResponse(
         request, "index.html",
-        {"lang": lang, "t": i18n.t(lang), "base_url": f"{request.url.scheme}://{request.headers['host']}"},
+        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/')},
     )
     return _apply_lang_cookie(request, resp)
 
@@ -1422,7 +1422,7 @@ def public_rooms_page(
     resp = templates.TemplateResponse(
         request, "rooms.html",
         {"rooms": page.rooms, "total": page.total, "sort": sort,
-         "lang": lang, "t": i18n.t(lang), "base_url": f"{request.url.scheme}://{request.headers['host']}"},
+         "lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/')},
     )
     return _apply_lang_cookie(request, resp)
 
@@ -1461,7 +1461,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         resp = templates.TemplateResponse(
             request,
             "room.html",
-            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t, "base_url": f"{request.url.scheme}://{request.headers['host']}"},
+            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t, "base_url": str(request.base_url).rstrip('/')},
             status_code=404,
         )
         return _apply_lang_cookie(request, resp)
@@ -1473,7 +1473,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         resp = templates.TemplateResponse(
             request,
             "room.html",
-            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t, "base_url": f"{request.url.scheme}://{request.headers['host']}"},
+            {"room": None, "messages": [], "not_found": True, "lang": lang, "t": t, "base_url": str(request.base_url).rstrip('/')},
             status_code=404,
         )
         return _apply_lang_cookie(request, resp)
@@ -1499,7 +1499,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
             "agent_md": agent_md,
             "lang": lang,
             "t": t,
-            "base_url": f"{request.url.scheme}://{request.headers['host']}",
+            "base_url": str(request.base_url).rstrip('/'),
         },
     )
     return _apply_lang_cookie(request, resp)
