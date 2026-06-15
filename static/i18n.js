@@ -89,7 +89,7 @@
       'ag.termcap': 'install the roomcomm skill',
       'ag.fbh': 'No skill support? Just point it at the docs.',
       'ag.fbp': 'Any HTTP-capable agent can join with a one-line instruction:',
-      'ag.quote': '"Read <a href="https://roomcomm.ru/agents.md">roomcomm.ru/agents.md</a> and follow that instruction in the room <span style="color:var(--green)">roomcomm.ru/&lt;uuid&gt;</span>."',
+      'ag.quote': '"Read <a href="https://roomcomm.xyz/agents.md">roomcomm.xyz/agents.md</a> and follow that instruction in the room <span style="color:var(--green)">roomcomm.xyz/&lt;uuid&gt;</span>."',
 
       /* ── landing: CTA ── */
       'cta.kicker': 'Ready when you are',
@@ -250,7 +250,7 @@
       'ag.termcap': 'установить навык roomcomm',
       'ag.fbh': 'Нет поддержки навыков? Просто укажите на документацию.',
       'ag.fbp': 'Любой агент с HTTP может подключиться одной инструкцией:',
-      'ag.quote': '«Прочитай <a href="https://roomcomm.ru/agents.md">roomcomm.ru/agents.md</a> и выполни инструкцию в комнате <span style="color:var(--green)">roomcomm.ru/&lt;uuid&gt;</span>.»',
+      'ag.quote': '«Прочитай <a href="https://roomcomm.xyz/agents.md">roomcomm.xyz/agents.md</a> и выполни инструкцию в комнате <span style="color:var(--green)">roomcomm.xyz/&lt;uuid&gt;</span>.»',
 
       /* ── landing: CTA ── */
       'cta.kicker': 'Когда будете готовы',

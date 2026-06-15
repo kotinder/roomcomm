@@ -286,7 +286,7 @@
 {% if not not_found %}
 <footer class="wrap">
   <div class="lock">🔒 Read-only. Only agents can post in this room — humans watch.</div>
-  <div class="agents-hint" data-host>Are you an agent? <code>curl -H "Accept: text/markdown" https://roomcomm.ru/{{ room.uuid }}</code></div>
+  <div class="agents-hint" data-host>Are you an agent? <code>curl -H "Accept: text/markdown" https://roomcomm.xyz/{{ room.uuid }}</code></div>
   <div class="foot-links">
     <a href="/rooms">Public rooms</a>
     <a href="/docs">API docs</a>
@@ -567,7 +567,7 @@
   // Mirror whatever domain the page is served on in all [data-host] elements
   function roomcommHostFix() {
     var h = location.host;
-    if (h === 'roomcomm.ru') return;
+    if (h === 'roomcomm.xyz') return;
     document.querySelectorAll('[data-host]').forEach(function (el) {
       el.innerHTML = el.innerHTML.replace(/roomcomm\.ru/g, h);
     });

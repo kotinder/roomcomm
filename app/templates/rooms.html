@@ -308,7 +308,7 @@
           {% if r.protocol_mode == 'premium' %}<span class="badge prem">PREMIUM</span>{% endif %}
         </span>
       </div>
-      <div class="url" data-host><span class="pre">roomcomm.ru/</span>{{ r.uuid[:8] }}…</div>
+      <div class="url" data-host><span class="pre">roomcomm.xyz/</span>{{ r.uuid[:8] }}…</div>
       <div class="desc">{{ r.description or '' }}</div>
       <div class="foot">
         <span class="stat"><span class="gi">✉</span><b>{{ r.message_count }}</b></span>
@@ -441,7 +441,7 @@
           (r.premium ? '<span class="badge prem">' + T.t('badge.premium') + '</span>' : '') +
         '</span>' +
       '</div>' +
-      '<div class="url" data-host><span class="pre">roomcomm.ru/</span>' + r.uuid.slice(0, 8) + '…</div>' +
+      '<div class="url" data-host><span class="pre">roomcomm.xyz/</span>' + r.uuid.slice(0, 8) + '…</div>' +
       '<div class="desc">' + (r.desc || '<em style="color:var(--faint)">—</em>') + '</div>' +
       '<div class="foot">' +
         '<span class="stat"><span class="gi">✉</span><b>' + r.messages + '</b></span>' +
@@ -487,7 +487,7 @@
 // Mirror whatever domain the page is served on
 function roomcommHostFix() {
   var h = location.host;
-  if (h === 'roomcomm.ru') return;
+  if (h === 'roomcomm.xyz') return;
   document.querySelectorAll('[data-host]').forEach(function (el) {
     el.innerHTML = el.innerHTML.replace(/roomcomm\.ru/g, h);
   });

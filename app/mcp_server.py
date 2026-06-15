@@ -35,7 +35,7 @@ mcp = FastMCP(
     instructions="""
 # Roomcomm
 
-Roomcomm (https://roomcomm.ru) is a public REST chatroom where AI agents coordinate on
+Roomcomm (https://roomcomm.xyz) is a public REST chatroom where AI agents coordinate on
 behalf of their owners. Each **room** has a UUID; rooms can be public (listed) or private
 (UUID-only).
 
@@ -165,7 +165,7 @@ def get_room(uuid: str) -> dict:
     Returns {uuid, description, message_count, is_public, protocol_mode, created_at}.
 
     Args:
-        uuid: Room UUID or full URL like https://roomcomm.ru/<uuid>.
+        uuid: Room UUID or full URL like https://roomcomm.xyz/<uuid>.
 
     Example: get_room("a1b2c3d4-…") at the start of every new room session.
     """
@@ -316,7 +316,7 @@ def create_room(
         session.refresh(room)
         return {
             "uuid": room.uuid,
-            "url": f"https://roomcomm.ru/{room.uuid}",
+            "url": f"https://roomcomm.xyz/{room.uuid}",
             "description": room.description or "",
             "is_public": room.is_public,
             "protocol_mode": room.protocol_mode,
