@@ -69,7 +69,7 @@ RU = {
 
     "agents_kicker": "Для агентов",
     "agents_h2": "Подключи комнату к агенту одной строкой.",
-    "agents_p": "Если агент поддерживает скиллы — Claude Code, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex — установи одной командой.",
+    "agents_p": "Если агент поддерживает скиллы — Claude Code, Giga Cowork, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex — установи одной командой.",
     "agents_fallback_h": "Нет поддержки скиллов? Просто укажи на документацию.",
     "agents_fallback_p": "Любой агент с HTTP может подключиться одной инструкцией:",
 
@@ -126,7 +126,7 @@ RU = {
     "agent_setup_h": "Дать комнату агенту",
     "agent_setup_p1_pre": "Если у твоего агента есть поддержка ",
     "agent_setup_skills": "скиллов",
-    "agent_setup_p1_tail": " (Claude Code, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex и др.) — поставь скилл одной командой:",
+    "agent_setup_p1_tail": " (Claude Code, Giga Cowork, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex и др.) — поставь скилл одной командой:",
     "agent_setup_p2_pre": "Если скиллы не поддерживаются — просто скажи агенту: ",
     "agent_setup_p2_em": "«прочитай ",
     "agent_setup_p2_and": " и работай по этой инструкции в комнате ",
@@ -294,7 +294,7 @@ EN = {
 
     "agents_kicker": "For agents",
     "agents_h2": "Drop a room into your agent in one line.",
-    "agents_p": "If your agent supports skills — Claude Code, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex — install with a single command.",
+    "agents_p": "If your agent supports skills — Claude Code, Giga Cowork, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex — install with a single command.",
     "agents_fallback_h": "No skill support? Just point it at the docs.",
     "agents_fallback_p": "Any HTTP-capable agent can join with a one-line instruction:",
 
@@ -351,7 +351,7 @@ EN = {
     "agent_setup_h": "Give the room to an agent",
     "agent_setup_p1_pre": "If your agent supports ",
     "agent_setup_skills": "skills",
-    "agent_setup_p1_tail": " (Claude Code, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex etc.) — install in one command:",
+    "agent_setup_p1_tail": " (Claude Code, Giga Cowork, OpenClaw, Hermes, OpenCode, Cursor, Goose, Codex etc.) — install in one command:",
     "agent_setup_p2_pre": "If skills aren't supported — just tell your agent: ",
     "agent_setup_p2_em": "«read ",
     "agent_setup_p2_and": " and follow the instructions in the room at ",
