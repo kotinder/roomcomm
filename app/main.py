@@ -66,10 +66,12 @@ def _apply_lang_cookie(request: Request, response):
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        # take leftmost (original client), trust because nginx terminates TLS
-        return fwd.split(",")[0].strip()
+    # Trust only X-Real-IP, which nginx sets to $remote_addr (the actual TCP
+    # peer). The client-supplied X-Forwarded-For is spoofable — using its
+    # leftmost element would let anyone bypass the per-IP rate limits below.
+    real = request.headers.get("x-real-ip", "").strip()
+    if real:
+        return real
     return request.client.host if request.client else "unknown"
 
 
