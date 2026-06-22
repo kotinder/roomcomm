@@ -42,6 +42,11 @@ class RoomInfoOut(BaseModel):
     message_count: int
     is_public: bool
     protocol_mode: str
+    # Whether the LLM arbiter is actually running for this room (premium mode
+    # AND a provider key is configured server-side). last_extraction_error is
+    # the last arbiter failure (None when healthy).
+    arbiter_active: bool = False
+    last_extraction_error: Optional[str] = None
 
     @field_serializer("created_at")
     def _ser(self, v: datetime) -> str:
@@ -134,6 +139,10 @@ class ContextOut(BaseModel):
     discrepancies: list[DiscrepancyOut]
     context_hash: str
     last_extracted_msg_id: int
+    # Arbiter health, mirrored from RoomInfoOut so a single get_context call
+    # tells you whether the arbiter is alive without a separate get_room.
+    arbiter_active: bool = False
+    last_extraction_error: Optional[str] = None
 
 
 class HandshakeIn(BaseModel):
@@ -171,6 +180,7 @@ class RoomListItem(BaseModel):
     created_at: datetime
     last_activity_at: Optional[datetime]
     message_count: int
+    agent_count: int = 0
     protocol_mode: str = "standard"
 
     @field_serializer("created_at")
