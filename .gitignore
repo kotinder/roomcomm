@@ -40,3 +40,6 @@ Thumbs.db
 *.env
 !.env.example
 admin.env
+
+# Local dev / demo helpers (not part of the public repo)
+_send_dialog.py

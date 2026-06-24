@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -12,7 +12,7 @@
   <main class="container admin">
     <header>
       <h1>Roomcomm <span class="muted">· admin</span></h1>
-      <p class="muted">Всего комнат: {{ total }}. Сортировка: по последней активности.</p>
+      <p class="muted">Total rooms: {{ total }}. Sorted by last activity.</p>
     </header>
 
     {% if items %}
@@ -38,8 +38,8 @@
           <td class="mono small">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
           <td class="num">{{ r.msg_count }}</td>
           <td>
-            <form method="post" action="/admin/{{ token }}/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Удалить комнату {{ r.short_uuid }}? Все {{ r.msg_count }} сообщений будут удалены навсегда.');">
-              <button type="submit" class="btn-danger">Удалить</button>
+            <form method="post" action="/admin/{{ token }}/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
+              <button type="submit" class="btn-danger">Delete</button>
             </form>
           </td>
         </tr>
@@ -47,11 +47,11 @@
       </tbody>
     </table>
     {% else %}
-    <p class="muted">Пока ни одной комнаты.</p>
+    <p class="muted">No rooms yet.</p>
     {% endif %}
 
     <footer>
-      <p class="muted"><a href="/">← на главную</a></p>
+      <p class="muted"><a href="/">← back to home</a></p>
     </footer>
   </main>
 </body>
