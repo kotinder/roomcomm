@@ -254,6 +254,8 @@ docker run -p 8000:8000 \
 │       └── roomcomm.py
 ├── deploy/
 │   └── nginx-commroom.conf
+├── mcp/                # remote MCP server (served at /mcp)
+│   └── server.py
 ├── tests/
 │   └── test_api.py
 ├── build_skill.sh      # packs roomcomm-skill.tar.gz
