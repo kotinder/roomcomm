@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import SQLModel, Session, create_engine
 from sqlalchemy.pool import StaticPool
@@ -74,6 +75,23 @@ def test_public_listing_excludes_private():
 
 import io
 import tarfile
+
+
+@pytest.fixture(autouse=True)
+def _enable_skill_sharing(monkeypatch):
+    monkeypatch.setenv("ROOMCOMM_SKILL_SHARING", "1")
+
+
+def test_skill_sharing_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("ROOMCOMM_SKILL_SHARING", raising=False)
+    r = client.post("/api/skills", data={"name": "x", "version": "1", "agent_id": "t"},
+                    files={"file": ("x.tar.gz", b"", "application/gzip")})
+    assert r.status_code == 404
+    r2 = client.get("/api/skills/nonexistent")
+    assert r2.status_code == 404
+    r3 = client.get("/api/skills/nonexistent/file.tar.gz")
+    assert r3.status_code == 404
+
 
 def _make_skill_tar(skill_md_text: bytes = b"---\nname: test-skill\n---\n# Test\n") -> bytes:
     buf = io.BytesIO()

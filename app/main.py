@@ -246,6 +246,19 @@ def create_room(
     description = (payload.description or "").strip()
     if len(description) > 500:
         raise HTTPException(status_code=400, detail="description too long (max 500)")
+    # Don't create silently-dead premium rooms: premium without a configured
+    # arbiter would accept messages but never extract claims or catch
+    # discrepancies. Fail loud instead of degrading to a plain chat.
+    if payload.protocol_mode == "premium" and not llm.is_configured():
+        log.error(
+            "create_room rejected: premium requested but no LLM arbiter "
+            "configured (NVIDIA_API_KEY / DEEPSEEK_API_KEY)"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="premium rooms require the LLM arbiter, which is not "
+                   "configured on this server",
+        )
     room = Room(
         uuid=str(uuid_lib.uuid4()),
         description=description,
@@ -348,6 +361,8 @@ def get_room(room_uuid: str, session: Session = Depends(get_session)):
         message_count=count,
         is_public=room.is_public,
         protocol_mode=room.protocol_mode,
+        arbiter_active=(room.protocol_mode == "premium" and llm.is_configured()),
+        last_extraction_error=room.last_extraction_error,
     )
 
 
@@ -447,8 +462,15 @@ def post_message(
     session.refresh(msg)
 
     # Premium rooms: schedule async LLM extraction after response goes out.
-    if room.protocol_mode == "premium" and llm.is_configured():
-        background_tasks.add_task(_refresh_room_context_bg, room_uuid)
+    if room.protocol_mode == "premium":
+        if llm.is_configured():
+            background_tasks.add_task(_refresh_room_context_bg, room_uuid)
+        else:
+            log.warning(
+                "premium room %s: arbiter skipped for msg #%s — no LLM API key "
+                "configured (NVIDIA_API_KEY / DEEPSEEK_API_KEY)",
+                room_uuid, msg.id,
+            )
 
     return MessageOut(
         id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp,
@@ -703,6 +725,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
     revisions = 0
     discs = 0
     last_model_used = "noop"
+    provider_failed = False
 
     for msg in new_msgs:
         threads = _gather_threads(session, room_uuid)
@@ -722,6 +745,11 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
             last_model_used = model_used
         except llm.LLMUnavailable as e:
             log.warning("LLM unavailable while processing msg #%s: %r", msg.id, e)
+            # Record the failure so the arbiter's health is visible via the API.
+            room.last_extraction_error = str(e)[:500]
+            session.add(room)
+            session.commit()
+            provider_failed = True
             # Don't update the watermark — try again next refresh.
             break
 
@@ -757,6 +785,13 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
             discs += 1
 
         room.last_extracted_msg_id = msg.id
+        session.add(room)
+        session.commit()
+
+    # All new messages processed without a provider failure — clear any stale
+    # error so the arbiter shows healthy again.
+    if not provider_failed and room.last_extraction_error is not None:
+        room.last_extraction_error = None
         session.add(room)
         session.commit()
 
@@ -935,6 +970,8 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
         ],
         context_hash=_canonical_threads_hash(threads),
         last_extracted_msg_id=room.last_extracted_msg_id,
+        arbiter_active=(room.protocol_mode == "premium" and llm.is_configured()),
+        last_extraction_error=room.last_extraction_error,
     )
 
 
@@ -1214,6 +1251,16 @@ def list_handshakes(room_uuid: str, session: Session = Depends(get_session)):
 
 # ---------- Skills (CDN) ----------
 
+def skill_sharing_enabled() -> bool:
+    """Skill-sharing CDN is off by default; enable with ROOMCOMM_SKILL_SHARING=1."""
+    return os.environ.get("ROOMCOMM_SKILL_SHARING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_skill_sharing() -> None:
+    if not skill_sharing_enabled():
+        raise HTTPException(status_code=404, detail="skill sharing is disabled")
+
+
 def _skill_urls(request: Request, skill: Skill) -> tuple[str, str]:
     base = str(request.base_url).rstrip("/")
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", skill.name) or "skill"
@@ -1240,7 +1287,8 @@ def _skill_to_info(request: Request, skill: Skill, include_sig: bool) -> SkillIn
     )
 
 
-@app.post("/api/skills", response_model=SkillUploadOut, status_code=201)
+@app.post("/api/skills", response_model=SkillUploadOut, status_code=201,
+          dependencies=[Depends(_require_skill_sharing)])
 async def upload_skill(
     request: Request,
     file: UploadFile = File(...),
@@ -1369,7 +1417,8 @@ async def upload_skill(
     return JSONResponse(content=response.model_dump(mode="json"), status_code=201)
 
 
-@app.get("/api/skills/{skill_id}", response_model=SkillInfoOut)
+@app.get("/api/skills/{skill_id}", response_model=SkillInfoOut,
+         dependencies=[Depends(_require_skill_sharing)])
 def get_skill_manifest(
     skill_id: str,
     request: Request,
@@ -1383,7 +1432,8 @@ def get_skill_manifest(
     return _skill_to_info(request, skill, include_sig=include_sig)
 
 
-@app.get("/api/skills/{skill_id}/{filename}")
+@app.get("/api/skills/{skill_id}/{filename}",
+         dependencies=[Depends(_require_skill_sharing)])
 def download_skill(
     skill_id: str,
     filename: str,
