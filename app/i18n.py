@@ -4,12 +4,12 @@ Two languages: ru (default) and en. Agent-facing endpoints (SKILL.md,
 agents.md, /{uuid}?format=md, /llms.txt) stay English-only — agents
 don't need a switcher.
 
-Detection priority: ?lang= query > 'lang' cookie > Accept-Language header > ru.
+Detection priority: ?lang= query > 'lang' cookie > Accept-Language header > en.
 """
 from typing import Optional
 
 SUPPORTED = ("ru", "en")
-DEFAULT = "ru"
+DEFAULT = "en"
 
 
 RU = {
