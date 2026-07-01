@@ -51,6 +51,11 @@ def _migrate_sqlite() -> None:
                 "ALTER TABLE rooms ADD COLUMN last_extracted_msg_id INTEGER NOT NULL DEFAULT 0"
             )
             conn.commit()
+        if "last_extraction_error" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN last_extraction_error VARCHAR(500)"
+            )
+            conn.commit()
 
         # PCIS-style signatures on messages (Phase: per-message non-repudiation).
         msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}

@@ -34,7 +34,11 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.environ.get("ROOMCOMM_DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-TIMEOUT_SECONDS = 40.0
+# Nemotron-3-super-120b is a reasoning model that emits a long chain-of-thought
+# before the answer REGARDLESS of the "detailed thinking off" directive (it
+# ignores it — measured ~7-13k chars of reasoning_content per call), so a single
+# structured extraction takes ~80-110s. Keep a generous ceiling (overridable).
+TIMEOUT_SECONDS = float(os.environ.get("ROOMCOMM_LLM_TIMEOUT", "150"))
 MAX_CHARS_PER_MESSAGE = 2000
 MAX_THREADS_IN_PROMPT = 60  # cap to keep prompt bounded for large rooms
 
@@ -51,7 +55,11 @@ You are given ONE new message, a few preceding messages for context (DO NOT extr
   • For each concrete commitment / position / decision / vote / requirement / offer in the NEW message, does it BELONG TO an existing thread (same topic) or does it OPEN a NEW thread?
   • If existing → emit an `update` (or `confirm` for "+1 / agreed / yes", or `contradict` for explicit disagreement with the thread's current_value, or `retract` if the author withdraws their own earlier statement).
   • If new → emit a new claim with a `subject` (short canonical title), a `subject_key` (lowercase kebab-case stable identifier — used for matching future updates), and an initial `value`.
-  • If the new message contradicts a thread that is `agreed`, ALSO emit a discrepancy.
+  • Emit a `discrepancy` (IN ADDITION to the update/contradict revision — emit both) whenever the NEW message materially conflicts with facts already established in the room. Set `related_thread_id` to the affected thread. Specifically flag a discrepancy when:
+      (a) it contradicts a thread that is already `agreed`; OR
+      (b) it changes a previously-stated money amount, date, quantity, or hard requirement to a CONFLICTING value — even if the thread is only `proposed`. Example: a warranty stated as 24 months silently becomes 12 months; a price, deadline, or count moves. Reducing a value below a requirement another party set is a discrepancy; OR
+      (c) the SAME author reverses or undercuts their OWN earlier commitment/claim — e.g. they earlier said "full compliance" / "meets spec" / "24 months" and now offer less than that.
+    Do NOT flag normal negotiation where a party openly proposes a different value as a fresh offer; flag it when the new value silently conflicts with a commitment, requirement, or the author's own prior assurance.
 
 A "thread" is one entity in the negotiation — a single deliverable, decision, deadline, deal item, vote topic, action assignment, constraint, etc. Examples:
   • "Concrete delivery to site #2" — value changes from "delivery on 2026-05-20" → "delivery on 2026-05-22"
@@ -133,19 +141,26 @@ def _build_user_payload(
 
 
 async def _call_openai_compat(
-    url: str, api_key: str, model: str, user_payload: str
+    url: str, api_key: str, model: str, user_payload: str,
+    system_prefix: Optional[str] = None,
 ) -> dict:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    messages = []
+    # Nemotron reasoning toggle. We send "detailed thinking off" since this is a
+    # structured-extraction clerk task that doesn't need CoT — but note the
+    # current 120b build ignores it and reasons anyway (see TIMEOUT_SECONDS).
+    # Kept so it takes effect if the provider honors it on other models/builds.
+    if system_prefix:
+        messages.append({"role": "system", "content": system_prefix})
+    messages.append({"role": "system", "content": SYSTEM_PROMPT})
+    messages.append({"role": "user", "content": user_payload})
     body = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_payload},
-        ],
+        "messages": messages,
         "temperature": 0.0,
         # Per-message processing keeps responses small for typical messages,
         # but "consolidation" / "summary" messages with 10+ items can blow
@@ -337,16 +352,17 @@ async def process_message(
 
     providers = []
     if NVIDIA_API_KEY:
-        providers.append(("nvidia", NVIDIA_URL, NVIDIA_API_KEY, NVIDIA_MODEL))
+        # "detailed thinking off" — Nemotron-specific reasoning toggle.
+        providers.append(("nvidia", NVIDIA_URL, NVIDIA_API_KEY, NVIDIA_MODEL, "detailed thinking off"))
     if DEEPSEEK_API_KEY:
-        providers.append(("deepseek", DEEPSEEK_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL))
+        providers.append(("deepseek", DEEPSEEK_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, None))
     if not providers:
         raise LLMUnavailable("no LLM API key configured (NVIDIA_API_KEY / DEEPSEEK_API_KEY)")
 
     last_err: Optional[Exception] = None
-    for name, url, key, model in providers:
+    for name, url, key, model, system_prefix in providers:
         try:
-            raw = await _call_openai_compat(url, key, model, payload)
+            raw = await _call_openai_compat(url, key, model, payload, system_prefix)
             return _validate_output(raw, existing_ids), f"{name}:{model}"
         except Exception as e:
             log.warning("LLM provider %s failed: %r", name, e)

@@ -20,6 +20,10 @@ class Room(SQLModel, table=True):
     # Watermark for incremental LLM processing — only messages with id >
     # last_extracted_msg_id are fed to the arbiter on the next refresh.
     last_extracted_msg_id: int = Field(default=0)
+    # Last arbiter extraction error (None when healthy). Surfaced via the API
+    # so clients can tell whether the premium arbiter is actually working
+    # without having to call verify_integrity.
+    last_extraction_error: Optional[str] = Field(default=None, max_length=500)
 
 
 class Message(SQLModel, table=True):
