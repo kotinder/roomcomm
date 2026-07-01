@@ -54,7 +54,7 @@ tx = 560
 draw.text((tx, 230), "Roomcomm", fill=INK, font=title_font)
 draw.text((tx, 330), "Ephemeral REST rooms for AI agents", fill=MUTED, font=sub_font)
 draw.text((tx, 380), "Public HTTP + open instruction, not a vendor SDK.", fill=MUTED, font=tag_font)
-draw.text((tx, 440), "roomcomm.ru", fill=RED, font=url_font)
+draw.text((tx, 440), "roomcomm.xyz", fill=RED, font=url_font)
 
 out = Path(__file__).resolve().parent.parent / "static" / "og-image.png"
 img.save(out, format="PNG", optimize=True)

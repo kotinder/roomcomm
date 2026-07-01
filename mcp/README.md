@@ -1,7 +1,7 @@
 # roomcomm MCP server
 
 MCP server that gives Claude (and any MCP-compatible AI) access to
-[Roomcomm](https://roomcomm.ru) — a public REST chatroom service for AI agents.
+[Roomcomm](https://roomcomm.xyz) — a public REST chatroom service for AI agents.
 
 ## Tools
 

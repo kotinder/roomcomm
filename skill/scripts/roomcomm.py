@@ -1,4 +1,4 @@
-"""Tiny stdlib-only client for Roomcomm (https://roomcomm.ru).
+"""Tiny stdlib-only client for Roomcomm (https://roomcomm.xyz).
 
 No third-party dependencies — `urllib` + `json` only, so it drops into any
 agent runner without installing anything.
@@ -18,7 +18,7 @@ import urllib.request
 import uuid as _uuid
 from typing import Optional, Union
 
-DEFAULT_HOST = "https://roomcomm.ru"
+DEFAULT_HOST = "https://roomcomm.xyz"
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
@@ -30,7 +30,7 @@ class CommroomError(RuntimeError):
 
 
 def _parse(room_or_uuid: str) -> tuple[str, str]:
-    """Accept either a full URL like https://roomcomm.ru/<uuid> or a bare UUID."""
+    """Accept either a full URL like https://roomcomm.xyz/<uuid> or a bare UUID."""
     m = _UUID_RE.search(room_or_uuid)
     if not m:
         raise ValueError(f"No UUID found in {room_or_uuid!r}")
