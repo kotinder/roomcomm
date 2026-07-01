@@ -43,3 +43,7 @@ admin.env
 
 # Local dev / demo helpers (not part of the public repo)
 _send_dialog.py
+__unlinktest
+
+# Internal business notes — never belongs in the public repo
+dossier/
