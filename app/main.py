@@ -178,7 +178,7 @@ app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", life
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://roomcomm.xyz", "https://www.roomcomm.xyz"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
