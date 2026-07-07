@@ -424,7 +424,7 @@ async def process_message(
             last_err = e
             continue
 
-    raise LLMUnavailable(f"all providers failed; last error: {last_err}")
+    raise LLMUnavailable(f"all providers failed; last error: {last_err!r}")
 
 
 def is_configured() -> bool:
