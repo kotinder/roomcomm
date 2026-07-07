@@ -47,6 +47,16 @@ class LLMUnavailable(RuntimeError):
     """Raised when no provider could produce a valid response."""
 
 
+class LLMBadOutput(LLMUnavailable):
+    """Provider answered, but not with the expected ledger JSON schema.
+
+    Retryable with a corrective instruction: at temperature 0 the exact same
+    prompt reproduces the exact same bad output forever (this is how room
+    extraction got permanently stuck on 26.06 — Nemotron echoed a top-level
+    "threads" list with one thread per physical unit and hit max_tokens).
+    """
+
+
 SYSTEM_PROMPT = """You are Roomcomm Arbiter — a structured-data clerk for a chat between two or more AI agents collaborating or negotiating.
 
 YOUR JOB FOR EACH CALL:
@@ -72,6 +82,8 @@ HARD RULES:
 - `subject_key`: lowercase kebab-case, no spaces, no quotes, ≤ 60 chars. Use generic nouns ("concrete-delivery-site-2", "manifesto-point-3-self-consciousness", "alice-q3-report"). Stable across messages.
 - `subject` ≤ 100 chars. `value` ≤ 200 chars. `quote` ≤ 200 chars (truncate with "…" if needed).
 - Match liberally: if a new message clearly references a thread's topic even with different phrasing, route to it via `thread_id`. When in doubt about whether it's the same topic, prefer creating a new thread (over-merging is worse than over-splitting).
+- A quantity of identical units is ONE thread ("200 server racks" → one thread whose value carries the quantity). NEVER create one thread per unit/item.
+- Your output's top-level keys MUST be exactly `new_claims`, `updates`, `discrepancies`. NEVER output a top-level `threads` key and NEVER echo `existing_threads` back.
 - BE LIBERAL ABOUT WHAT TO EXTRACT: requests ("need 200kg beef"), offers ("can supply at $10"), counter-offers, votes (+1/-1), assignments ("Bob will draft"), deadlines, decisions ("we go with option A") — all are valid.
 - DO NOT extract: pure greetings, pure thanks, generic opinions with no concrete content, questions with no proposal attached.
 - If the new message is unreadable mojibake / encoding garbage, emit nothing.
@@ -140,9 +152,13 @@ def _build_user_payload(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+EXPECTED_TOP_KEYS = {"new_claims", "updates", "discrepancies"}
+
+
 async def _call_openai_compat(
     url: str, api_key: str, model: str, user_payload: str,
     system_prefix: Optional[str] = None,
+    corrective: Optional[str] = None,
 ) -> dict:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -158,6 +174,8 @@ async def _call_openai_compat(
         messages.append({"role": "system", "content": system_prefix})
     messages.append({"role": "system", "content": SYSTEM_PROMPT})
     messages.append({"role": "user", "content": user_payload})
+    if corrective:
+        messages.append({"role": "user", "content": corrective})
     body = {
         "model": model,
         "messages": messages,
@@ -183,18 +201,33 @@ async def _call_openai_compat(
         rc = msg.get("reasoning_content") or ""
         if rc:
             candidates.append(rc)
+    parsed: Optional[dict] = None
     for cand in candidates:
         try:
-            return json.loads(cand)
+            parsed = json.loads(cand)
+            break
         except json.JSONDecodeError:
             pass
         start = cand.find("{")
         end = cand.rfind("}")
         if start >= 0 and end > start:
             try:
-                return json.loads(cand[start : end + 1])
+                parsed = json.loads(cand[start : end + 1])
+                break
             except json.JSONDecodeError:
                 pass
+    if parsed is not None:
+        # Schema guard: a syntactically valid JSON with none of the ledger
+        # keys (e.g. an echo of existing_threads) must NOT silently validate
+        # into "nothing extracted" — that would advance the watermark and
+        # drop the message's content forever.
+        if isinstance(parsed, dict) and (set(parsed) & EXPECTED_TOP_KEYS):
+            return parsed
+        got = list(parsed)[:5] if isinstance(parsed, dict) else type(parsed).__name__
+        raise LLMBadOutput(
+            f"schema violation: top-level keys {got!r}, "
+            f"expected some of {sorted(EXPECTED_TOP_KEYS)}"
+        )
     fr = data["choices"][0].get("finish_reason")
     # Salvage: if the response was truncated by max_tokens, harvest any
     # complete `new_claims` / `updates` objects from the partial JSON.
@@ -202,7 +235,7 @@ async def _call_openai_compat(
         salvaged = _salvage_partial_ledger(content)
         if salvaged is not None:
             return salvaged
-    raise LLMUnavailable(
+    raise LLMBadOutput(
         f"no JSON found in response; content[:200]={content[:200]!r}, "
         f"finish_reason={fr!r}"
     )
@@ -261,6 +294,15 @@ def _salvage_partial_ledger(content: str) -> Optional[dict]:
     )
     return {"new_claims": new_claims, "updates": updates, "discrepancies": discrepancies}
 
+
+CORRECTIVE_INSTRUCTION = (
+    "Your previous reply did not follow the required output schema. "
+    'Reply with ONLY a JSON object whose top-level keys are exactly '
+    '"new_claims", "updates", "discrepancies". '
+    "Do NOT echo existing_threads, do NOT output a \"threads\" key, "
+    "do NOT create one thread per physical unit. "
+    'If nothing is extractable, reply {"new_claims": [], "updates": [], "discrepancies": []}.'
+)
 
 ALLOWED_KINDS_NEW = {"propose"}
 ALLOWED_KINDS_UPDATE = {"update", "confirm", "contradict", "retract"}
@@ -362,7 +404,20 @@ async def process_message(
     last_err: Optional[Exception] = None
     for name, url, key, model, system_prefix in providers:
         try:
-            raw = await _call_openai_compat(url, key, model, payload, system_prefix)
+            try:
+                raw = await _call_openai_compat(url, key, model, payload, system_prefix)
+            except LLMBadOutput as bad:
+                # At temperature 0 the same prompt reproduces the same bad
+                # output, so a plain retry is useless — append a corrective
+                # instruction to break the determinism.
+                log.warning(
+                    "LLM provider %s produced bad output (%r) — retrying once "
+                    "with corrective instruction", name, bad,
+                )
+                raw = await _call_openai_compat(
+                    url, key, model, payload, system_prefix,
+                    corrective=CORRECTIVE_INSTRUCTION,
+                )
             return _validate_output(raw, existing_ids), f"{name}:{model}"
         except Exception as e:
             log.warning("LLM provider %s failed: %r", name, e)

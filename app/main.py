@@ -719,6 +719,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
         return {
             "processed_msgs": 0, "new_threads": 0, "revisions": 0,
             "discrepancies": 0, "model_used": "noop", "elapsed_ms": 0,
+            "provider_failed": False, "last_error": None,
         }
 
     new_threads = 0
@@ -800,6 +801,8 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
         "processed_msgs": len(new_msgs), "new_threads": new_threads,
         "revisions": revisions, "discrepancies": discs,
         "model_used": last_model_used, "elapsed_ms": elapsed_ms,
+        "provider_failed": provider_failed,
+        "last_error": room.last_extraction_error if provider_failed else None,
     }
 
 
@@ -816,6 +819,19 @@ async def _refresh_room_context_bg(room_uuid: str) -> None:
                     out["revisions"], out["discrepancies"],
                     out["model_used"], out["elapsed_ms"],
                 )
+                if out.get("provider_failed"):
+                    # The watermark did not advance — every future message in
+                    # this room will re-hit the same failure. Make it loud.
+                    err = out.get("last_error") or "unknown"
+                    log.warning(
+                        "bg refresh %s: extraction STUCK, watermark not advanced: %s",
+                        room_uuid, err,
+                    )
+                    await notify.send(notify.format_error(
+                        where="LLM arbiter extraction (stuck, will retry on next message)",
+                        exc=llm.LLMUnavailable(err),
+                        request_path=f"/api/rooms/{room_uuid}",
+                    ))
     except Exception as e:
         log.warning("background refresh failed for %s: %r", room_uuid, e)
         try:
