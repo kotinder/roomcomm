@@ -11,6 +11,7 @@ import time
 import uuid as uuid_lib
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -126,7 +127,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
 
 from . import i18n, llm, notify, pcis
 from .database import SKILLS_DIR, engine, get_session, init_db
-from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room, Skill
+from .models import Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message, Room, Skill, utcnow
 from .schemas import (
     ClaimIn,
     ContextOut,
@@ -170,6 +171,7 @@ STATIC_DIR = BASE_DIR.parent / "static"
 async def lifespan(app_: FastAPI):
     from .mcp_server import mcp_lifespan as _mcp_lifespan  # lazy — avoids circular import
     init_db()
+    _prune_hits()
     async with _mcp_lifespan(app_):
         yield
 
@@ -185,6 +187,102 @@ app.add_middleware(
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ---------- Usage stats ----------
+# Counts *meaningful* events, not every request — scanner noise (wp-admin
+# probes, 404s) never matches _classify_hit, so the hits table stays a
+# usage signal rather than a raw access log.
+
+HITS_RETENTION_DAYS = 90
+_UUID_PAGE_RE = re.compile(
+    r"^/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_MSG_POST_RE = re.compile(r"^/api/rooms/[^/]+/messages$")
+
+
+def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
+    """Map a request to a countable usage event, or None to skip it."""
+    if status >= 400:
+        return None
+    if method == "POST":
+        if path == "/mcp":
+            return "mcp"
+        if path == "/api/rooms":
+            return "room_created"
+        if _MSG_POST_RE.match(path):
+            return "message"
+        if path == "/api/skills":
+            return "skill_upload"
+    elif method == "GET":
+        if path in ("/", "/rooms"):
+            return "landing"
+        if _UUID_PAGE_RE.match(path):
+            return "room_view"
+        if path.startswith("/api/skills/"):
+            return "skill_download"
+    return None
+
+
+def _record_hit(event: str, path: str, headers: dict, client_host: str) -> None:
+    # Same trust model as _client_ip: X-Real-IP is set by nginx, XFF is not trusted.
+    ip = (headers.get("x-real-ip") or "").strip() or client_host
+    try:
+        with Session(engine) as s:
+            s.add(Hit(
+                day=utcnow().strftime("%Y-%m-%d"),
+                event=event,
+                ip=ip[:45],
+                user_agent=(headers.get("user-agent") or "")[:200],
+                referer=(headers.get("referer") or "")[:300],
+                path=path[:200],
+            ))
+            s.commit()
+    except Exception:
+        log.exception("failed to record hit")
+
+
+def _prune_hits() -> None:
+    cutoff = (utcnow() - timedelta(days=HITS_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    with Session(engine) as s:
+        s.exec(delete(Hit).where(Hit.day < cutoff))
+        s.commit()
+
+
+class _StatsMiddleware:
+    """Pure ASGI middleware — BaseHTTPMiddleware would buffer/interfere with
+    the long-lived SSE streams on /mcp. Records the event as soon as the
+    response status is known (SSE responses may never complete)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        method = scope["method"]
+        path = scope["path"]
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                event = _classify_hit(method, path, message["status"])
+                if event:
+                    headers = {
+                        k.decode("latin-1").lower(): v.decode("latin-1")
+                        for k, v in scope.get("headers", [])
+                    }
+                    client = scope.get("client")
+                    await asyncio.to_thread(
+                        _record_hit, event, path, headers,
+                        client[0] if client else "unknown",
+                    )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(_StatsMiddleware)
 
 
 @app.exception_handler(Exception)
@@ -1478,6 +1576,18 @@ def index(request: Request):
     return _apply_lang_cookie(request, resp)
 
 
+_ROBOTS_TXT = """User-agent: *
+Disallow: /admin/
+Disallow: /api/
+Disallow: /mcp
+"""
+
+
+@app.get("/robots.txt", include_in_schema=False)
+def robots_txt():
+    return PlainTextResponse(_ROBOTS_TXT)
+
+
 @app.get("/rooms", response_class=HTMLResponse)
 def public_rooms_page(
     request: Request,
@@ -1582,6 +1692,58 @@ def _check_admin(token: str) -> None:
 
 _NOINDEX_HEADERS = {"X-Robots-Tag": "noindex, nofollow", "Cache-Control": "private, no-store"}
 
+STATS_EVENTS = [
+    ("mcp", "MCP"),
+    ("message", "Msgs"),
+    ("room_created", "Rooms+"),
+    ("room_view", "Room views"),
+    ("landing", "Landing"),
+    ("skill_download", "Skill DL"),
+    ("skill_upload", "Skill UL"),
+]
+
+
+def _admin_stats(session: Session, days_back: int = 14) -> dict:
+    days = [
+        (utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        for i in range(days_back - 1, -1, -1)
+    ]
+    since = days[0]
+    by_day: dict[str, dict[str, int]] = {d: {} for d in days}
+    for day, event, n in session.exec(
+        select(Hit.day, Hit.event, func.count(Hit.id))
+        .where(Hit.day >= since)
+        .group_by(Hit.day, Hit.event)
+    ).all():
+        by_day.setdefault(day, {})[event] = n
+    uniques = dict(session.exec(
+        select(Hit.day, func.count(func.distinct(Hit.ip)))
+        .where(Hit.day >= since)
+        .group_by(Hit.day)
+    ).all())
+    top_ua = session.exec(
+        select(Hit.user_agent, func.count(Hit.id))
+        .where(Hit.day >= since, Hit.user_agent != "")
+        .group_by(Hit.user_agent)
+        .order_by(func.count(Hit.id).desc())
+        .limit(10)
+    ).all()
+    top_ref = session.exec(
+        select(Hit.referer, func.count(Hit.id))
+        .where(Hit.day >= since, Hit.referer != "")
+        .group_by(Hit.referer)
+        .order_by(func.count(Hit.id).desc())
+        .limit(10)
+    ).all()
+    return {
+        "days": days,
+        "by_day": by_day,
+        "uniques": uniques,
+        "top_ua": top_ua,
+        "top_ref": top_ref,
+        "events": STATS_EVENTS,
+    }
+
 
 @app.get("/admin/{token}", response_class=HTMLResponse)
 def admin_page(token: str, request: Request, session: Session = Depends(get_session)):
@@ -1617,7 +1779,8 @@ def admin_page(token: str, request: Request, session: Session = Depends(get_sess
     response = templates.TemplateResponse(
         request,
         "admin.html",
-        {"items": items, "token": token, "total": len(items)},
+        {"items": items, "token": token, "total": len(items),
+         "stats": _admin_stats(session)},
     )
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v

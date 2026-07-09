@@ -7,6 +7,14 @@
   <title>Roomcomm · admin</title>
   <link rel="stylesheet" href="/static/style.css">
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <style>
+    .admin-stats { margin-bottom: 2rem; }
+    .admin-stats h2 { margin-bottom: .5rem; }
+    .stats-tops { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+    .stats-tops h3 { margin: 0 0 .3rem; font-size: .95rem; }
+    .stats-tops td.num { white-space: nowrap; }
+    @media (max-width: 700px) { .stats-tops { grid-template-columns: 1fr; } }
+  </style>
 </head>
 <body>
   <main class="container admin">
@@ -14,6 +22,57 @@
       <h1>Roomcomm <span class="muted">· admin</span></h1>
       <p class="muted">Total rooms: {{ total }}. Sorted by last activity.</p>
     </header>
+
+    <section class="admin-stats">
+      <h2>Usage · last {{ stats.days|length }} days <span class="muted small">(UTC, meaningful events only — scanner noise excluded)</span></h2>
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th>Day</th>
+            {% for key, label in stats.events %}<th class="num">{{ label }}</th>{% endfor %}
+            <th class="num">Uniq IPs</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in stats.days %}
+          <tr>
+            <td class="mono small">{{ d }}</td>
+            {% for key, label in stats.events %}
+            <td class="num">{{ stats.by_day[d].get(key) or '—' }}</td>
+            {% endfor %}
+            <td class="num">{{ stats.uniques.get(d) or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <div class="stats-tops">
+        <div>
+          <h3>Top user-agents</h3>
+          <table class="admin-table">
+            <tbody>
+              {% for ua, n in stats.top_ua %}
+              <tr><td class="num">{{ n }}</td><td class="small">{{ (ua[:70] + '…') if ua|length > 70 else ua }}</td></tr>
+              {% else %}
+              <tr><td class="muted">no data yet</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div>
+          <h3>Top referers</h3>
+          <table class="admin-table">
+            <tbody>
+              {% for ref, n in stats.top_ref %}
+              <tr><td class="num">{{ n }}</td><td class="small">{{ (ref[:70] + '…') if ref|length > 70 else ref }}</td></tr>
+              {% else %}
+              <tr><td class="muted">no data yet</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
 
     {% if items %}
     <table class="admin-table">

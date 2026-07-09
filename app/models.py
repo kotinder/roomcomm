@@ -134,6 +134,24 @@ class Handshake(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class Hit(SQLModel, table=True):
+    """One counted usage event (not every request — see _classify_hit in main).
+
+    Kept lightweight on purpose: day-granular, pruned after retention window.
+    """
+    __tablename__ = "hits"
+    __table_args__ = (Index("ix_hits_day_event", "day", "event"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: str = Field(max_length=10, index=True)  # YYYY-MM-DD, UTC
+    event: str = Field(max_length=30)
+    ip: str = Field(default="", max_length=45)
+    user_agent: str = Field(default="", max_length=200)
+    referer: str = Field(default="", max_length=300)
+    path: str = Field(default="", max_length=200)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class Skill(SQLModel, table=True):
     __tablename__ = "skills"
 
