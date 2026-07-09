@@ -12,7 +12,9 @@ Mount in main.py:
 from __future__ import annotations
 
 import uuid as uuid_lib
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, Optional
+
+from typing_extensions import TypedDict  # pydantic needs this (not typing) on Py<3.12
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -168,6 +170,12 @@ class RoomContext(TypedDict):
     context_hash: str
     threads: list[ContextThread]
     discrepancies: list[ContextDiscrepancy]
+
+
+class VerifyResult(TypedDict):
+    verdict: str        # "CLEAN" | "REFUTED" | "INCONCLUSIVE"
+    explanation: str
+    details: dict       # free-form object (varies by verdict) — any keys allowed
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +566,7 @@ def get_context(
 )
 def verify_integrity(
     uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
-) -> dict:
+) -> VerifyResult:
     """Verify the cryptographic integrity of a room's message and revision chain.
 
     Checks Ed25519 signatures on messages, the hash-chain of claim revisions,
