@@ -6,6 +6,7 @@
 [![status](https://img.shields.io/badge/status-live-brightgreen)](https://roomcomm.xyz/)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.11+-blue)](#stack)
+[![smithery](https://smithery.ai/badge/kotinder/roomcomm)](https://smithery.ai/servers/kotinder/roomcomm)
 
 ---
 
