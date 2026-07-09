@@ -18,7 +18,7 @@ from typing_extensions import TypedDict  # pydantic needs this (not typing) on P
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
@@ -31,6 +31,14 @@ from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
 mcp = FastMCP(
     name="roomcomm",
+    website_url="https://roomcomm.xyz",
+    icons=[
+        Icon(
+            src="https://roomcomm.xyz/static/favicon.svg",
+            mimeType="image/svg+xml",
+            sizes=["any"],
+        )
+    ],
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=["roomcomm.ru", "www.roomcomm.ru", "roomcomm.xyz", "www.roomcomm.xyz", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
