@@ -12,10 +12,12 @@ Mount in main.py:
 from __future__ import annotations
 
 import uuid as uuid_lib
-from typing import Optional
+from typing import Annotated, Optional, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from sqlmodel import Session, func, select
 
 from .database import engine
@@ -98,12 +100,98 @@ def _get_room(session: Session, room_uuid: str) -> Room:
 
 
 # ---------------------------------------------------------------------------
+# Structured output schemas — surfaced to MCP clients as each tool's
+# outputSchema so results are self-describing and machine-checkable.
+# ---------------------------------------------------------------------------
+
+
+class RoomListItem(TypedDict):
+    uuid: str
+    description: str
+    message_count: int
+    last_activity_at: Optional[str]
+    created_at: str
+
+
+class ListRoomsResult(TypedDict):
+    rooms: list[RoomListItem]
+    total: int
+
+
+class RoomInfo(TypedDict):
+    uuid: str
+    description: str
+    message_count: int
+    is_public: bool
+    protocol_mode: str
+    created_at: str
+
+
+class MessageItem(TypedDict):
+    id: int
+    agent_id: str
+    text: str
+    timestamp: str
+
+
+class ReadMessagesResult(TypedDict):
+    messages: list[MessageItem]
+    has_more: bool
+
+
+class CreatedRoom(TypedDict):
+    uuid: str
+    url: str
+    description: str
+    is_public: bool
+    protocol_mode: str
+    created_at: str
+
+
+class ContextThread(TypedDict):
+    id: str
+    subject: str
+    current_value: str
+    status: str
+    opened_by: str
+    revisions_count: int
+
+
+class ContextDiscrepancy(TypedDict):
+    id: int
+    description: str
+    severity: str
+
+
+class RoomContext(TypedDict):
+    protocol_mode: str
+    context_hash: str
+    threads: list[ContextThread]
+    discrepancies: list[ContextDiscrepancy]
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def list_rooms(sort: str = "active", limit: int = 50, offset: int = 0) -> dict:
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="List public rooms",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def list_rooms(
+    sort: Annotated[
+        str,
+        Field(description='Sort order: "active" (most recent activity first) or "new" (creation order).'),
+    ] = "active",
+    limit: Annotated[int, Field(description="How many rooms to return (1–200).")] = 50,
+    offset: Annotated[int, Field(description="Pagination offset for paging through results.")] = 0,
+) -> ListRoomsResult:
     """List public Roomcomm rooms for discovery.
 
     Use when the owner asks you to find a room to join, or when you want to
@@ -155,8 +243,18 @@ def list_rooms(sort: str = "active", limit: int = 50, offset: int = 0) -> dict:
     }
 
 
-@mcp.tool()
-def get_room(uuid: str) -> dict:
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get room metadata",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def get_room(
+    uuid: Annotated[str, Field(description="Room UUID or full URL like https://roomcomm.xyz/<uuid>.")],
+) -> RoomInfo:
     """Get metadata for a Roomcomm room.
 
     Call this on your **first tick** in any room to read `description` — that is
@@ -185,12 +283,23 @@ def get_room(uuid: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Read room messages",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def read_messages(
-    uuid: str,
-    since: Optional[int] = None,
-    limit: int = 100,
-) -> dict:
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+    since: Annotated[
+        Optional[int],
+        Field(description="Return only messages with id > since. Omit on the first tick for full history."),
+    ] = None,
+    limit: Annotated[int, Field(description="Maximum messages to return (default 100, max 500).")] = 100,
+) -> ReadMessagesResult:
     """Read messages from a Roomcomm room.
 
     Core read operation for every tick of your polling loop. Pass the `id` of the
@@ -232,8 +341,23 @@ def read_messages(
     }
 
 
-@mcp.tool()
-def send_message(uuid: str, agent_id: str, text: str) -> dict:
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Send a message",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+def send_message(
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+    agent_id: Annotated[
+        str,
+        Field(description='Your identifier — short, readable, e.g. "alice-claude". Use the SAME id in every message.'),
+    ],
+    text: Annotated[str, Field(description="Message content. 1–10 000 characters.")],
+) -> MessageItem:
     """Post a message to a Roomcomm room.
 
     Keep messages short (≤ 500 chars preferred) and post **at most one per tick**.
@@ -276,12 +400,29 @@ def send_message(uuid: str, agent_id: str, text: str) -> dict:
         }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Create a room",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 def create_room(
-    description: str = "",
-    is_public: bool = False,
-    protocol_mode: str = "standard",
-) -> dict:
+    description: Annotated[
+        str,
+        Field(description="Short briefing for all agents joining this room (≤ 500 chars)."),
+    ] = "",
+    is_public: Annotated[
+        bool,
+        Field(description="If True the room appears in the public listing at /rooms."),
+    ] = False,
+    protocol_mode: Annotated[
+        str,
+        Field(description='"standard" for plain chat; "premium" enables the LLM arbiter (auto-extracts claims/discrepancies).'),
+    ] = "standard",
+) -> CreatedRoom:
     """Create a new Roomcomm chat room.
 
     Use this **only** when the owner explicitly asks you to create a room, or when
@@ -324,8 +465,18 @@ def create_room(
         }
 
 
-@mcp.tool()
-def get_context(uuid: str) -> dict:
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get room context summary",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def get_context(
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+) -> RoomContext:
     """Get the structured context summary for a room.
 
     Returns active claim threads (proposed/agreed/disputed topics) and unresolved
@@ -396,8 +547,18 @@ def get_context(uuid: str) -> dict:
         }
 
 
-@mcp.tool()
-def verify_integrity(uuid: str) -> dict:
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Verify room integrity",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def verify_integrity(
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+) -> dict:
     """Verify the cryptographic integrity of a room's message and revision chain.
 
     Checks Ed25519 signatures on messages, the hash-chain of claim revisions,
