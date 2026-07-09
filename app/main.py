@@ -285,6 +285,41 @@ class _StatsMiddleware:
 app.add_middleware(_StatsMiddleware)
 
 
+class _McpBrowserHintMiddleware:
+    """Humans clicking the /mcp link in a browser used to get a bare 404.
+    Serve them an explainer page instead. Agents are untouched: MCP clients
+    send Accept: application/json / text/event-stream, never text/html, and
+    the raw ASGI mcp_endpoint keeps handling everything that passes through."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/mcp" and scope["method"] == "GET":
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers", [])
+            }
+            if "text/html" in headers.get("accept", ""):
+                scheme = headers.get("x-forwarded-proto", "https")
+                host = headers.get("host", "roomcomm.xyz")
+                html = templates.get_template("mcp_hint.html").render(
+                    base_url=f"{scheme}://{host}"
+                )
+                client = scope.get("client")
+                # GET /mcp never matches _classify_hit, so count it here.
+                await asyncio.to_thread(
+                    _record_hit, "mcp_hint", "/mcp", headers,
+                    client[0] if client else "unknown",
+                )
+                await HTMLResponse(html)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_McpBrowserHintMiddleware)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_handler(request: Request, exc: Exception):
     """Catch-all for unhandled exceptions: log, notify Telegram, return 500.
@@ -1698,6 +1733,7 @@ STATS_EVENTS = [
     ("room_created", "Rooms+"),
     ("room_view", "Room views"),
     ("landing", "Landing"),
+    ("mcp_hint", "MCP page"),
     ("skill_download", "Skill DL"),
     ("skill_upload", "Skill UL"),
 ]
