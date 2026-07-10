@@ -56,6 +56,19 @@ def _migrate_sqlite() -> None:
                 "ALTER TABLE rooms ADD COLUMN last_extraction_error VARCHAR(500)"
             )
             conn.commit()
+        # Auth MVP: write policies + key attribution on rooms.
+        # (agent_keys / usage_counters are new tables — create_all handles them.)
+        if "write_policy" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN write_policy VARCHAR(10) NOT NULL DEFAULT 'open'"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN write_key_hash VARCHAR(64)"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN owner_key_id INTEGER REFERENCES agent_keys(id)"
+            )
+            conn.commit()
 
         # PCIS-style signatures on messages (Phase: per-message non-repudiation).
         msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
@@ -63,6 +76,13 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN pubkey_hex VARCHAR(64)")
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN signature_hex VARCHAR(128)")
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN memory_root VARCHAR(128)")
+            conn.commit()
+
+        # Auth MVP: key attribution on messages.
+        if msg_cols and "key_id" not in msg_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE messages ADD COLUMN key_id INTEGER REFERENCES agent_keys(id)"
+            )
             conn.commit()
 
         # Arbiter-signed hash chain on revisions.

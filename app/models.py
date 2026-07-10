@@ -7,6 +7,54 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class AgentKey(SQLModel, table=True):
+    """A free, instantly-issued API key — an accountable, revocable, tiered
+    identity. Only sha256 of the key is stored; the key itself is shown once
+    at issue time. A key is NOT unlimited access: volume is quota-limited per
+    key too, otherwise abusers would just register bots and spam legally.
+    """
+    __tablename__ = "agent_keys"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    key_hash: str = Field(unique=True, index=True, max_length=64)
+    # Claimed display name — not unique, informational only.
+    agent_id: str = Field(default="", max_length=100)
+    # Optional contact (tg/email) for a future trust escalation path.
+    contact: Optional[str] = Field(default=None, max_length=200)
+    # 'free' | 'trusted' | 'blocked'
+    tier: str = Field(default="free", max_length=20)
+    # Per-key overrides of the tier's default daily quotas (NULL = tier default).
+    daily_msg_quota: Optional[int] = Field(default=None)
+    daily_room_quota: Optional[int] = Field(default=None)
+    # Instant kill switch — revoked keys are rejected everywhere.
+    revoked: bool = Field(default=False)
+    # IP the key was issued to — admin-side farm detection (many keys from
+    # one IP), same trust model as _client_ip (nginx-set X-Real-IP only).
+    created_ip: str = Field(default="", max_length=45)
+    # One-time code the owner sends to the Telegram bot to escalate the key
+    # to tier 'verified' (phase 2.5). Generated at issue time, shown in
+    # /api/keys/me.
+    verify_code: str = Field(default="", max_length=20, index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+    last_used_at: Optional[datetime] = Field(default=None)
+    # Admin-only annotation (why trusted/blocked, who it belongs to, etc.)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class UsageCounter(SQLModel, table=True):
+    """Persistent daily usage counter per subject — survives restarts, unlike
+    the in-memory per-IP rate limiter in main. Incremented atomically via
+    INSERT ... ON CONFLICT DO UPDATE.
+    """
+    __tablename__ = "usage_counters"
+
+    # 'key:<id>' for Bearer-authenticated requests, 'ip:<addr>' for anonymous.
+    subject: str = Field(primary_key=True, max_length=60)
+    day: str = Field(primary_key=True, max_length=10)  # YYYY-MM-DD, UTC
+    kind: str = Field(primary_key=True, max_length=10)  # 'msg' | 'room'
+    count: int = Field(default=0)
+
+
 class Room(SQLModel, table=True):
     __tablename__ = "rooms"
 
@@ -14,6 +62,15 @@ class Room(SQLModel, table=True):
     description: str = Field(default="", max_length=500)
     created_at: datetime = Field(default_factory=utcnow)
     is_public: bool = Field(default=False, index=True)
+    # Who may post: 'open' (default — anyone, current behavior) | 'key'
+    # (requires the room write-key or the owner's Bearer key) | 'signed'
+    # (reserved for the ed25519 layer, not implemented yet).
+    write_policy: str = Field(default="open", max_length=10)
+    # sha256 of the room write-key; set when write_policy='key', shown to the
+    # creator once at room creation.
+    write_key_hash: Optional[str] = Field(default=None, max_length=64)
+    # Key that created the room (NULL = created anonymously).
+    owner_key_id: Optional[int] = Field(default=None, foreign_key="agent_keys.id")
     # "standard" — claims feature available, LLM runs only on /context/refresh.
     # "premium"  — LLM extracts claims after every message (background task).
     protocol_mode: str = Field(default="standard", max_length=20)
@@ -42,6 +99,8 @@ class Message(SQLModel, table=True):
     # Opaque hex string the agent uses to commit to its memory state at the
     # moment of sending. Server does not interpret it.
     memory_root: Optional[str] = Field(default=None, max_length=128)
+    # Key the message was posted with (NULL = anonymous post).
+    key_id: Optional[int] = Field(default=None, foreign_key="agent_keys.id")
 
 
 class Claim(SQLModel, table=True):
