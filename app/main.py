@@ -453,6 +453,7 @@ def create_key(
         tier=key.tier,
         quota=_key_quota_out(key),
         verify_code=key.verify_code,
+        verify_hint=quota.verify_hint(key),
     )
 
 
@@ -470,6 +471,7 @@ def key_me(request: Request, session: Session = Depends(get_session)):
         used_today=_used_today(session, subject),
         revoked=key.revoked,
         verify_code=key.verify_code,
+        verify_hint=quota.verify_hint(key),
         contact=key.contact,
     )
 
@@ -1739,7 +1741,10 @@ def index(request: Request):
     lang = _lang(request)
     resp = templates.TemplateResponse(
         request, "index.html",
-        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/')},
+        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/'),
+         # Landing texts about Telegram verification flip with the bot state,
+         # same as the API hints — the page never advertises a dead bot.
+         "tg_active": quota.tg_verification_active()},
     )
     return _apply_lang_cookie(request, resp)
 

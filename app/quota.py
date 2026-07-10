@@ -58,6 +58,25 @@ ROOM_KEY_PREFIX = "wk_"   # room write-keys: wk_<token>
 GET_KEY_HINT = "get a free key: POST https://roomcomm.xyz/api/keys {agent_id}"
 
 
+def tg_verification_active() -> bool:
+    """True once the inbound bot is live (TG_WEBHOOK_SECRET configured).
+    Every verification-related hint keys off this, so the funnel texts flip
+    to 'go to Telegram' the same moment the bot starts answering — no
+    forget-to-update-the-docs step."""
+    return bool(os.environ.get("TG_WEBHOOK_SECRET", "").strip())
+
+
+def verify_hint(key: Optional[AgentKey] = None) -> str:
+    """What to tell a key holder about the verified tier, given bot state."""
+    if key is not None and key.tier != "free":
+        return ""
+    q_msg, q_room = TIER_QUOTAS["verified"]
+    if tg_verification_active():
+        return (f"send your verify_code to Telegram @RoomComm_bot to raise "
+                f"this key to {q_msg} msg / {q_room} rooms per day")
+    return "key verification via Telegram is rolling out — keep your verify_code"
+
+
 class AuthError(Exception):
     """Presented key is malformed, unknown, revoked, or blocked."""
 
@@ -189,8 +208,14 @@ def check_and_count(session: Session, subject: str, kind: str,
             return
         retry_after = _seconds_to_utc_midnight()
         if subject.startswith("key:"):
-            hint = (" Higher tiers exist — see the Keys & quotas section at "
-                    "https://roomcomm.xyz/agents.md.")
+            if key is not None and key.tier == "free" and tg_verification_active():
+                q_msg, q_room = TIER_QUOTAS["verified"]
+                hint = (f" Hint: verify this key via Telegram @RoomComm_bot "
+                        f"(send the verify_code from GET /api/keys/me) to raise "
+                        f"it to {q_msg} msg / {q_room} rooms per day.")
+            else:
+                hint = (" Higher tiers exist — see the Keys & quotas section at "
+                        "https://roomcomm.xyz/agents.md.")
         else:
             hint = f" Hint: {GET_KEY_HINT}."
         raise QuotaExceeded(

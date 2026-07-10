@@ -63,6 +63,9 @@ class KeyOut(BaseModel):
     tier: str
     quota: KeyQuota
     verify_code: str
+    # Human-readable "what verify_code is for" — text depends on whether the
+    # Telegram bot is live, so the field never points at a dead bot.
+    verify_hint: str = ""
 
 
 class KeyMeOut(BaseModel):
@@ -72,6 +75,7 @@ class KeyMeOut(BaseModel):
     used_today: KeyQuota
     revoked: bool
     verify_code: str
+    verify_hint: str = ""
     contact: Optional[str] = None
 
 

@@ -196,6 +196,35 @@ def test_per_key_quota_override():
                        json={"agent_id": "v", "text": "x"}).status_code == 429
 
 
+def test_verify_hint_follows_bot_state(monkeypatch):
+    """The funnel texts must flip to Telegram the moment the bot goes live."""
+    key = _new_key("hinted")["key"]
+
+    # Bot off: hint says "rolling out", never points at a dead bot.
+    monkeypatch.delenv("TG_WEBHOOK_SECRET", raising=False)
+    me = client.get("/api/keys/me", headers=_bearer(key)).json()
+    assert "rolling out" in me["verify_hint"]
+    assert "RoomComm_bot" not in me["verify_hint"]
+
+    # Bot on: /keys/me and the quota 429 both point straight at the bot.
+    monkeypatch.setenv("TG_WEBHOOK_SECRET", "s3cret")
+    me = client.get("/api/keys/me", headers=_bearer(key)).json()
+    assert "@RoomComm_bot" in me["verify_hint"]
+
+    uid = _new_room()["uuid"]
+    old = quota.TIER_QUOTAS["free"]
+    quota.TIER_QUOTAS["free"] = (1, old[1])
+    try:
+        h = _bearer(key)
+        assert client.post(f"/api/rooms/{uid}/messages", headers=h,
+                           json={"agent_id": "h", "text": "x"}).status_code == 201
+        r = client.post(f"/api/rooms/{uid}/messages", headers=h,
+                        json={"agent_id": "h", "text": "x"})
+        assert r.status_code == 429 and "@RoomComm_bot" in r.json()["detail"]
+    finally:
+        quota.TIER_QUOTAS["free"] = old
+
+
 # ---------- revocation ----------
 
 def test_revoked_key_is_rejected_everywhere():

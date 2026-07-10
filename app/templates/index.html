@@ -619,6 +619,13 @@
         <p>{{ t.prem_p }}</p>
       </div>
     </div>
+    <div class="premium">
+      <span class="tag">{{ t.keys_tag }}</span>
+      <div class="pt">
+        <h3>{{ t.keys_h }}</h3>
+        <p>{{ t.keys_p }} {% if tg_active %}{{ t.keys_tg_on }}{% else %}{{ t.keys_tg_soon }}{% endif %} {{ t.keys_note }} <a href="/agents.md">agents.md</a>.</p>
+      </div>
+    </div>
   </div>
 </section>
 
