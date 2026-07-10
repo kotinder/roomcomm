@@ -14,6 +14,10 @@
     .stats-tops h3 { margin: 0 0 .3rem; font-size: .95rem; }
     .stats-tops td.num { white-space: nowrap; }
     @media (max-width: 700px) { .stats-tops { grid-template-columns: 1fr; } }
+    #rooms-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+    #rooms-table th.sortable:hover { text-decoration: underline; }
+    #rooms-table th.sortable .arrow { opacity: .4; font-size: .85em; }
+    #rooms-table th.sortable[aria-sort] .arrow { opacity: 1; }
   </style>
 </head>
 <body>
@@ -75,27 +79,27 @@
     </section>
 
     {% if items %}
-    <table class="admin-table">
+    <table class="admin-table" id="rooms-table">
       <thead>
         <tr>
-          <th>UUID</th>
-          <th>Vis</th>
-          <th>Description</th>
-          <th>Created</th>
-          <th>Last activity</th>
-          <th class="num">Msgs</th>
+          <th class="sortable" data-type="text">UUID <span class="arrow">↕</span></th>
+          <th class="sortable" data-type="text">Vis <span class="arrow">↕</span></th>
+          <th class="sortable" data-type="text">Description <span class="arrow">↕</span></th>
+          <th class="sortable" data-type="text">Created <span class="arrow">↕</span></th>
+          <th class="sortable" data-type="text">Last activity <span class="arrow">↕</span></th>
+          <th class="sortable num" data-type="num">Msgs <span class="arrow">↕</span></th>
           <th></th>
         </tr>
       </thead>
       <tbody>
         {% for r in items %}
         <tr>
-          <td class="mono"><a href="/{{ r.uuid }}" target="_blank">{{ r.short_uuid }}</a></td>
-          <td>{% if r.is_public %}<span class="badge badge-public" title="public">🌐</span>{% else %}<span class="badge badge-private" title="private">🔒</span>{% endif %}</td>
-          <td>{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
-          <td class="mono small">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
-          <td class="mono small">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
-          <td class="num">{{ r.msg_count }}</td>
+          <td class="mono" data-sort="{{ r.short_uuid }}"><a href="/{{ r.uuid }}" target="_blank">{{ r.short_uuid }}</a></td>
+          <td data-sort="{{ 'public' if r.is_public else 'private' }}">{% if r.is_public %}<span class="badge badge-public" title="public">🌐</span>{% else %}<span class="badge badge-private" title="private">🔒</span>{% endif %}</td>
+          <td data-sort="{{ (r.description or '')|lower }}">{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
+          <td class="mono small" data-sort="{{ r.created_at.strftime('%Y-%m-%dT%H:%M:%S') }}">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="mono small" data-sort="{{ r.last_at.strftime('%Y-%m-%dT%H:%M:%S') if r.last_at else '' }}">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
+          <td class="num" data-sort="{{ r.msg_count }}">{{ r.msg_count }}</td>
           <td>
             <form method="post" action="/admin/{{ token }}/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
               <button type="submit" class="btn-danger">Delete</button>
@@ -113,5 +117,46 @@
       <p class="muted"><a href="/">← back to home</a></p>
     </footer>
   </main>
+  <script>
+    (function () {
+      var table = document.getElementById('rooms-table');
+      if (!table) return;
+      var tbody = table.tBodies[0];
+      var headers = table.tHead.rows[0].cells;
+
+      function cellKey(row, col, type) {
+        var td = row.cells[col];
+        var v = td.hasAttribute('data-sort') ? td.getAttribute('data-sort') : td.textContent.trim();
+        return type === 'num' ? parseFloat(v) || 0 : v.toLowerCase();
+      }
+
+      function sortBy(col, type, asc) {
+        var rows = Array.prototype.slice.call(tbody.rows);
+        rows.sort(function (a, b) {
+          var ka = cellKey(a, col, type), kb = cellKey(b, col, type);
+          if (ka < kb) return asc ? -1 : 1;
+          if (ka > kb) return asc ? 1 : -1;
+          return 0;
+        });
+        rows.forEach(function (r) { tbody.appendChild(r); });
+      }
+
+      Array.prototype.forEach.call(headers, function (th, col) {
+        if (th.className.indexOf('sortable') === -1) return;
+        var arrow = th.querySelector('.arrow');
+        th.addEventListener('click', function () {
+          var asc = th.getAttribute('aria-sort') !== 'ascending';
+          Array.prototype.forEach.call(headers, function (h) {
+            h.removeAttribute('aria-sort');
+            var a = h.querySelector('.arrow');
+            if (a) a.textContent = '↕';
+          });
+          th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+          if (arrow) arrow.textContent = asc ? '↑' : '↓';
+          sortBy(col, th.getAttribute('data-type') || 'text', asc);
+        });
+      });
+    })();
+  </script>
 </body>
 </html>
