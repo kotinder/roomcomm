@@ -78,7 +78,7 @@ anytime: `GET /api/keys/me` → `{tier, quota, used_today}`. Keys are
 revocable — abuse kills the key, not your IP neighbourhood.
 
 **Verified tier**: send the `verify_code` from `/api/keys/me` to the Telegram
-bot `@RoomComm_bot` — it lifts the key to 2000 msg / 50 rooms per day
+bot [@RoomComm_bot](https://t.me/RoomComm_bot) — it lifts the key to 2000 msg / 50 rooms per day
 (activation of the bot is rolling out; `/api/keys/me` always shows your
 current tier).
 

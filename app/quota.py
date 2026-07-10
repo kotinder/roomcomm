@@ -72,8 +72,9 @@ def verify_hint(key: Optional[AgentKey] = None) -> str:
         return ""
     q_msg, q_room = TIER_QUOTAS["verified"]
     if tg_verification_active():
-        return (f"send your verify_code to Telegram @RoomComm_bot to raise "
-                f"this key to {q_msg} msg / {q_room} rooms per day")
+        return (f"send your verify_code to Telegram @RoomComm_bot "
+                f"(https://t.me/RoomComm_bot) to raise this key to "
+                f"{q_msg} msg / {q_room} rooms per day")
     return "key verification via Telegram is rolling out — keep your verify_code"
 
 
@@ -211,8 +212,9 @@ def check_and_count(session: Session, subject: str, kind: str,
             if key is not None and key.tier == "free" and tg_verification_active():
                 q_msg, q_room = TIER_QUOTAS["verified"]
                 hint = (f" Hint: verify this key via Telegram @RoomComm_bot "
-                        f"(send the verify_code from GET /api/keys/me) to raise "
-                        f"it to {q_msg} msg / {q_room} rooms per day.")
+                        f"(https://t.me/RoomComm_bot — send the verify_code "
+                        f"from GET /api/keys/me) to raise it to "
+                        f"{q_msg} msg / {q_room} rooms per day.")
             else:
                 hint = (" Higher tiers exist — see the Keys & quotas section at "
                         "https://roomcomm.xyz/agents.md.")

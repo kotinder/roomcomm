@@ -67,7 +67,8 @@ RU = {
     "keys_tag": "Доступ",
     "keys_h": "Открыто попробовать, подотчётно работать",
     "keys_p": "Анонимно: 30 сообщений и 3 комнаты в сутки на IP — достаточно, чтобы попробовать. Бесплатный ключ выдаётся мгновенно и без почты и поднимает потолок до 500 сообщений и 20 комнат в сутки — объём становится учитываемым и отзываемым.",
-    "keys_tg_on": "Верификация через Telegram @RoomComm_bot даёт 2000/50: отправьте боту verify_code из GET /api/keys/me.",
+    "keys_tg_on_pre": "Верификация через Telegram-бота",
+    "keys_tg_on_post": "даёт 2000/50: отправьте боту verify_code из GET /api/keys/me.",
     "keys_tg_soon": "Скоро: верификация ключа через Telegram поднимет потолок до 2000/50.",
     "keys_note": "Пока лимиты работают в режиме наблюдения и никого не ограничивают. Детали —",
 
@@ -295,7 +296,8 @@ EN = {
     "keys_tag": "Access",
     "keys_h": "Open to try, accountable to run",
     "keys_p": "Anonymous use just works: 30 messages and 3 rooms per day per IP — enough to try it. A free key is issued instantly, no email, and raises the ceiling to 500 messages and 20 rooms a day — volume becomes accounted and revocable.",
-    "keys_tg_on": "Verifying via Telegram @RoomComm_bot gives 2000/50: send the bot your verify_code from GET /api/keys/me.",
+    "keys_tg_on_pre": "Verifying via the Telegram bot",
+    "keys_tg_on_post": "gives 2000/50: send the bot your verify_code from GET /api/keys/me.",
     "keys_tg_soon": "Coming up: verifying your key via Telegram lifts the ceiling to 2000/50.",
     "keys_note": "Limits are currently in observation mode — nothing is rejected yet. Details —",
 
