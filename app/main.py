@@ -40,6 +40,13 @@ SKILL_UPLOAD_WINDOW = 3600
 SKILL_MAX_BYTES = 512 * 1024
 _skill_buckets: dict[str, deque] = defaultdict(deque)
 _skill_lock = Lock()
+
+# Key issuance burst limit — anti key-farming (keys are free and instant,
+# so this plus the modest per-key quota is what makes farming unprofitable).
+KEY_CREATE_LIMIT = 3
+KEY_CREATE_WINDOW = 3600
+_key_buckets: dict[str, deque] = defaultdict(deque)
+_key_lock = Lock()
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _HEX128_RE = re.compile(r"^[0-9a-fA-F]{128}$")
 
@@ -76,42 +83,39 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _check_create_rate(request: Request) -> None:
-    """Raise 429 if the IP has created too many rooms in the last hour."""
+def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
+                       limit: int, window: int, what: str) -> None:
+    """Raise 429 if the IP exceeded `limit` events in the sliding `window`."""
     ip = _client_ip(request)
     now = time.monotonic()
-    with _create_lock:
-        bucket = _create_buckets[ip]
-        cutoff = now - ROOM_CREATE_WINDOW
+    with lock:
+        bucket = buckets[ip]
+        cutoff = now - window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
-        if len(bucket) >= ROOM_CREATE_LIMIT:
-            retry_after = int(ROOM_CREATE_WINDOW - (now - bucket[0])) + 1
+        if len(bucket) >= limit:
+            retry_after = int(window - (now - bucket[0])) + 1
             raise HTTPException(
                 status_code=429,
-                detail=f"Too many rooms created from this IP. Try again in {retry_after}s.",
+                detail=f"Too many {what} from this IP. Try again in {retry_after}s.",
                 headers={"Retry-After": str(retry_after)},
             )
         bucket.append(now)
+
+
+def _check_create_rate(request: Request) -> None:
+    _check_bucket_rate(request, _create_buckets, _create_lock,
+                       ROOM_CREATE_LIMIT, ROOM_CREATE_WINDOW, "rooms created")
 
 
 def _check_skill_rate(request: Request) -> None:
-    """Raise 429 if the IP has uploaded too many skills in the last hour."""
-    ip = _client_ip(request)
-    now = time.monotonic()
-    with _skill_lock:
-        bucket = _skill_buckets[ip]
-        cutoff = now - SKILL_UPLOAD_WINDOW
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= SKILL_UPLOAD_LIMIT:
-            retry_after = int(SKILL_UPLOAD_WINDOW - (now - bucket[0])) + 1
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too many skill uploads from this IP. Try again in {retry_after}s.",
-                headers={"Retry-After": str(retry_after)},
-            )
-        bucket.append(now)
+    _check_bucket_rate(request, _skill_buckets, _skill_lock,
+                       SKILL_UPLOAD_LIMIT, SKILL_UPLOAD_WINDOW, "skill uploads")
+
+
+def _check_key_rate(request: Request) -> None:
+    _check_bucket_rate(request, _key_buckets, _key_lock,
+                       KEY_CREATE_LIMIT, KEY_CREATE_WINDOW, "keys issued")
 
 
 def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
@@ -125,15 +129,22 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, llm, notify, pcis
+from . import i18n, llm, notify, pcis, quota
 from .database import SKILLS_DIR, engine, get_session, init_db
-from .models import Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message, Room, Skill, utcnow
+from .models import (
+    AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
+    Room, Skill, UsageCounter, utcnow,
+)
 from .schemas import (
     ClaimIn,
     ContextOut,
     DiscrepancyOut,
     HandshakeIn,
     HandshakeOut,
+    KeyCreate,
+    KeyMeOut,
+    KeyOut,
+    KeyQuota,
     MessageIn,
     MessageOut,
     MessagesPage,
@@ -366,7 +377,96 @@ def _get_room_or_404(session: Session, room_uuid: str) -> Room:
     return room
 
 
+# ---------- Auth MVP: subject resolution + quota (REST side) ----------
+# The actual accounting lives in quota.py (shared with the MCP transport);
+# these wrappers translate its transport-neutral exceptions to HTTP.
+
+def _resolve_subject(request: Request, session: Session) -> tuple[str, Optional[AgentKey]]:
+    """(subject, key) for this request: 'key:<id>' with valid Bearer, else 'ip:<addr>'."""
+    try:
+        key = quota.resolve_key(session, request.headers.get("authorization"))
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return quota.subject_of(key, _client_ip(request)), key
+
+
+def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
+    try:
+        quota.check_and_count(session, subject, kind, key)
+    except quota.QuotaExceeded as e:
+        raise HTTPException(
+            status_code=429, detail=e.detail,
+            headers={"Retry-After": str(e.retry_after)},
+        )
+
+
+def _used_today(session: Session, subject: str) -> KeyQuota:
+    day = utcnow().strftime("%Y-%m-%d")
+    used = {"msg": 0, "room": 0}
+    for row in session.exec(
+        select(UsageCounter).where(UsageCounter.subject == subject, UsageCounter.day == day)
+    ).all():
+        if row.kind in used:
+            used[row.kind] = row.count
+    return KeyQuota(**used)
+
+
+def _key_quota_out(key: Optional[AgentKey]) -> KeyQuota:
+    return KeyQuota(msg=quota.daily_quota(key, "msg"), room=quota.daily_quota(key, "room"))
+
+
 # ---------- API ----------
+
+
+@app.post("/api/keys", response_model=KeyOut, status_code=201)
+def create_key(
+    payload: KeyCreate,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Issue a free agent key — instant, no email/password.
+
+    The key is returned once and only its sha256 is stored. Keys don't lift
+    limits to infinity — they move you from the anonymous IP budget to a
+    bigger, *accounted and revocable* per-key budget.
+    """
+    _check_key_rate(request)
+    raw = quota.generate_key()
+    key = AgentKey(
+        key_hash=quota.hash_key(raw),
+        agent_id=(payload.agent_id or "").strip(),
+        contact=(payload.contact or "").strip() or None,
+        created_ip=_client_ip(request)[:45],
+        verify_code=quota.generate_verify_code(),
+    )
+    session.add(key)
+    session.commit()
+    session.refresh(key)
+    return KeyOut(
+        key=raw,
+        agent_id=key.agent_id,
+        tier=key.tier,
+        quota=_key_quota_out(key),
+        verify_code=key.verify_code,
+    )
+
+
+@app.get("/api/keys/me", response_model=KeyMeOut)
+def key_me(request: Request, session: Session = Depends(get_session)):
+    """Introspect the presented key: tier, budget, what's spent today."""
+    subject, key = _resolve_subject(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="provide your key: Authorization: Bearer <key>")
+    session.commit()  # persist last_used_at touched by resolve_key
+    return KeyMeOut(
+        agent_id=key.agent_id,
+        tier=key.tier,
+        quota=_key_quota_out(key),
+        used_today=_used_today(session, subject),
+        revoked=key.revoked,
+        verify_code=key.verify_code,
+        contact=key.contact,
+    )
 
 @app.post("/api/rooms", response_model=RoomCreateOut, status_code=201)
 def create_room(
@@ -376,6 +476,8 @@ def create_room(
     session: Session = Depends(get_session),
 ):
     _check_create_rate(request)
+    subject, key = _resolve_subject(request, session)
+    _check_quota(session, subject, "room", key)
     description = (payload.description or "").strip()
     if len(description) > 500:
         raise HTTPException(status_code=400, detail="description too long (max 500)")
@@ -392,11 +494,21 @@ def create_room(
             detail="premium rooms require the LLM arbiter, which is not "
                    "configured on this server",
         )
+    # write_policy='key': generate the room write-key now — returned once in
+    # the response, only its hash is stored.
+    room_write_key: Optional[str] = None
+    write_key_hash: Optional[str] = None
+    if payload.write_policy == "key":
+        room_write_key = quota.generate_room_key()
+        write_key_hash = quota.hash_key(room_write_key)
     room = Room(
         uuid=str(uuid_lib.uuid4()),
         description=description,
         is_public=bool(payload.is_public),
         protocol_mode=payload.protocol_mode,
+        write_policy=payload.write_policy,
+        write_key_hash=write_key_hash,
+        owner_key_id=key.id if key else None,
     )
     session.add(room)
     session.commit()
@@ -423,6 +535,8 @@ def create_room(
         created_at=room.created_at,
         is_public=room.is_public,
         protocol_mode=room.protocol_mode,
+        write_policy=room.write_policy,
+        write_key=room_write_key,
     )
 
 
@@ -530,11 +644,20 @@ def list_messages(
 def post_message(
     room_uuid: str,
     payload: MessageIn,
+    request: Request,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
     room_uuid = _validate_uuid(room_uuid)
     room = _get_room_or_404(session, room_uuid)
+    # Auth MVP: write-policy gate (403) before the daily budget (429), both
+    # before any DB mutation.
+    subject, key = _resolve_subject(request, session)
+    try:
+        quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    _check_quota(session, subject, "msg", key)
     count = session.exec(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
@@ -583,6 +706,7 @@ def post_message(
         pubkey_hex=pk,
         signature_hex=sg,
         memory_root=payload.memory_root,
+        key_id=key.id if key else None,
     )
     # If signed, lock the message timestamp to the agent's ts_iso so the
     # signed surface remains reproducible. Otherwise the default factory
@@ -1612,7 +1736,7 @@ def index(request: Request):
 
 
 _ROBOTS_TXT = """User-agent: *
-Disallow: /admin/
+Disallow: /admin
 Disallow: /api/
 Disallow: /mcp
 """
@@ -1659,6 +1783,23 @@ def _render_room_agent_md(request: Request, room: Optional[Room], room_uuid: str
         description=(room.description if room else "") or "",
         is_public=(room.is_public if room else False),
     )
+
+
+# NOTE: must be registered BEFORE the /{room_uuid} catch-all below, or the
+# room page swallows the one-segment /admin path. The rest of the admin
+# section (login, keys, helpers) lives further down; names resolve at call time.
+@app.get("/admin", response_class=HTMLResponse)
+def admin_home(request: Request, session: Session = Depends(get_session)):
+    try:
+        _check_admin_request(request)
+    except HTTPException:
+        # Show the login form instead of a bare 404: the page itself reveals
+        # nothing, and the POST target is rate-limited.
+        resp = HTMLResponse(ADMIN_LOGIN_HTML)
+        for k, v in _NOINDEX_HEADERS.items():
+            resp.headers[k] = v
+        return resp
+    return _render_admin(request, session)
 
 
 @app.get("/{room_uuid}", response_class=HTMLResponse)
@@ -1719,10 +1860,52 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
 
 
 # ---------- Admin ----------
+# Hardened: the token no longer travels in the URL path (paths leak into
+# nginx logs, browser history and Referer). Login once via POST form →
+# HttpOnly SameSite=strict cookie; API calls may instead send
+# Authorization: Bearer <admin token>. The legacy /admin/{token} URL still
+# works as a one-shot login redirect so old bookmarks keep functioning.
+
+ADMIN_COOKIE = "admin_token"
+ADMIN_LOGIN_LIMIT = 10          # failed attempts per hour per IP
+ADMIN_LOGIN_WINDOW = 3600
+_admin_login_buckets: dict[str, deque] = defaultdict(deque)
+_admin_login_lock = Lock()
+
+
+def _admin_token_ok(token: Optional[str]) -> bool:
+    return bool(ADMIN_TOKEN) and bool(token) and secrets.compare_digest(token, ADMIN_TOKEN)
+
 
 def _check_admin(token: str) -> None:
-    if not ADMIN_TOKEN or not secrets.compare_digest(token, ADMIN_TOKEN):
+    if not _admin_token_ok(token):
         raise HTTPException(status_code=404, detail="Not found")
+
+
+def _check_admin_request(request: Request) -> None:
+    """Admin auth from header (Bearer) or session cookie. 404 on failure —
+    same hide-the-door behavior as before."""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        if _admin_token_ok(auth[7:].strip()):
+            return
+    if _admin_token_ok(request.cookies.get(ADMIN_COOKIE)):
+        return
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+def _set_admin_cookie(response, request: Request):
+    response.set_cookie(
+        ADMIN_COOKIE, ADMIN_TOKEN,
+        max_age=60 * 60 * 24 * 30,  # 30 days
+        httponly=True,
+        samesite="strict",
+        secure=request.url.scheme == "https",
+        path="/admin",
+    )
+    for k, v in _NOINDEX_HEADERS.items():
+        response.headers[k] = v
+    return response
 
 
 _NOINDEX_HEADERS = {"X-Robots-Tag": "noindex, nofollow", "Cache-Control": "private, no-store"}
@@ -1781,9 +1964,92 @@ def _admin_stats(session: Session, days_back: int = 14) -> dict:
     }
 
 
+def _admin_keys(session: Session) -> list[dict]:
+    """Keys table for the dashboard: identity, tier, today's spend vs budget."""
+    day = utcnow().strftime("%Y-%m-%d")
+    used: dict[str, dict[str, int]] = {}
+    for row in session.exec(
+        select(UsageCounter).where(UsageCounter.day == day)
+    ).all():
+        used.setdefault(row.subject, {})[row.kind] = row.count
+    items = []
+    for k in session.exec(select(AgentKey).order_by(AgentKey.id.desc())).all():
+        u = used.get(f"key:{k.id}", {})
+        q_msg = quota.daily_quota(k, "msg")
+        q_room = quota.daily_quota(k, "room")
+        items.append({
+            "id": k.id,
+            "agent_id": k.agent_id or "—",
+            "tier": k.tier,
+            "contact": k.contact or "",
+            "tg_id": (k.contact or "")[3:] if (k.contact or "").startswith("tg:") else "",
+            "created_ip": k.created_ip,
+            "created_at": k.created_at,
+            "last_used_at": k.last_used_at,
+            "revoked": k.revoked,
+            "note": k.note or "",
+            "used_msg": u.get("msg", 0),
+            "used_room": u.get("room", 0),
+            "quota_msg": q_msg,
+            "quota_room": q_room,
+            "maxed": u.get("msg", 0) >= q_msg or u.get("room", 0) >= q_room,
+        })
+    return items
+
+
+def _admin_top_subjects(session: Session, limit: int = 15) -> list[dict]:
+    """Today's hungriest subjects (keys AND anonymous IPs), by messages."""
+    day = utcnow().strftime("%Y-%m-%d")
+    agg: dict[str, dict[str, int]] = {}
+    for row in session.exec(
+        select(UsageCounter).where(UsageCounter.day == day)
+    ).all():
+        agg.setdefault(row.subject, {"msg": 0, "room": 0})[row.kind] = row.count
+    top = sorted(agg.items(), key=lambda kv: -(kv[1]["msg"] + kv[1]["room"] * 10))
+    return [
+        {"subject": s, "msg": v["msg"], "room": v["room"]}
+        for s, v in top[:limit]
+    ]
+
+
+ADMIN_LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
+<title>Roomcomm · admin</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main class="container" style="max-width:360px">
+<h1>Admin</h1>
+<form method="post" action="/admin/login">
+  <input type="password" name="token" placeholder="admin token" autofocus
+         style="width:100%;margin-bottom:.6rem">
+  <button type="submit">Sign in</button>
+</form>
+</main></body></html>"""
+
+
+@app.post("/admin/login")
+def admin_login(request: Request, token: str = Form(default="")):
+    _check_bucket_rate(request, _admin_login_buckets, _admin_login_lock,
+                       ADMIN_LOGIN_LIMIT, ADMIN_LOGIN_WINDOW, "login attempts")
+    if not _admin_token_ok(token.strip()):
+        raise HTTPException(status_code=404, detail="Not found")
+    return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    _check_admin_request(request)
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.delete_cookie(ADMIN_COOKIE, path="/admin")
+    return resp
+
+
 @app.get("/admin/{token}", response_class=HTMLResponse)
-def admin_page(token: str, request: Request, session: Session = Depends(get_session)):
+def admin_page_legacy(token: str, request: Request):
+    """Old bookmark path — logs in and redirects so the token leaves the URL."""
     _check_admin(token)
+    return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
+
+
+def _render_admin(request: Request, session: Session):
     rows = session.exec(
         select(
             Room,
@@ -1815,12 +2081,57 @@ def admin_page(token: str, request: Request, session: Session = Depends(get_sess
     response = templates.TemplateResponse(
         request,
         "admin.html",
-        {"items": items, "token": token, "total": len(items),
-         "stats": _admin_stats(session)},
+        {"items": items, "total": len(items),
+         "stats": _admin_stats(session),
+         "keys": _admin_keys(session),
+         "top_subjects": _admin_top_subjects(session),
+         "quota_mode": quota.QUOTA_MODE,
+         "tiers": ["free", "verified", "trusted", "blocked"]},
     )
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
     return response
+
+
+@app.post("/admin/keys/{key_id}/revoke")
+def admin_revoke_key(key_id: int, request: Request, session: Session = Depends(get_session)):
+    _check_admin_request(request)
+    key = session.get(AgentKey, key_id)
+    if key is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.revoked = True
+    session.add(key)
+    session.commit()
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/keys/{key_id}/tier")
+def admin_set_tier(
+    key_id: int,
+    request: Request,
+    tier: str = Form(...),
+    daily_msg_quota: str = Form(default=""),
+    daily_room_quota: str = Form(default=""),
+    note: str = Form(default=""),
+    session: Session = Depends(get_session),
+):
+    """Move a key between tiers; optional per-key quota overrides (empty =
+    tier default). Also the un-revoke path: setting a tier clears `revoked`."""
+    _check_admin_request(request)
+    if tier not in ("free", "verified", "trusted", "blocked"):
+        raise HTTPException(status_code=400, detail="bad tier")
+    key = session.get(AgentKey, key_id)
+    if key is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.tier = tier
+    key.daily_msg_quota = int(daily_msg_quota) if daily_msg_quota.strip() else None
+    key.daily_room_quota = int(daily_room_quota) if daily_room_quota.strip() else None
+    if note.strip():
+        key.note = note.strip()[:500]
+    key.revoked = False
+    session.add(key)
+    session.commit()
+    return RedirectResponse(url="/admin", status_code=303)
 
 
 # ---------- MCP (Streamable HTTP, /mcp) ----------
@@ -1830,13 +2141,13 @@ from .mcp_server import mcp_endpoint as _mcp_endpoint  # noqa: E402
 app.add_route("/mcp", _mcp_endpoint, methods=["GET", "POST", "DELETE"])
 
 
-@app.post("/admin/{token}/rooms/{room_uuid}/delete")
+@app.post("/admin/rooms/{room_uuid}/delete")
 def admin_delete_room(
-    token: str,
     room_uuid: str,
+    request: Request,
     session: Session = Depends(get_session),
 ):
-    _check_admin(token)
+    _check_admin_request(request)
     try:
         room_uuid = str(uuid_lib.UUID(room_uuid))
     except (ValueError, AttributeError, TypeError):
@@ -1858,7 +2169,7 @@ def admin_delete_room(
     session.exec(delete(Message).where(Message.room_uuid == room_uuid))
     session.delete(room)
     session.commit()
-    response = RedirectResponse(url=f"/admin/{token}", status_code=303)
+    response = RedirectResponse(url="/admin", status_code=303)
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
     return response

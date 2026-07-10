@@ -16,14 +16,15 @@ from typing import Annotated, Optional
 
 from typing_extensions import TypedDict  # pydantic needs this (not typing) on Py<3.12
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
+from . import quota
 from .database import engine
-from .models import Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
+from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
 # ---------------------------------------------------------------------------
 # Server definition
@@ -107,6 +108,32 @@ def _get_room(session: Session, room_uuid: str) -> Room:
     if room is None:
         raise ValueError(f"Room {room_uuid} not found")
     return room
+
+
+def _resolve_subject(ctx: Context, session: Session) -> tuple[str, Optional[AgentKey]]:
+    """Same subject resolution as the REST side, from the MCP HTTP request.
+
+    MCP tools write to the DB directly (no REST round-trip), so the quota
+    layer must be called here too — otherwise /mcp would be a free side door
+    around the budgets. Same trust model: only nginx-set X-Real-IP counts.
+    """
+    request = ctx.request_context.request  # starlette Request (streamable HTTP)
+    headers = request.headers if request is not None else {}
+    try:
+        key = quota.resolve_key(session, headers.get("authorization"))
+    except quota.AuthError as e:
+        raise ValueError(e.detail)
+    ip = (headers.get("x-real-ip") or "").strip() or (
+        request.client.host if request is not None and request.client else "unknown"
+    )
+    return quota.subject_of(key, ip), key
+
+
+def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
+    try:
+        quota.check_and_count(session, subject, kind, key)
+    except quota.QuotaExceeded as e:
+        raise RuntimeError(f"429: {e.detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +400,11 @@ def send_message(
         Field(description='Your identifier — short, readable, e.g. "alice-claude". Use the SAME id in every message.'),
     ],
     text: Annotated[str, Field(description="Message content. 1–10 000 characters.")],
+    ctx: Context,
+    room_key: Annotated[
+        Optional[str],
+        Field(description="Room write-key — only needed for write-protected rooms (write_policy='key')."),
+    ] = None,
 ) -> MessageItem:
     """Post a message to a Roomcomm room.
 
@@ -386,6 +418,7 @@ def send_message(
         agent_id: Your identifier — short, readable, e.g. "alice-claude".
                   Use the SAME agent_id in every message in every room.
         text: Message content. ≤ 10 000 chars.
+        room_key: Write-key for write-protected rooms; omit for open rooms.
 
     Example: send_message("a1b2…", "alice-claude", "bob-gpt4: agreed, let's use REST.")
     """
@@ -398,13 +431,19 @@ def send_message(
 
     with Session(engine) as session:
         room = _get_room(session, uid)
+        subject, key = _resolve_subject(ctx, session)
+        try:
+            quota.check_write_policy(room, room_key, key)
+        except quota.AuthError as e:
+            raise ValueError(e.detail)
+        _check_quota(session, subject, "msg", key)
         count = session.exec(
             select(func.count()).select_from(Message).where(Message.room_uuid == uid)
         ).one()
         if count >= 1000:
             raise RuntimeError("Room message limit reached (1000) — room is full")
-        _ = room  # room exists check passed
-        msg = Message(room_uuid=uid, agent_id=agent_id, text=text)
+        msg = Message(room_uuid=uid, agent_id=agent_id, text=text,
+                      key_id=key.id if key else None)
         session.add(msg)
         session.commit()
         session.refresh(msg)
@@ -426,6 +465,7 @@ def send_message(
     )
 )
 def create_room(
+    ctx: Context,
     description: Annotated[
         str,
         Field(description="Short briefing for all agents joining this room (≤ 500 chars)."),
@@ -462,11 +502,14 @@ def create_room(
         raise ValueError('protocol_mode must be "standard" or "premium"')
 
     with Session(engine) as session:
+        subject, key = _resolve_subject(ctx, session)
+        _check_quota(session, subject, "room", key)
         room = Room(
             uuid=str(uuid_lib.uuid4()),
             description=description,
             is_public=bool(is_public),
             protocol_mode=protocol_mode,
+            owner_key_id=key.id if key else None,
         )
         session.add(room)
         session.commit()

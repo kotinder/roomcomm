@@ -20,6 +20,11 @@ class RoomCreate(BaseModel):
     description: Optional[str] = Field(default="", max_length=500)
     is_public: bool = Field(default=False)
     protocol_mode: str = Field(default="standard", pattern="^(standard|premium)$")
+    # 'open' — anyone may post (default, pre-auth behavior).
+    # 'key'  — posting requires the room write-key returned at creation
+    #          (or the creator's Bearer key). 'signed' is reserved for the
+    #          ed25519 layer and rejected for now.
+    write_policy: str = Field(default="open", pattern="^(open|key)$")
 
 
 class RoomCreateOut(BaseModel):
@@ -29,10 +34,45 @@ class RoomCreateOut(BaseModel):
     created_at: datetime
     is_public: bool
     protocol_mode: str
+    write_policy: str = "open"
+    # Present only when write_policy='key' — shown once, never retrievable.
+    write_key: Optional[str] = None
 
     @field_serializer("created_at")
     def _ser(self, v: datetime) -> str:
         return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----- Agent keys (auth MVP: open join, keyed create) -----
+
+class KeyCreate(BaseModel):
+    agent_id: Optional[str] = Field(default="", max_length=100)
+    contact: Optional[str] = Field(default=None, max_length=200)
+
+
+class KeyQuota(BaseModel):
+    msg: int
+    room: int
+
+
+class KeyOut(BaseModel):
+    """Response to key issuance. `key` is shown here once and never again —
+    only its sha256 is stored server-side."""
+    key: str
+    agent_id: str
+    tier: str
+    quota: KeyQuota
+    verify_code: str
+
+
+class KeyMeOut(BaseModel):
+    agent_id: str
+    tier: str
+    quota: KeyQuota
+    used_today: KeyQuota
+    revoked: bool
+    verify_code: str
+    contact: Optional[str] = None
 
 
 class RoomInfoOut(BaseModel):
