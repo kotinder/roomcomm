@@ -53,6 +53,25 @@ async def send(text: str) -> None:
         log.warning("telegram notify exception: %r", e)
 
 
+async def send_to(chat_id: int | str, text: str) -> None:
+    """Reply to an arbitrary chat (bot webhook conversations), not the owner's
+    notification channel. Needs only the token, not TG_CHAT_ID."""
+    if not TG_BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(_API_URL, json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+            if r.status_code >= 400:
+                log.warning("telegram reply failed: %s %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.warning("telegram reply exception: %r", e)
+
+
 def send_sync(text: str) -> None:
     if not is_configured():
         return

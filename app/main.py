@@ -26,6 +26,11 @@ from sqlmodel import Session, delete, select, func
 
 ADMIN_TOKEN = os.environ.get("ROOMCOMM_ADMIN_TOKEN", "")
 
+# Shared secret Telegram echoes back in X-Telegram-Bot-Api-Secret-Token on
+# every webhook call (set via setWebhook, see scripts/tg_set_webhook.py).
+# Empty = webhook feature off, bot stays outbound-only.
+TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "")
+
 # In-memory rate limit for POST /api/rooms: max 10 creations per hour per IP.
 # Resets on container restart — that's acceptable for MVP, the goal is to stop
 # obviously broken/abusive auto-spawners, not high-determination attackers.
@@ -129,7 +134,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, llm, notify, pcis, quota
+from . import i18n, llm, notify, pcis, quota, tg_bot
 from .database import SKILLS_DIR, engine, get_session, init_db
 from .models import (
     AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
@@ -1857,6 +1862,28 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         },
     )
     return _apply_lang_cookie(request, resp)
+
+
+# ---------- Telegram webhook (free -> verified escalation) ----------
+
+@app.post("/tg/webhook")
+async def tg_webhook(request: Request, session: Session = Depends(get_session)):
+    """Inbound updates for @RoomComm_bot. Auth = the secret Telegram echoes
+    back on every call; anyone else gets the same 404 the admin paths use."""
+    if not TG_WEBHOOK_SECRET or not secrets.compare_digest(
+        request.headers.get("x-telegram-bot-api-secret-token", ""),
+        TG_WEBHOOK_SECRET,
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}  # malformed body — ack so Telegram doesn't retry
+    try:
+        await tg_bot.handle_update(update, session)
+    except Exception:
+        log.exception("tg webhook handler failed")
+    return {"ok": True}  # always ack: a retry loop can't fix a logic error
 
 
 # ---------- Admin ----------
