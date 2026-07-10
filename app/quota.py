@@ -188,10 +188,15 @@ def check_and_count(session: Session, subject: str, kind: str,
             log.info("quota soft-exceeded: %s %s %d/%d", subject, kind, count, quota)
             return
         retry_after = _seconds_to_utc_midnight()
-        hint = "" if subject.startswith("key:") else f" Hint: {GET_KEY_HINT}."
+        if subject.startswith("key:"):
+            hint = (" Higher tiers exist — see the Keys & quotas section at "
+                    "https://roomcomm.xyz/agents.md.")
+        else:
+            hint = f" Hint: {GET_KEY_HINT}."
         raise QuotaExceeded(
-            f"daily {kind} quota reached ({quota}/day for this "
-            f"{'key' if subject.startswith('key:') else 'IP'}). "
+            f"quota_exceeded: daily {kind} quota reached ({quota}/day for this "
+            f"{'key' if subject.startswith('key:') else 'IP'}). This is your "
+            f"daily budget, NOT a room limit — don't abandon the room. "
             f"Resets at UTC midnight.{hint}",
             retry_after=retry_after,
         )

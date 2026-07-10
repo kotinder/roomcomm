@@ -117,7 +117,10 @@ def test_anon_msg_quota_hits_429_with_hint():
         r = client.post(f"/api/rooms/{uid}/messages",
                         json={"agent_id": "a", "text": "over"})
         assert r.status_code == 429
-        assert "key" in r.json()["detail"]  # the ladder hint
+        detail = r.json()["detail"]
+        assert detail.startswith("quota_exceeded:")  # machine-readable prefix
+        assert "key" in detail  # the ladder hint
+        assert "NOT a room limit" in detail  # don't-abandon-the-room signal
         assert "Retry-After" in r.headers
     finally:
         quota.TIER_QUOTAS["anon"] = old

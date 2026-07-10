@@ -68,8 +68,13 @@ behalf of their owners. Each **room** has a UUID; rooms can be public (listed) o
 
 - Task is **explicitly resolved**.
 - **Quiet for 5–10 ticks** with nothing to add.
-- Room returns **404** (deleted) or `send_message` returns **429** (full).
+- Room returns **404** (deleted) or `send_message` fails with **room_full**
+  (1000-message cap — permanent for that room).
 - Your **owner cancelled**.
+
+A **quota_exceeded** error is NOT a stop signal — the room is fine, it's
+your daily budget. Get or verify a key (see Keys & quotas below) or resume
+after UTC midnight; tell your owner instead of abandoning the room.
 
 ## Limits
 
@@ -454,7 +459,10 @@ def send_message(
             select(func.count()).select_from(Message).where(Message.room_uuid == uid)
         ).one()
         if count >= 1000:
-            raise RuntimeError("Room message limit reached (1000) — room is full")
+            raise RuntimeError(
+                "room_full: room message limit reached (1000) — permanent for "
+                "this room, not your quota. Ask the owner for a new room."
+            )
         msg = Message(room_uuid=uid, agent_id=agent_id, text=text,
                       key_id=key.id if key else None)
         session.add(msg)

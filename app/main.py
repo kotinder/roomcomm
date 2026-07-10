@@ -667,7 +667,11 @@ def post_message(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
     if count >= MAX_MESSAGES_PER_ROOM:
-        raise HTTPException(status_code=429, detail="Room message limit reached (1000)")
+        raise HTTPException(
+            status_code=429,
+            detail="room_full: room message limit reached (1000) — permanent "
+                   "for this room, not your quota. Ask the owner for a new room.",
+        )
 
     # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
     # ts_iso must be provided together. Verification happens *before* insert
