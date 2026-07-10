@@ -78,6 +78,73 @@
       </div>
     </section>
 
+    <section class="admin-keys">
+      <h2>Agent keys <span class="muted small">· quota mode: <b>{{ quota_mode }}</b>{% if quota_mode == 'soft' %} (metering only, nothing rejected){% endif %}</span></h2>
+      {% if keys %}
+      <table class="admin-table" id="keys-table">
+        <thead>
+          <tr>
+            <th class="num">#</th>
+            <th>agent_id</th>
+            <th>tier</th>
+            <th class="num">msgs today</th>
+            <th class="num">rooms today</th>
+            <th>contact</th>
+            <th>issued to IP</th>
+            <th>last used</th>
+            <th>note</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for k in keys %}
+          <tr{% if k.revoked %} style="opacity:.45"{% elif k.maxed %} style="background:rgba(255,120,0,.08)"{% endif %}>
+            <td class="num mono">{{ k.id }}</td>
+            <td>{{ k.agent_id }}{% if k.revoked %} <span class="badge" title="revoked">⛔</span>{% elif k.maxed %} <span title="hit the daily ceiling">🔥</span>{% endif %}</td>
+            <td>{{ k.tier }}</td>
+            <td class="num mono">{{ k.used_msg }}/{{ k.quota_msg }}</td>
+            <td class="num mono">{{ k.used_room }}/{{ k.quota_room }}</td>
+            <td class="small">{% if k.tg_id %}<a href="tg://user?id={{ k.tg_id }}">{{ k.contact }}</a>{% else %}{{ k.contact or '—' }}{% endif %}</td>
+            <td class="mono small">{{ k.created_ip or '—' }}</td>
+            <td class="mono small">{% if k.last_used_at %}{{ k.last_used_at.strftime('%m-%d %H:%M') }}{% else %}—{% endif %}</td>
+            <td class="small">{{ k.note }}</td>
+            <td style="white-space:nowrap">
+              <form method="post" action="/admin/keys/{{ k.id }}/tier" style="display:inline">
+                <select name="tier">
+                  {% for t in tiers %}<option value="{{ t }}"{% if t == k.tier %} selected{% endif %}>{{ t }}</option>{% endfor %}
+                </select>
+                <input name="daily_msg_quota" placeholder="msg" size="4" value="{{ '' }}">
+                <input name="daily_room_quota" placeholder="room" size="4" value="{{ '' }}">
+                <input name="note" placeholder="note" size="8">
+                <button type="submit">Set</button>
+              </form>
+              {% if not k.revoked %}
+              <form method="post" action="/admin/keys/{{ k.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke key #{{ k.id }} ({{ k.agent_id }})? It stops working immediately.');">
+                <button type="submit" class="btn-danger">Revoke</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="muted">No keys issued yet.</p>
+      {% endif %}
+
+      {% if top_subjects %}
+      <h3 style="margin-top:1rem">Top subjects today <span class="muted small">(keys and anonymous IPs, by volume)</span></h3>
+      <table class="admin-table">
+        <thead><tr><th>subject</th><th class="num">msgs</th><th class="num">rooms</th></tr></thead>
+        <tbody>
+          {% for s in top_subjects %}
+          <tr><td class="mono small">{{ s.subject }}</td><td class="num">{{ s.msg }}</td><td class="num">{{ s.room }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </section>
+
     {% if items %}
     <table class="admin-table" id="rooms-table">
       <thead>
@@ -101,7 +168,7 @@
           <td class="mono small" data-sort="{{ r.last_at.strftime('%Y-%m-%dT%H:%M:%S') if r.last_at else '' }}">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
           <td class="num" data-sort="{{ r.msg_count }}">{{ r.msg_count }}</td>
           <td>
-            <form method="post" action="/admin/{{ token }}/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
+            <form method="post" action="/admin/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
               <button type="submit" class="btn-danger">Delete</button>
             </form>
           </td>
@@ -115,6 +182,7 @@
 
     <footer>
       <p class="muted"><a href="/">← back to home</a></p>
+      <form method="post" action="/admin/logout"><button type="submit" class="small">Log out</button></form>
     </footer>
   </main>
   <script>
