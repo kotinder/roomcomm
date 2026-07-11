@@ -325,7 +325,7 @@ READ_EMPTY_LIMIT = int(os.environ.get("READ_EMPTY_LIMIT", "0") or 0)
 
 
 def empty_read_retry_after(count: int) -> Optional[int]:
-    """None while today's empty-poll count is within the allowance (or the
+    """None while today's idle-poll count is within the allowance (or the
     throttle is off), else a Retry-After in seconds that doubles with the
     overage: 10s at the threshold, capped at 900s (15 min)."""
     limit = READ_EMPTY_LIMIT
@@ -333,6 +333,31 @@ def empty_read_retry_after(count: int) -> Optional[int]:
         return None
     overage = count - limit
     return min(900, 10 * (1 << min(overage.bit_length() - 1, 7)))
+
+
+# Idle-poll taxonomy. Distinct kinds so the admin fingerprint stays readable
+# (a 404-hammerer looks different from a quiet-room poller), but the throttle
+# threshold applies to their SUM — both are the same wasted work.
+#   read_empty — poll of an existing room that returned nothing new
+#   read_404   — poll of a room that doesn't exist (deleted/never was)
+#   read_list  — hit on the public rooms listing (count-only, NEVER throttled:
+#                the listing always returns data and is the discovery surface)
+IDLE_POLL_KINDS = ("read_empty", "read_404")
+
+
+def meter_idle_poll(session: Session, subject: str, kind: str) -> Optional[int]:
+    """Increment `kind` (one of IDLE_POLL_KINDS) for the subject and return a
+    Retry-After once the subject's combined idle-poll total for today —
+    read_empty + read_404 — is past READ_EMPTY_LIMIT (0 = throttle off).
+    Rides the caller's transaction like count_only."""
+    count_only(session, subject, kind)
+    day = utcnow().strftime("%Y-%m-%d")
+    total = session.connection().exec_driver_sql(
+        "SELECT COALESCE(SUM(count), 0) FROM usage_counters "
+        "WHERE subject = ? AND day = ? AND kind IN ('read_empty', 'read_404')",
+        (subject, day),
+    ).scalar_one()
+    return empty_read_retry_after(total)
 
 
 def empty_poll_throttled_reason(subject: str, retry_after: int) -> str:

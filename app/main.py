@@ -407,29 +407,62 @@ def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentK
         )
 
 
-def _meter_empty_read(session: Session, request: Request) -> Optional[tuple[str, int]]:
-    """Record one empty poll for this request's subject (key if a valid Bearer
-    is present, else IP). Count-only metering: it must never make a read fail,
-    so a bad key degrades to the IP subject and any error is swallowed. GET
-    handlers don't otherwise commit, so this commits its own counter.
+def _poll_subject(session: Session, request: Request) -> str:
+    """Subject for read-path metering: key if a valid Bearer is present, else
+    IP. A bad key degrades to the IP subject — metering must never fail a read."""
+    try:
+        key = quota.resolve_key(session, request.headers.get("authorization"))
+    except quota.AuthError:
+        key = None
+    return quota.subject_of(key, _client_ip(request))
 
-    Returns (subject, retry_after) once the subject is past today's empty-poll
+
+def _meter_idle_poll(session: Session, request: Request,
+                     kind: str) -> Optional[tuple[str, int]]:
+    """Record one idle poll (kind 'read_empty' or 'read_404') for this
+    request's subject. Best-effort: any metering error is swallowed and never
+    breaks a read. GET handlers don't otherwise commit, so this commits its
+    own counter.
+
+    Returns (subject, retry_after) once the subject is past today's idle-poll
     allowance (quota.READ_EMPTY_LIMIT, 0 = throttle off) so the caller can turn
     it into a 429. Metering FAILURES still never throttle."""
     try:
-        try:
-            key = quota.resolve_key(session, request.headers.get("authorization"))
-        except quota.AuthError:
-            key = None
-        subject = quota.subject_of(key, _client_ip(request))
-        count = quota.count_only(session, subject, "read_empty")
+        subject = _poll_subject(session, request)
+        retry_after = quota.meter_idle_poll(session, subject, kind)
         session.commit()
-        retry_after = quota.empty_read_retry_after(count)
         return (subject, retry_after) if retry_after is not None else None
     except Exception:  # metering is best-effort; never break a read over it
-        log.debug("empty-read metering failed", exc_info=True)
+        log.debug("idle-poll metering failed", exc_info=True)
         session.rollback()
         return None
+
+
+def _meter_listing_read(session: Session, request: Request) -> None:
+    """Count one public-listing read (kind 'read_list'). Pure visibility —
+    the listing always returns data, so it is never throttled and this never
+    fails the request."""
+    try:
+        quota.count_only(session, _poll_subject(session, request), "read_list")
+        session.commit()
+    except Exception:
+        log.debug("listing-read metering failed", exc_info=True)
+        session.rollback()
+
+
+def _missing_room_response(session: Session, request: Request) -> HTTPException:
+    """Meter a poll of a nonexistent room (kind 'read_404' — polling deleted
+    rooms 24/7 is the freeloader's current signature) and return the exception
+    to raise: 429 past the idle-poll allowance, else the plain 404."""
+    throttled = _meter_idle_poll(session, request, "read_404")
+    if throttled is not None:
+        subject, retry_after = throttled
+        return HTTPException(
+            status_code=429,
+            detail=quota.empty_poll_throttled_reason(subject, retry_after),
+            headers={"Retry-After": str(retry_after)},
+        )
+    return HTTPException(status_code=404, detail="Room not found")
 
 
 def _used_today(session: Session, subject: str) -> KeyQuota:
@@ -591,6 +624,8 @@ def list_public_rooms(
     session: Session = Depends(get_session),
 ):
     """Public listing of rooms — only is_public=true. For agent discovery."""
+    # Visibility only: who reads the showcase, and how often (read_list).
+    _meter_listing_read(session, request)
     base = str(request.base_url).rstrip("/")
     stmt = (
         select(
@@ -637,9 +672,12 @@ def list_public_rooms(
 
 
 @app.get("/api/rooms/{room_uuid}", response_model=RoomInfoOut)
-def get_room(room_uuid: str, session: Session = Depends(get_session)):
+def get_room(room_uuid: str, request: Request, session: Session = Depends(get_session)):
     room_uuid = _validate_uuid(room_uuid)
-    room = _get_room_or_404(session, room_uuid)
+    room = session.get(Room, room_uuid)
+    if room is None:
+        # Room-info polling of a nonexistent room is idle polling too.
+        raise _missing_room_response(session, request)
     count = session.exec(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
@@ -664,7 +702,8 @@ def list_messages(
     session: Session = Depends(get_session),
 ):
     room_uuid = _validate_uuid(room_uuid)
-    _get_room_or_404(session, room_uuid)
+    if session.get(Room, room_uuid) is None:
+        raise _missing_room_response(session, request)
     effective_limit = min(limit, MAX_LIMIT)
 
     stmt = select(Message).where(Message.room_uuid == room_uuid)
@@ -681,7 +720,7 @@ def list_messages(
         # messages costs nothing, ever. With READ_EMPTY_LIMIT set (off by
         # default), a subject far past the daily allowance starts getting 429s
         # whose Retry-After grows with the overage.
-        throttled = _meter_empty_read(session, request)
+        throttled = _meter_idle_poll(session, request, "read_empty")
         if throttled is not None:
             subject, retry_after = throttled
             raise HTTPException(
@@ -2097,21 +2136,25 @@ def _admin_keys(session: Session) -> list[dict]:
 
 def _admin_top_subjects(session: Session, limit: int = 15) -> list[dict]:
     """Today's hungriest subjects (keys AND anonymous IPs). Ranked by write load
-    (msg + room); read_empty (idle polls) is surfaced too — a subject with huge
-    read_empty and near-zero writes is the polling-parasite fingerprint."""
+    (msg + room) with a small read-side term — a subject with huge idle-poll
+    counts (read_empty of quiet rooms, read_404 of deleted ones) and near-zero
+    writes is the polling-parasite fingerprint; read_list shows who watches
+    the showcase."""
     day = utcnow().strftime("%Y-%m-%d")
+    kinds = ("msg", "room", "read_empty", "read_404", "read_list")
     agg: dict[str, dict[str, int]] = {}
     for row in session.exec(
         select(UsageCounter).where(UsageCounter.day == day)
     ).all():
-        agg.setdefault(row.subject, {"msg": 0, "room": 0, "read_empty": 0})[row.kind] = row.count
+        agg.setdefault(row.subject, dict.fromkeys(kinds, 0))[row.kind] = row.count
     top = sorted(
         agg.items(),
-        key=lambda kv: -(kv[1]["msg"] + kv[1]["room"] * 10 + kv[1].get("read_empty", 0) * 0.01),
+        key=lambda kv: -(kv[1]["msg"] + kv[1]["room"] * 10
+                         + (kv[1].get("read_empty", 0) + kv[1].get("read_404", 0)
+                            + kv[1].get("read_list", 0)) * 0.01),
     )
     return [
-        {"subject": s, "msg": v["msg"], "room": v["room"],
-         "read_empty": v.get("read_empty", 0)}
+        {"subject": s, **{k: v.get(k, 0) for k in kinds}}
         for s, v in top[:limit]
     ]
 

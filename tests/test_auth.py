@@ -457,18 +457,29 @@ def test_empty_reads_metered_not_charged_when_data():
     assert _read_empty_total() == mid
 
 
+def _poll_count_today(kind: str) -> int:
+    """Today's counter of `kind` for the test client's anonymous subject."""
+    from sqlmodel import select as _sel
+    with Session(engine) as s:
+        row = s.exec(_sel(app.models.UsageCounter).where(
+            app.models.UsageCounter.kind == kind,
+            app.models.UsageCounter.subject == "ip:testclient")).first()
+        return row.count if row else 0
+
+
+def _idle_polls_today() -> int:
+    """Combined idle-poll total (read_empty + read_404) — what the throttle
+    threshold applies to."""
+    return _poll_count_today("read_empty") + _poll_count_today("read_404")
+
+
 def test_empty_read_throttle_off_by_default_then_429_with_growing_retry_after():
     """READ_EMPTY_LIMIT=0 (default) never rejects; once set, empty polls past
     the allowance get 429 with a Retry-After that grows with the overage —
     while posting and reads that return data stay untouched."""
-    from sqlmodel import select as _sel
 
     def _subject_count():
-        with Session(engine) as s:
-            row = s.exec(_sel(app.models.UsageCounter).where(
-                app.models.UsageCounter.kind == "read_empty",
-                app.models.UsageCounter.subject == "ip:testclient")).first()
-            return row.count if row else 0
+        return _idle_polls_today()
 
     uid = _new_room()["uuid"]
 
@@ -503,6 +514,47 @@ def test_empty_read_throttle_off_by_default_then_429_with_growing_retry_after():
                            json={"agent_id": "a", "text": "hi"}).status_code == 201
         ok = client.get(f"/api/rooms/{uid}/messages")
         assert ok.status_code == 200 and ok.json()["messages"]
+    finally:
+        quota.READ_EMPTY_LIMIT = prev
+
+
+def test_404_and_listing_polls_are_metered():
+    """Polling a room that doesn't exist is metered as read_404 (on both the
+    messages and the room-info endpoints, plain 404 while under the limit),
+    and every hit on the public listing lands in read_list."""
+    import uuid as _uuid
+    ghost = str(_uuid.uuid4())
+
+    b4 = _poll_count_today("read_404")
+    assert client.get(f"/api/rooms/{ghost}/messages").status_code == 404
+    assert client.get(f"/api/rooms/{ghost}").status_code == 404
+    assert _poll_count_today("read_404") == b4 + 2
+
+    bl = _poll_count_today("read_list")
+    assert client.get("/api/rooms").status_code == 200
+    assert _poll_count_today("read_list") == bl + 1
+
+
+def test_404_polls_count_toward_the_idle_throttle():
+    """Hammering deleted rooms (the freeloader's live signature) shares the
+    idle-poll allowance with empty reads: past it, the 404 turns into the
+    throttle 429 — while WRITE paths keep their plain 404."""
+    import uuid as _uuid
+    ghost = str(_uuid.uuid4())
+
+    prev = quota.READ_EMPTY_LIMIT
+    quota.READ_EMPTY_LIMIT = _idle_polls_today() + 1
+    try:
+        # at the allowance -> still the plain 404
+        assert client.get(f"/api/rooms/{ghost}/messages").status_code == 404
+        # past it -> the throttle answers instead
+        r = client.get(f"/api/rooms/{ghost}/messages")
+        assert r.status_code == 429
+        assert r.json()["detail"].startswith("empty_poll_throttled:")
+        assert "Retry-After" in r.headers
+        # posting into a nonexistent room is NOT idle polling -> plain 404
+        assert client.post(f"/api/rooms/{ghost}/messages",
+                           json={"agent_id": "a", "text": "x"}).status_code == 404
     finally:
         quota.READ_EMPTY_LIMIT = prev
 

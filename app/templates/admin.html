@@ -133,12 +133,12 @@
       {% endif %}
 
       {% if top_subjects %}
-      <h3 style="margin-top:1rem">Top subjects today <span class="muted small">(keys and anonymous IPs, by volume)</span></h3>
+      <h3 style="margin-top:1rem">Top subjects today <span class="muted small">(keys and anonymous IPs, by volume; empty/404 = idle polls — the freeloader fingerprint)</span></h3>
       <table class="admin-table">
-        <thead><tr><th>subject</th><th class="num">msgs</th><th class="num">rooms</th></tr></thead>
+        <thead><tr><th>subject</th><th class="num">msgs</th><th class="num">rooms</th><th class="num">empty</th><th class="num">404</th><th class="num">list</th></tr></thead>
         <tbody>
           {% for s in top_subjects %}
-          <tr><td class="mono small">{{ s.subject }}</td><td class="num">{{ s.msg }}</td><td class="num">{{ s.room }}</td></tr>
+          <tr><td class="mono small">{{ s.subject }}</td><td class="num">{{ s.msg }}</td><td class="num">{{ s.room }}</td><td class="num">{{ s.read_empty }}</td><td class="num">{{ s.read_404 }}</td><td class="num">{{ s.read_list }}</td></tr>
           {% endfor %}
         </tbody>
       </table>

@@ -155,24 +155,53 @@ def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentK
         raise RuntimeError(f"429: {e.detail}")
 
 
-def _meter_empty_read(ctx: Context, session: Session) -> Optional[tuple[str, int]]:
-    """MCP twin of the REST-side empty-poll metering — /mcp must not stay a
-    free side door for 24/7 polling. Count-only and best-effort: it never makes
-    a read fail on its own; a bad Bearer just skips metering. Returns
-    (subject, retry_after) once the subject is past today's empty-poll
+def _meter_idle_poll(ctx: Context, session: Session,
+                     kind: str) -> Optional[tuple[str, int]]:
+    """MCP twin of the REST-side idle-poll metering ('read_empty'/'read_404') —
+    /mcp must not stay a free side door for 24/7 polling. Best-effort: it never
+    makes a read fail on its own; a bad Bearer just skips metering. Returns
+    (subject, retry_after) once the subject is past today's idle-poll
     allowance (quota.READ_EMPTY_LIMIT, 0 = throttle off)."""
     try:
         try:
             subject, _ = _resolve_subject(ctx, session)
         except ValueError:
             return None
-        count = quota.count_only(session, subject, "read_empty")
+        retry_after = quota.meter_idle_poll(session, subject, kind)
         session.commit()
-        retry_after = quota.empty_read_retry_after(count)
         return (subject, retry_after) if retry_after is not None else None
     except Exception:
         session.rollback()
         return None
+
+
+def _meter_listing_read(ctx: Context, session: Session) -> None:
+    """Count one listing read (kind 'read_list'). Visibility only — never
+    throttled, never fails the request."""
+    try:
+        try:
+            subject, _ = _resolve_subject(ctx, session)
+        except ValueError:
+            return
+        quota.count_only(session, subject, "read_list")
+        session.commit()
+    except Exception:
+        session.rollback()
+
+
+def _room_or_throttled_404(ctx: Context, session: Session, uid: str) -> Room:
+    """_get_room with idle-poll accounting: a poll of a nonexistent room is
+    metered as 'read_404' (hammering deleted rooms 24/7 is the freeloader's
+    signature) and, past the idle-poll allowance, answered with the throttle
+    error instead of the plain not-found."""
+    room = session.get(Room, uid)
+    if room is not None:
+        return room
+    throttled = _meter_idle_poll(ctx, session, "read_404")
+    if throttled is not None:
+        subject, retry_after = throttled
+        raise ValueError(f"429: {quota.empty_poll_throttled_reason(subject, retry_after)}")
+    raise ValueError(f"Room {uid} not found")
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +296,7 @@ class VerifyResult(TypedDict):
     )
 )
 def list_rooms(
+    ctx: Context,
     sort: Annotated[
         str,
         Field(description='Sort order: "active" (most recent activity first) or "new" (creation order).'),
@@ -290,6 +320,8 @@ def list_rooms(
     """
     limit = min(max(1, limit), 200)
     with Session(engine) as session:
+        # Visibility only: who reads the showcase, and how often (read_list).
+        _meter_listing_read(ctx, session)
         stmt = (
             select(
                 Room,
@@ -336,6 +368,7 @@ def list_rooms(
 )
 def get_room(
     uuid: Annotated[str, Field(description="Room UUID or full URL like https://roomcomm.xyz/<uuid>.")],
+    ctx: Context,
 ) -> RoomInfo:
     """Get metadata for a Roomcomm room.
 
@@ -351,7 +384,7 @@ def get_room(
     """
     uid = _validate_uuid(_extract_uuid(uuid))
     with Session(engine) as session:
-        room = _get_room(session, uid)
+        room = _room_or_throttled_404(ctx, session, uid)
         count = session.exec(
             select(func.count()).select_from(Message).where(Message.room_uuid == uid)
         ).one()
@@ -402,7 +435,7 @@ def read_messages(
     uid = _validate_uuid(_extract_uuid(uuid))
     effective_limit = min(max(1, limit), 500)
     with Session(engine) as session:
-        _get_room(session, uid)
+        _room_or_throttled_404(ctx, session, uid)
         stmt = select(Message).where(Message.room_uuid == uid)
         if since is not None:
             stmt = stmt.where(Message.id > since)
@@ -412,7 +445,7 @@ def read_messages(
             # Same empty-poll metering/throttle as the REST side: an idle poll
             # of a quiet room is the parasite's signature; a read that returns
             # messages is never counted or throttled.
-            throttled = _meter_empty_read(ctx, session)
+            throttled = _meter_idle_poll(ctx, session, "read_empty")
             if throttled is not None:
                 subject, retry_after = throttled
                 raise ValueError(
