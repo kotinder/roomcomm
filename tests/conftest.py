@@ -15,6 +15,11 @@ from pathlib import Path
 # used for a real call — tests don't exercise the arbiter network path.
 os.environ.setdefault("NVIDIA_API_KEY", "test-dummy-key")
 
+# Most tests create rooms anonymously; keep the "keyed create" wall OFF by
+# default so they keep working. The dedicated keyed-create test flips
+# quota.KEYED_CREATE on locally.
+os.environ.setdefault("KEYED_CREATE", "off")
+
 _ROOT = Path(__file__).resolve().parent.parent
 
 

@@ -120,8 +120,25 @@ def test_anon_msg_quota_hits_429_with_hint():
         detail = r.json()["detail"]
         assert detail.startswith("quota_exceeded:")  # machine-readable prefix
         assert "key" in detail  # the ladder hint
-        assert "NOT a room limit" in detail  # don't-abandon-the-room signal
+        assert "don't abandon the room" in detail  # don't-abandon-the-room signal
         assert "Retry-After" in r.headers
+    finally:
+        quota.TIER_QUOTAS["anon"] = old
+
+
+def test_anon_room_quota_429_is_room_specific():
+    """The room-creation 429 must read as room-specific, not carry the
+    message-quota 'don't abandon the room' phrasing."""
+    old = quota.TIER_QUOTAS["anon"]
+    quota.TIER_QUOTAS["anon"] = (old[0], 1)  # 1 room/day for anon
+    try:
+        assert client.post("/api/rooms", json={"description": "a"}).status_code == 201
+        r = client.post("/api/rooms", json={"description": "b"})
+        assert r.status_code == 429
+        detail = r.json()["detail"]
+        assert detail.startswith("quota_exceeded:")
+        assert "room-creation limit" in detail
+        assert "abandon" not in detail  # msg-only phrasing must not leak here
     finally:
         quota.TIER_QUOTAS["anon"] = old
 
@@ -194,6 +211,65 @@ def test_per_key_quota_override():
                        json={"agent_id": "v", "text": "x"}).status_code == 201
     assert client.post(f"/api/rooms/{uid}/messages", headers=h,
                        json={"agent_id": "v", "text": "x"}).status_code == 429
+
+
+def test_premium_room_is_open_to_create_but_verified_only_to_post():
+    """Anyone may create a premium room, but only a Telegram-verified key may
+    post into it (the LLM arbiter runs on every message)."""
+    key = _new_key("prem-seeker")["key"]
+    h = _bearer(key)
+
+    # A free key can CREATE a premium room.
+    room = client.post("/api/rooms", headers=h,
+                       json={"description": "p", "protocol_mode": "premium"})
+    assert room.status_code == 201
+    uid = room.json()["uuid"]
+
+    # Free key may NOT post into it.
+    free = client.post(f"/api/rooms/{uid}/messages", headers=h,
+                       json={"agent_id": "v", "text": "x"})
+    assert free.status_code == 403 and "Telegram-verified" in free.json()["detail"]
+    # Anonymous also denied.
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "x"}).status_code == 403
+
+    # Elevate to verified (what the Telegram bot does) → posting now allowed.
+    with Session(engine) as s:
+        kid = s.exec(__import__("sqlmodel").select(app.models.AgentKey)).all()[-1].id
+    assert client.post(f"/admin/keys/{kid}/tier", data={"tier": "verified"},
+                       headers={"Authorization": f"Bearer {ADMIN}"},
+                       follow_redirects=False).status_code == 303
+    ok = client.post(f"/api/rooms/{uid}/messages", headers=h,
+                     json={"agent_id": "v", "text": "x"})
+    assert ok.status_code == 201
+
+
+def test_limit_hit_notifies_owner_once(monkeypatch):
+    """The owner is pinged once (per subject/kind/day) when someone hits a
+    daily limit — deduped even as the over-quota caller keeps retrying."""
+    captured: list[str] = []
+    monkeypatch.setattr(quota, "_fire_limit_notification", captured.append)
+    quota._limit_notified_day = ""
+    quota._limit_notified.clear()
+
+    key = _new_key("hammerer")["key"]
+    h = _bearer(key)
+    old = quota.TIER_QUOTAS["free"]
+    quota.TIER_QUOTAS["free"] = (1, old[1])  # 1 msg/day for free keys
+    try:
+        uid = _new_room()["uuid"]
+        # first msg ok; second and third cross the limit
+        assert client.post(f"/api/rooms/{uid}/messages", headers=h,
+                           json={"agent_id": "h", "text": "x"}).status_code == 201
+        assert client.post(f"/api/rooms/{uid}/messages", headers=h,
+                           json={"agent_id": "h", "text": "x"}).status_code == 429
+        assert client.post(f"/api/rooms/{uid}/messages", headers=h,
+                           json={"agent_id": "h", "text": "x"}).status_code == 429
+    finally:
+        quota.TIER_QUOTAS["free"] = old
+
+    assert len(captured) == 1  # deduped despite two over-limit requests
+    assert "messages" in captured[0] and "hammerer" in captured[0]
 
 
 def test_verify_hint_follows_bot_state(monkeypatch):
@@ -283,6 +359,152 @@ def test_open_room_regression():
     assert r.status_code == 201
     body = client.get(f"/api/rooms/{uid}/messages").json()
     assert body["messages"][0]["text"] == "hi"
+
+
+# ---------- keyed create (the parasite wall) ----------
+
+def test_keyed_create_requires_key():
+    """Wall on: anonymous create -> 403, but reading and posting into an existing
+    open room stay anonymous; a key creates fine; killswitch reopens create."""
+    prev = quota.KEYED_CREATE
+    quota.KEYED_CREATE = "on"
+    try:
+        r = client.post("/api/rooms", json={"description": "t"})
+        assert r.status_code == 403
+        assert "keyed create" in r.json()["detail"].lower()
+
+        key = _new_key("creator")["key"]
+        r = client.post("/api/rooms", json={"description": "t"}, headers=_bearer(key))
+        assert r.status_code == 201
+        uid = r.json()["uuid"]
+
+        # open join preserved: anonymous post into the open room still works
+        r = client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
+        assert r.status_code == 201
+
+        # killswitch off -> anonymous create works again
+        quota.KEYED_CREATE = "off"
+        assert client.post("/api/rooms", json={"description": "t"}).status_code == 201
+    finally:
+        quota.KEYED_CREATE = prev
+
+
+# ---------- admin: seal an existing room's write policy in place ----------
+
+def test_admin_seal_and_reopen_write_policy():
+    """Seal an existing open room to owner-only writes without recreating it,
+    then reopen it — the flow used to freeze finished demos as read-only."""
+    owner_key = _new_key("demo-owner")["key"]
+    with Session(engine) as s:
+        oid = s.exec(__import__("sqlmodel").select(app.models.AgentKey)).all()[-1].id
+    uid = _new_room()["uuid"]  # open, anonymous room
+
+    # anon can post while open
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "x"}).status_code == 201
+
+    # seal: write_policy=key + owner_key_id -> only the owner writes
+    r = client.post(f"/admin/rooms/{uid}/write-policy",
+                    data={"write_policy": "key", "owner_key_id": str(oid)},
+                    headers={"Authorization": f"Bearer {ADMIN}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["write_policy"] == "key" and r.json()["owner_key_id"] == oid
+
+    # stranger now blocked, owner allowed, reads still open
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "s", "text": "x"}).status_code == 403
+    assert client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "o", "text": "x"},
+                       headers=_bearer(owner_key)).status_code == 201
+    assert client.get(f"/api/rooms/{uid}/messages").status_code == 200
+
+    # reopen -> anon can post again
+    r = client.post(f"/admin/rooms/{uid}/write-policy", data={"write_policy": "open"},
+                    headers={"Authorization": f"Bearer {ADMIN}"})
+    assert r.status_code == 200
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "x"}).status_code == 201
+
+
+def test_admin_seal_requires_auth():
+    uid = _new_room()["uuid"]
+    r = client.post(f"/admin/rooms/{uid}/write-policy", data={"write_policy": "key"})
+    assert r.status_code == 404
+
+
+# ---------- empty-read metering ----------
+
+def test_empty_reads_metered_not_charged_when_data():
+    """An empty poll bumps read_empty; a read that returns messages does not.
+    Metering never rejects a read."""
+    from sqlmodel import select as _sel
+
+    def _read_empty_total():
+        with Session(engine) as s:
+            return sum(c.count for c in s.exec(
+                _sel(app.models.UsageCounter).where(
+                    app.models.UsageCounter.kind == "read_empty")).all())
+
+    uid = _new_room()["uuid"]
+    before = _read_empty_total()
+    # empty poll (since past the end) -> counted, still 200
+    assert client.get(f"/api/rooms/{uid}/messages?since=999").status_code == 200
+    assert _read_empty_total() == before + 1
+
+    # a read that returns data -> NOT counted
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
+    mid = _read_empty_total()
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"]
+    assert _read_empty_total() == mid
+
+
+def test_empty_read_throttle_off_by_default_then_429_with_growing_retry_after():
+    """READ_EMPTY_LIMIT=0 (default) never rejects; once set, empty polls past
+    the allowance get 429 with a Retry-After that grows with the overage —
+    while posting and reads that return data stay untouched."""
+    from sqlmodel import select as _sel
+
+    def _subject_count():
+        with Session(engine) as s:
+            row = s.exec(_sel(app.models.UsageCounter).where(
+                app.models.UsageCounter.kind == "read_empty",
+                app.models.UsageCounter.subject == "ip:testclient")).first()
+            return row.count if row else 0
+
+    uid = _new_room()["uuid"]
+
+    # gate off (default): metered, never rejected
+    assert quota.READ_EMPTY_LIMIT == 0
+    for _ in range(3):
+        assert client.get(f"/api/rooms/{uid}/messages?since=999").status_code == 200
+
+    prev = quota.READ_EMPTY_LIMIT
+    # allowance = one more empty poll than this subject already burned today
+    quota.READ_EMPTY_LIMIT = _subject_count() + 1
+    try:
+        # at the allowance -> still 200
+        assert client.get(f"/api/rooms/{uid}/messages?since=999").status_code == 200
+        # past it -> 429, machine-readable prefix, Retry-After header
+        r1 = client.get(f"/api/rooms/{uid}/messages?since=999")
+        assert r1.status_code == 429
+        detail = r1.json()["detail"]
+        assert detail.startswith("empty_poll_throttled:")
+        assert "NOT a message quota" in detail  # must not read as quota/room death
+        ra1 = int(r1.headers["Retry-After"])
+        assert ra1 >= 10
+
+        # keep hammering: Retry-After grows with the overage
+        for _ in range(3):
+            r2 = client.get(f"/api/rooms/{uid}/messages?since=999")
+            assert r2.status_code == 429
+        assert int(r2.headers["Retry-After"]) > ra1
+
+        # posting is unaffected, and a read that RETURNS data is never throttled
+        assert client.post(f"/api/rooms/{uid}/messages",
+                           json={"agent_id": "a", "text": "hi"}).status_code == 201
+        ok = client.get(f"/api/rooms/{uid}/messages")
+        assert ok.status_code == 200 and ok.json()["messages"]
+    finally:
+        quota.READ_EMPTY_LIMIT = prev
 
 
 # ---------- admin auth ----------

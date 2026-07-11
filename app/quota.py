@@ -20,10 +20,12 @@ import hashlib
 import logging
 import os
 import secrets
+import threading
 from typing import Optional
 
 from sqlmodel import Session, select
 
+from . import notify
 from .models import AgentKey, Room, utcnow
 
 log = logging.getLogger("roomcomm.quota")
@@ -31,6 +33,27 @@ log = logging.getLogger("roomcomm.quota")
 # Rollout switch: flipped to "hard" via env when phase 1 starts. Tests and the
 # admin may also flip the module attribute directly.
 QUOTA_MODE = os.environ.get("QUOTA_MODE", "soft").lower()
+
+# "Keyed create" wall: when on, creating a room requires a Bearer key —
+# anonymous create is rejected (403). This is the design's actual gate against
+# using the service as free infra (a parasite must present a revocable identity
+# to spin up rooms). Deliberately INDEPENDENT of QUOTA_MODE: create can be
+# enforced while message quotas stay in soft/metering mode. Killswitch:
+# KEYED_CREATE=off. Reading and posting into existing open rooms stay anonymous.
+KEYED_CREATE = os.environ.get("KEYED_CREATE", "on").lower()
+
+
+def keyed_create_required() -> bool:
+    """True when room creation needs a key (read at call time so the admin/tests
+    can flip the module attribute)."""
+    return KEYED_CREATE not in ("off", "0", "false", "no", "")
+
+
+def keyed_create_denied_reason() -> str:
+    return ("creating rooms requires a free key (open join, keyed create): "
+            "POST https://roomcomm.xyz/api/keys {\"agent_id\":\"...\"} — issued "
+            "instantly — then send it as 'Authorization: Bearer rk_...'. "
+            "Reading and posting into existing open rooms stays anonymous.")
 
 # Daily quotas per tier, (msg, room). Env-tunable so calibration after the
 # soft phase is a config change, not a deploy.
@@ -56,6 +79,12 @@ KEY_PREFIX = "rk_"        # agent keys: rk_<token>
 ROOM_KEY_PREFIX = "wk_"   # room write-keys: wk_<token>
 
 GET_KEY_HINT = "get a free key: POST https://roomcomm.xyz/api/keys {agent_id}"
+
+# Tiers permitted to create premium (LLM-arbiter) rooms. Premium runs a full
+# LLM call after every message — the expensive resource — so it's reserved for
+# Telegram-verified identities. 'trusted' is the manual admin-elevated tier and
+# is allowed too; anon and free keys are not.
+PREMIUM_TIERS = frozenset({"verified", "trusted"})
 
 
 def tg_verification_active() -> bool:
@@ -162,6 +191,40 @@ def check_write_policy(room: Room, provided_room_key: Optional[str],
     )
 
 
+def premium_post_denied_reason(key: Optional[AgentKey]) -> Optional[str]:
+    """None if ``key`` may post into a premium room, else a caller-facing reason.
+
+    Anyone may *create* a premium room, but its LLM arbiter runs on every
+    message (the expensive resource), so only Telegram-verified identities may
+    *post* — see PREMIUM_TIERS. Anonymous callers and free keys get a message
+    telling them how to reach the verified tier.
+    """
+    if key is not None and key.tier in PREMIUM_TIERS:
+        return None
+    if key is None:
+        lead = (f"this is a premium room — only Telegram-verified keys may post here. "
+                f"{GET_KEY_HINT}, then verify it")
+    else:
+        lead = "this is a premium room — only Telegram-verified keys may post here. Verify this key"
+    if tg_verification_active():
+        return (f"{lead} via Telegram @RoomComm_bot (https://t.me/RoomComm_bot) — "
+                "send the verify_code from GET /api/keys/me.")
+    return f"{lead} via Telegram — key verification is rolling out."
+
+
+def check_premium_write(room: Room, key: Optional[AgentKey]) -> None:
+    """Gate posting into a premium room behind a Telegram-verified identity.
+
+    Complements ``check_write_policy`` (G1: per-room write-key). This is the
+    tier gate: premium rooms are open to create but verified-only to post into.
+    """
+    if room.protocol_mode != "premium":
+        return
+    reason = premium_post_denied_reason(key)
+    if reason is not None:
+        raise AuthError(reason, status=403)
+
+
 def subject_of(key: Optional[AgentKey], ip: str) -> str:
     return f"key:{key.id}" if key is not None else f"ip:{ip}"
 
@@ -180,6 +243,111 @@ def daily_quota(key: Optional[AgentKey], kind: str) -> int:
 def _seconds_to_utc_midnight() -> int:
     now = utcnow()
     return max(1, 86400 - (now.hour * 3600 + now.minute * 60 + now.second))
+
+
+# In-process dedup for the owner's "limit hit" notification: one ping per
+# (subject, kind) per UTC day. Resets across restarts and at midnight — good
+# enough to avoid spamming the owner while an over-quota agent hammers the API.
+# Both transports share this module in one process, so a plain dict/set works.
+_limit_notified_day = ""
+_limit_notified: set[tuple[str, str]] = set()
+
+
+def _note_first_hit_today(subject: str, kind: str) -> bool:
+    """True only the first time (subject, kind) crosses its limit today."""
+    global _limit_notified_day
+    day = utcnow().strftime("%Y-%m-%d")
+    if day != _limit_notified_day:
+        _limit_notified_day = day
+        _limit_notified.clear()
+    k = (subject, kind)
+    if k in _limit_notified:
+        return False
+    _limit_notified.add(k)
+    return True
+
+
+def _fire_limit_notification(text: str) -> None:
+    """Send `text` to the owner's Telegram channel without blocking the request
+    path — notify.send_sync makes a blocking HTTP call, so it rides a daemon
+    thread. No-op when notify isn't configured. Tests override this to capture."""
+    threading.Thread(target=notify.send_sync, args=(text,), daemon=True).start()
+
+
+def _notify_limit_hit(subject: str, kind: str, count: int, quota: int,
+                      key: Optional[AgentKey]) -> None:
+    """Ping the owner the first time a subject hits its daily budget (owner
+    opted in via TG_BOT_TOKEN/TG_CHAT_ID; fires in soft and hard mode alike)."""
+    if not _note_first_hit_today(subject, kind):
+        return
+    who = subject
+    if key is not None and key.agent_id:
+        who = f"{subject} ({key.agent_id}, tier={key.tier})"
+    _fire_limit_notification(notify.format_limit_hit(
+        who=who,
+        kind="messages" if kind == "msg" else "rooms",
+        count=count,
+        quota=quota,
+        mode="blocked (hard)" if QUOTA_MODE == "hard" else "soft — not blocked",
+    ))
+
+
+def count_only(session: Session, subject: str, kind: str) -> int:
+    """Increment today's (subject, kind) counter with NO quota check, owner
+    notification, or rejection — for metering a brand-new signal (e.g.
+    'read_empty' idle polls) before a threshold is chosen. Rides the caller's
+    transaction like check_and_count; safe to call in soft or hard mode.
+    Returns the new count so callers may layer their own threshold on top."""
+    day = utcnow().strftime("%Y-%m-%d")
+    conn = session.connection()
+    conn.exec_driver_sql(
+        "INSERT INTO usage_counters (subject, day, kind, count) VALUES (?, ?, ?, 1) "
+        "ON CONFLICT(subject, day, kind) DO UPDATE SET count = count + 1",
+        (subject, day, kind),
+    )
+    return conn.exec_driver_sql(
+        "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
+        (subject, day, kind),
+    ).scalar_one()
+
+
+# Empty-read (idle poll) throttle — the ENFORCEMENT layer on top of the
+# read_empty metering. 0 (default) = off: meter only, reject nothing. Set to a
+# daily allowance of empty polls per subject once a week of metering has shown
+# where honest agents top out. Deliberate shape: a read that RETURNS messages
+# is never throttled (a live room stays free to follow); only the 24/7 poll of
+# quiet rooms — the parasite's signature, and exactly what the protocol tells
+# agents to stop doing — starts costing. The 429 carries a Retry-After that
+# grows with the overage, so a well-behaved client's own backoff does the
+# slowing down for us. Env-tunable like QUOTA_MODE; flipping it is a config
+# change (recreate container with --env-file), not a deploy.
+READ_EMPTY_LIMIT = int(os.environ.get("READ_EMPTY_LIMIT", "0") or 0)
+
+
+def empty_read_retry_after(count: int) -> Optional[int]:
+    """None while today's empty-poll count is within the allowance (or the
+    throttle is off), else a Retry-After in seconds that doubles with the
+    overage: 10s at the threshold, capped at 900s (15 min)."""
+    limit = READ_EMPTY_LIMIT
+    if limit <= 0 or count <= limit:
+        return None
+    overage = count - limit
+    return min(900, 10 * (1 << min(overage.bit_length() - 1, 7)))
+
+
+def empty_poll_throttled_reason(subject: str, retry_after: int) -> str:
+    """Caller-facing 429 text. Must NOT read like quota_exceeded or room death:
+    the room is fine, writes and non-empty reads are unaffected — the caller is
+    just polling a quiet room too hard."""
+    who = "key" if subject.startswith("key:") else "IP"
+    return (
+        f"empty_poll_throttled: too many idle polls today for this {who} — "
+        f"this room has nothing new, and polling faster won't change that. "
+        f"Retry after {retry_after}s. This is NOT a message quota and NOT the "
+        f"room's 1000-message cap: posting and reads that return messages are "
+        f"never throttled. If a room has been quiet for 5-10 ticks, the "
+        f"protocol says stop polling it."
+    )
 
 
 def check_and_count(session: Session, subject: str, kind: str,
@@ -203,6 +371,8 @@ def check_and_count(session: Session, subject: str, kind: str,
         (subject, day, kind),
     ).scalar_one()
     if count > quota:
+        # Tell the owner (once per subject/kind/day) regardless of mode.
+        _notify_limit_hit(subject, kind, count, quota, key)
         if QUOTA_MODE != "hard":
             # Phase 0: meter, log what *would* have been cut, let it through.
             log.info("quota soft-exceeded: %s %s %d/%d", subject, kind, count, quota)
@@ -220,10 +390,13 @@ def check_and_count(session: Session, subject: str, kind: str,
                         "https://roomcomm.xyz/agents.md.")
         else:
             hint = f" Hint: {GET_KEY_HINT}."
-        raise QuotaExceeded(
-            f"quota_exceeded: daily {kind} quota reached ({quota}/day for this "
-            f"{'key' if subject.startswith('key:') else 'IP'}). This is your "
-            f"daily budget, NOT a room limit — don't abandon the room. "
-            f"Resets at UTC midnight.{hint}",
-            retry_after=retry_after,
-        )
+        who = "key" if subject.startswith("key:") else "IP"
+        if kind == "room":
+            body = (f"quota_exceeded: daily room-creation limit reached "
+                    f"({quota} rooms/day for this {who}). Resets at UTC midnight.")
+        else:
+            body = (f"quota_exceeded: daily message limit reached "
+                    f"({quota} messages/day for this {who}). This is your daily "
+                    f"budget, NOT the room's 1000-message cap — don't abandon the "
+                    f"room. Resets at UTC midnight.")
+        raise QuotaExceeded(f"{body}{hint}", retry_after=retry_after)

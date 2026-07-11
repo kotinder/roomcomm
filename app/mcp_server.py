@@ -22,7 +22,7 @@ from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
-from . import quota
+from . import llm, quota
 from .database import engine
 from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
@@ -153,6 +153,26 @@ def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentK
         quota.check_and_count(session, subject, kind, key)
     except quota.QuotaExceeded as e:
         raise RuntimeError(f"429: {e.detail}")
+
+
+def _meter_empty_read(ctx: Context, session: Session) -> Optional[tuple[str, int]]:
+    """MCP twin of the REST-side empty-poll metering — /mcp must not stay a
+    free side door for 24/7 polling. Count-only and best-effort: it never makes
+    a read fail on its own; a bad Bearer just skips metering. Returns
+    (subject, retry_after) once the subject is past today's empty-poll
+    allowance (quota.READ_EMPTY_LIMIT, 0 = throttle off)."""
+    try:
+        try:
+            subject, _ = _resolve_subject(ctx, session)
+        except ValueError:
+            return None
+        count = quota.count_only(session, subject, "read_empty")
+        session.commit()
+        retry_after = quota.empty_read_retry_after(count)
+        return (subject, retry_after) if retry_after is not None else None
+    except Exception:
+        session.rollback()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +376,7 @@ def get_room(
 )
 def read_messages(
     uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+    ctx: Context,
     since: Annotated[
         Optional[int],
         Field(description="Return only messages with id > since. Omit on the first tick for full history."),
@@ -387,6 +408,16 @@ def read_messages(
             stmt = stmt.where(Message.id > since)
         stmt = stmt.order_by(Message.id.asc()).limit(effective_limit + 1)
         rows = session.exec(stmt).all()
+        if not rows:
+            # Same empty-poll metering/throttle as the REST side: an idle poll
+            # of a quiet room is the parasite's signature; a read that returns
+            # messages is never counted or throttled.
+            throttled = _meter_empty_read(ctx, session)
+            if throttled is not None:
+                subject, retry_after = throttled
+                raise ValueError(
+                    f"429: {quota.empty_poll_throttled_reason(subject, retry_after)}"
+                )
     has_more = len(rows) > effective_limit
     rows = rows[:effective_limit]
     return {
@@ -453,6 +484,7 @@ def send_message(
         subject, key = _resolve_subject(ctx, session)
         try:
             quota.check_write_policy(room, room_key, key)
+            quota.check_premium_write(room, key)
         except quota.AuthError as e:
             raise ValueError(e.detail)
         _check_quota(session, subject, "msg", key)
@@ -525,7 +557,16 @@ def create_room(
 
     with Session(engine) as session:
         subject, key = _resolve_subject(ctx, session)
+        # "Keyed create" wall — mirrors the REST side: anonymous callers can read
+        # and post into open rooms, but creating one needs a revocable key.
+        if key is None and quota.keyed_create_required():
+            raise ValueError(quota.keyed_create_denied_reason())
         _check_quota(session, subject, "room", key)
+        # Anyone may create a premium room (verified-only gate is on posting),
+        # but refuse premium with no arbiter configured — mirrors the REST side.
+        if protocol_mode == "premium" and not llm.is_configured():
+            raise ValueError("premium rooms require the LLM arbiter, which "
+                             "is not configured on this server")
         room = Room(
             uuid=str(uuid_lib.uuid4()),
             description=description,

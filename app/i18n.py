@@ -239,6 +239,27 @@ RU = {
     "verdict_clean": "✅ ЧИСТО",
     "verdict_refuted": "🔴 ОПРОВЕРГНУТО",
     "verdict_inconclusive": "🟡 НЕДОСТАТОЧНО ДАННЫХ",
+
+    # Footer disclaimer + Terms page
+    "foot_disclaimer": "Публично и без шифрования. Не отправляйте секреты и персональные данные.",
+    "foot_terms": "Условия",
+    "terms_title": "Условия использования — Roomcomm",
+    "terms_h1": "Условия использования",
+    "terms_updated": "Обновлено 11.07.2026",
+    "terms_lead": "Коротко и по делу. Используя сайт или API roomcomm, вы принимаете эти условия.",
+    "terms_1_h": "1. Всё публично",
+    "terms_1_p": "Сообщения хранятся и показываются без шифрования. Приватная комната — это лишь «не в общем списке», а не тайна. Не отправляйте пароли, ключи, токены и персональные данные.",
+    "terms_2_h": "2. Как есть, без гарантий",
+    "terms_2_p": "Сервис бесплатный и работает по мере сил. Комнаты, лимиты и сам сервис могут меняться, очищаться или отключаться в любой момент без предупреждения.",
+    "terms_3_h": "3. Ваш контент остаётся вашим",
+    "terms_3_p": "Вы сохраняете права на то, что публикуете, и предоставляете roomcomm право хранить, обрабатывать и отображать это для работы сервиса. Права на контент — это не обещание его хранить: комнаты временные (см. п.2), поэтому держите собственную копию всего важного.",
+    "terms_4_h": "4. Строите поверх API — на свой риск",
+    "terms_4_p": "Никаких гарантий доступности (SLA нет). Мы вправе ограничить или отключить доступ, если он мешает сервису или другим пользователям.",
+    "terms_5_h": "5. Согласие",
+    "terms_5_p": "Используя API или сайт, вы принимаете эти условия. Не согласны — не используйте сервис.",
+    "terms_joke": "💾 What happens in roomcomm, stays in roomcomm’s database.",
+    "terms_contact": "Вопросы — ",
+    "terms_back": "← На главную",
 }
 
 EN = {
@@ -467,6 +488,27 @@ EN = {
     "verdict_clean": "✅ CLEAN",
     "verdict_refuted": "🔴 REFUTED",
     "verdict_inconclusive": "🟡 INCONCLUSIVE",
+
+    # Footer disclaimer + Terms page
+    "foot_disclaimer": "Public and unencrypted. Don't post secrets or personal data.",
+    "foot_terms": "Terms",
+    "terms_title": "Terms of Use — Roomcomm",
+    "terms_h1": "Terms of Use",
+    "terms_updated": "Updated 2026-07-11",
+    "terms_lead": "Short and to the point. By using the roomcomm site or API, you accept these terms.",
+    "terms_1_h": "1. Everything is public",
+    "terms_1_p": "Messages are stored and displayed unencrypted. A private room only means «not in the public list» — it is not a secret. Do not post passwords, keys, tokens, or personal data.",
+    "terms_2_h": "2. As-is, no warranty",
+    "terms_2_p": "The service is free and best-effort. Rooms, limits, and the service itself may change, be wiped, or be shut down at any time without notice.",
+    "terms_3_h": "3. Your content stays yours",
+    "terms_3_p": "You keep the rights to what you post, and you grant roomcomm the right to store, process, and display it in order to run the service. Rights to your content are not a promise we'll keep it: rooms are ephemeral (see §2), so keep your own copy of anything important.",
+    "terms_4_h": "4. Build on the API at your own risk",
+    "terms_4_p": "No availability guarantees (there is no SLA). We may throttle or cut off access if it harms the service or other users.",
+    "terms_5_h": "5. Acceptance",
+    "terms_5_p": "By using the API or the site, you accept these terms. If you disagree, don't use the service.",
+    "terms_joke": "💾 What happens in roomcomm, stays in roomcomm’s database.",
+    "terms_contact": "Questions — ",
+    "terms_back": "← Back to home",
 }
 
 _BUNDLES = {"ru": RU, "en": EN}
@@ -480,11 +522,18 @@ def normalize(lang: Optional[str]) -> str:
 
 
 def detect(query_lang: Optional[str], cookie_lang: Optional[str],
-           accept_language: Optional[str]) -> str:
+           accept_language: Optional[str], host: Optional[str] = None) -> str:
     if query_lang and query_lang.lower() in SUPPORTED:
         return query_lang.lower()
     if cookie_lang and cookie_lang.lower() in SUPPORTED:
         return cookie_lang.lower()
+    # Domain default: the .ru ccTLD is a strong signal for a Russian audience,
+    # and ranks ABOVE Accept-Language on purpose — many Russian users run
+    # English-configured browsers, so the domain is the better guess here.
+    # Still below an explicit ?lang= or a saved cookie: user choice always wins.
+    # Generic domains (.xyz) fall through to Accept-Language.
+    if host and host.lower().split(":")[0].endswith(".ru"):
+        return "ru"
     if accept_language:
         # very simple parser: take the first language tag
         for tag in accept_language.split(","):

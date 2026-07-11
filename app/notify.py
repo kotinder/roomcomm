@@ -109,6 +109,22 @@ def format_room_created(
     )
 
 
+def format_limit_hit(
+    *,
+    who: str,
+    kind: str,
+    count: int,
+    quota: int,
+    mode: str,
+) -> str:
+    return (
+        f"🚦 <b>Roomcomm daily limit hit</b>\n"
+        f"<b>Subject:</b> <code>{html.escape(who)}</code>\n"
+        f"<b>Limit:</b> {kind} {count}/{quota} per day\n"
+        f"<b>Mode:</b> {html.escape(mode)}"
+    )
+
+
 def format_error(
     *,
     where: str,

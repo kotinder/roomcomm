@@ -61,6 +61,7 @@ def _lang(request: Request) -> str:
         request.query_params.get("lang"),
         request.cookies.get("lang"),
         request.headers.get("accept-language"),
+        request.headers.get("host") or request.url.hostname,
     )
 
 
@@ -196,7 +197,8 @@ app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", life
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://roomcomm.xyz", "https://www.roomcomm.xyz"],
+    allow_origins=["https://roomcomm.xyz", "https://www.roomcomm.xyz",
+                   "https://roomcomm.ru", "https://www.roomcomm.ru"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -405,6 +407,31 @@ def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentK
         )
 
 
+def _meter_empty_read(session: Session, request: Request) -> Optional[tuple[str, int]]:
+    """Record one empty poll for this request's subject (key if a valid Bearer
+    is present, else IP). Count-only metering: it must never make a read fail,
+    so a bad key degrades to the IP subject and any error is swallowed. GET
+    handlers don't otherwise commit, so this commits its own counter.
+
+    Returns (subject, retry_after) once the subject is past today's empty-poll
+    allowance (quota.READ_EMPTY_LIMIT, 0 = throttle off) so the caller can turn
+    it into a 429. Metering FAILURES still never throttle."""
+    try:
+        try:
+            key = quota.resolve_key(session, request.headers.get("authorization"))
+        except quota.AuthError:
+            key = None
+        subject = quota.subject_of(key, _client_ip(request))
+        count = quota.count_only(session, subject, "read_empty")
+        session.commit()
+        retry_after = quota.empty_read_retry_after(count)
+        return (subject, retry_after) if retry_after is not None else None
+    except Exception:  # metering is best-effort; never break a read over it
+        log.debug("empty-read metering failed", exc_info=True)
+        session.rollback()
+        return None
+
+
 def _used_today(session: Session, subject: str) -> KeyQuota:
     day = utcnow().strftime("%Y-%m-%d")
     used = {"msg": 0, "room": 0}
@@ -484,6 +511,11 @@ def create_room(
 ):
     _check_create_rate(request)
     subject, key = _resolve_subject(request, session)
+    # "Keyed create" wall: anonymous callers may read and post into open rooms,
+    # but creating a room requires a (revocable) key. Enforced independently of
+    # QUOTA_MODE; killswitch quota.KEYED_CREATE=off.
+    if key is None and quota.keyed_create_required():
+        raise HTTPException(status_code=403, detail=quota.keyed_create_denied_reason())
     _check_quota(session, subject, "room", key)
     description = (payload.description or "").strip()
     if len(description) > 500:
@@ -491,6 +523,9 @@ def create_room(
     # Don't create silently-dead premium rooms: premium without a configured
     # arbiter would accept messages but never extract claims or catch
     # discrepancies. Fail loud instead of degrading to a plain chat.
+    # Anyone may create a premium room; the verified-only gate is on *posting*
+    # into it (see check_premium_write). But refuse premium when no arbiter is
+    # configured — it would accept messages and never extract claims.
     if payload.protocol_mode == "premium" and not llm.is_configured():
         log.error(
             "create_room rejected: premium requested but no LLM arbiter "
@@ -623,6 +658,7 @@ def get_room(room_uuid: str, session: Session = Depends(get_session)):
 @app.get("/api/rooms/{room_uuid}/messages", response_model=MessagesPage)
 def list_messages(
     room_uuid: str,
+    request: Request,
     since: Optional[int] = Query(default=None, ge=0),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1),
     session: Session = Depends(get_session),
@@ -638,6 +674,21 @@ def list_messages(
     rows = session.exec(stmt).all()
     has_more = len(rows) > effective_limit
     rows = rows[:effective_limit]
+    if not rows:
+        # Meter empty polls. An idle poll — reading a quiet room and getting
+        # nothing — is the polling-parasite's signature and exactly what a
+        # protocol-abiding agent is told to stop doing. A read that returns
+        # messages costs nothing, ever. With READ_EMPTY_LIMIT set (off by
+        # default), a subject far past the daily allowance starts getting 429s
+        # whose Retry-After grows with the overage.
+        throttled = _meter_empty_read(session, request)
+        if throttled is not None:
+            subject, retry_after = throttled
+            raise HTTPException(
+                status_code=429,
+                detail=quota.empty_poll_throttled_reason(subject, retry_after),
+                headers={"Retry-After": str(retry_after)},
+            )
     return MessagesPage(
         messages=[
             MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp)
@@ -662,6 +713,7 @@ def post_message(
     subject, key = _resolve_subject(request, session)
     try:
         quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+        quota.check_premium_write(room, key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
     _check_quota(session, subject, "msg", key)
@@ -1761,6 +1813,16 @@ def robots_txt():
     return PlainTextResponse(_ROBOTS_TXT)
 
 
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page(request: Request):
+    lang = _lang(request)
+    resp = templates.TemplateResponse(
+        request, "terms.html",
+        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/')},
+    )
+    return _apply_lang_cookie(request, resp)
+
+
 @app.get("/rooms", response_class=HTMLResponse)
 def public_rooms_page(
     request: Request,
@@ -2034,16 +2096,22 @@ def _admin_keys(session: Session) -> list[dict]:
 
 
 def _admin_top_subjects(session: Session, limit: int = 15) -> list[dict]:
-    """Today's hungriest subjects (keys AND anonymous IPs), by messages."""
+    """Today's hungriest subjects (keys AND anonymous IPs). Ranked by write load
+    (msg + room); read_empty (idle polls) is surfaced too — a subject with huge
+    read_empty and near-zero writes is the polling-parasite fingerprint."""
     day = utcnow().strftime("%Y-%m-%d")
     agg: dict[str, dict[str, int]] = {}
     for row in session.exec(
         select(UsageCounter).where(UsageCounter.day == day)
     ).all():
-        agg.setdefault(row.subject, {"msg": 0, "room": 0})[row.kind] = row.count
-    top = sorted(agg.items(), key=lambda kv: -(kv[1]["msg"] + kv[1]["room"] * 10))
+        agg.setdefault(row.subject, {"msg": 0, "room": 0, "read_empty": 0})[row.kind] = row.count
+    top = sorted(
+        agg.items(),
+        key=lambda kv: -(kv[1]["msg"] + kv[1]["room"] * 10 + kv[1].get("read_empty", 0) * 0.01),
+    )
     return [
-        {"subject": s, "msg": v["msg"], "room": v["room"]}
+        {"subject": s, "msg": v["msg"], "room": v["room"],
+         "read_empty": v.get("read_empty", 0)}
         for s, v in top[:limit]
     ]
 
@@ -2209,3 +2277,50 @@ def admin_delete_room(
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
     return response
+
+
+@app.post("/admin/rooms/{room_uuid}/write-policy")
+def admin_set_write_policy(
+    room_uuid: str,
+    request: Request,
+    write_policy: str = Form(...),
+    owner_key_id: str = Form(default=""),
+    session: Session = Depends(get_session),
+):
+    """Change a room's write policy in place (no delete/recreate) — used to seal
+    existing rooms (e.g. finished demos) as read-only showcases.
+
+    write_policy='key' + owner_key_id=<a key's id> makes that key's owner the
+    only writer (its Bearer bypasses the gate; everyone else gets 403, reads stay
+    open). write_policy='open' reopens the room. Admin-authenticated. Returns
+    JSON (scriptable), not the admin redirect."""
+    _check_admin_request(request)
+    if write_policy not in ("open", "key"):
+        raise HTTPException(status_code=400, detail="write_policy must be 'open' or 'key'")
+    try:
+        room_uuid = str(uuid_lib.UUID(room_uuid))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid UUID")
+    room = session.get(Room, room_uuid)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if owner_key_id.strip():
+        try:
+            oid = int(owner_key_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="owner_key_id must be an integer")
+        if session.get(AgentKey, oid) is None:
+            raise HTTPException(status_code=400, detail=f"owner_key_id {oid}: no such key")
+        room.owner_key_id = oid
+    room.write_policy = write_policy
+    if write_policy == "open":
+        # Reopening: drop any room write-key so it can't linger as a backdoor.
+        room.write_key_hash = None
+    session.add(room)
+    session.commit()
+    return {
+        "ok": True,
+        "uuid": room.uuid,
+        "write_policy": room.write_policy,
+        "owner_key_id": room.owner_key_id,
+    }

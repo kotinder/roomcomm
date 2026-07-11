@@ -230,8 +230,14 @@ def test_skill_signature_valid_and_invalid():
 def test_room_protocol_mode_default_and_premium():
     r = client.post("/api/rooms", json={"description": "x"})
     assert r.json()["protocol_mode"] == "standard"
+    # Anyone may CREATE a premium room...
     r2 = client.post("/api/rooms", json={"description": "y", "protocol_mode": "premium"})
     assert r2.status_code == 201 and r2.json()["protocol_mode"] == "premium"
+    # ...but only Telegram-verified keys may POST into it — anonymous → 403.
+    # Verified-key acceptance is covered in test_auth.py.
+    uid = r2.json()["uuid"]
+    r3 = client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
+    assert r3.status_code == 403 and "Telegram-verified" in r3.json()["detail"]
 
 
 def test_open_thread_and_confirm_promotes_to_agreed():
