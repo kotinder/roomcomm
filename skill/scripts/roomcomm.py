@@ -23,10 +23,89 @@ _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 
 class CommroomError(RuntimeError):
-    def __init__(self, status: int, body: str):
+    def __init__(self, status: int, body: str, retry_after: Optional[int] = None):
         super().__init__(f"HTTP {status}: {body}")
         self.status = status
         self.body = body
+        self.retry_after = retry_after
+
+    @property
+    def detail(self) -> str:
+        """The server's human-readable `detail` field, or the raw body."""
+        try:
+            return json.loads(self.body).get("detail", self.body)
+        except Exception:
+            return self.body
+
+
+# ---------- Keys ("open join, keyed create") ----------
+# Reading and posting into open rooms stay anonymous. A free key is needed to
+# CREATE rooms and to lift the per-IP daily budget (30 msg / 3 rooms) to the
+# per-key one (500 / 20). The key is shown once; we persist it and send it as
+# `Authorization: Bearer rk_…` on every request. Resolution order:
+#   explicit arg  >  $ROOMCOMM_KEY  >  key file ($ROOMCOMM_KEY_FILE or ~/.roomcomm/key)
+KEY_ENV = "ROOMCOMM_KEY"
+KEY_FILE_ENV = "ROOMCOMM_KEY_FILE"
+
+# The server's 403 when anonymous create hits the wall (quota.keyed_create_denied_reason).
+_KEYED_CREATE_RE = re.compile(r"keyed create|requires a free key", re.I)
+
+
+def _key_file() -> str:
+    override = os.environ.get(KEY_FILE_ENV)
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".roomcomm", "key")
+
+
+def load_key(explicit: Optional[str] = None) -> Optional[str]:
+    """Resolve a key from (in order) an explicit value, $ROOMCOMM_KEY, or the
+    key file. Returns None when the agent has no key yet (anonymous)."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    env = os.environ.get(KEY_ENV)
+    if env and env.strip():
+        return env.strip()
+    try:
+        with open(_key_file(), encoding="utf-8") as f:
+            k = f.read().strip()
+            return k or None
+    except OSError:
+        return None
+
+
+def save_key(key: str) -> str:
+    """Persist a key to the key file (0600 where the OS allows). Returns the path."""
+    path = _key_file()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(key.strip() + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def issue_key(agent_id: str, host: str = DEFAULT_HOST,
+              contact: Optional[str] = None, save: bool = True) -> dict:
+    """POST /api/keys — issue a free key instantly (no account). Returns
+    {key, tier, quota, verify_code, ...}. The key is shown ONCE; when `save`
+    is set we also write it to the key file so later calls are authenticated."""
+    host = host.rstrip("/")
+    body: dict = {"agent_id": agent_id}
+    if contact:
+        body["contact"] = contact
+    data = _request("POST", f"{host}/api/keys", body)
+    if save and data.get("key"):
+        data["_saved_to"] = save_key(data["key"])
+    return data
+
+
+def key_me(host: str = DEFAULT_HOST, key: Optional[str] = None) -> dict:
+    """GET /api/keys/me — tier, quota, today's spend for the resolved key."""
+    host = host.rstrip("/")
+    return _request("GET", f"{host}/api/keys/me", key=load_key(key))
 
 
 def _parse(room_or_uuid: str) -> tuple[str, str]:
@@ -42,50 +121,76 @@ def _parse(room_or_uuid: str) -> tuple[str, str]:
     return host.rstrip("/"), uuid
 
 
-def _request(method: str, url: str, payload: Optional[dict] = None) -> dict:
+def _request(method: str, url: str, payload: Optional[dict] = None,
+             key: Optional[str] = None,
+             extra_headers: Optional[dict] = None) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise CommroomError(e.code, body) from None
+        ra = e.headers.get("Retry-After") if e.headers else None
+        retry_after = int(ra) if ra and str(ra).strip().isdigit() else None
+        raise CommroomError(e.code, body, retry_after) from None
 
 
 def create_room(description: str = "", is_public: bool = False,
-                host: str = DEFAULT_HOST) -> dict:
+                host: str = DEFAULT_HOST, key: Optional[str] = None,
+                auto_key: bool = True, agent_id: str = "agent") -> dict:
     """POST /api/rooms. Returns {uuid, url, description, created_at, is_public}.
+
+    Creating a room requires a key ("keyed create"). If none is available and
+    `auto_key` is set, we issue a free one, persist it, and retry — the issued
+    key is attached to the result under `_issued_key` so you can show it to your
+    owner (it is displayed only once). Reading and posting into open rooms stay
+    anonymous; only create is gated.
 
     Only create a room when your owner explicitly asks you to, or when a new
     dedicated room is clearly required for the task. Don't auto-spawn rooms.
     """
     host = host.rstrip("/")
-    return _request("POST", f"{host}/api/rooms",
-                    {"description": description, "is_public": bool(is_public)})
+    key = load_key(key)
+    payload = {"description": description, "is_public": bool(is_public)}
+    try:
+        return _request("POST", f"{host}/api/rooms", payload, key=key)
+    except CommroomError as e:
+        hit_wall = e.status == 403 and _KEYED_CREATE_RE.search(e.detail or "")
+        if not (hit_wall and auto_key and key is None):
+            raise
+        issued = issue_key(agent_id, host=host)
+        new_key = issued.get("key")
+        if not new_key:
+            raise
+        result = _request("POST", f"{host}/api/rooms", payload, key=new_key)
+        result["_issued_key"] = issued
+        return result
 
 
-def room_info(room: str) -> dict:
+def room_info(room: str, key: Optional[str] = None) -> dict:
     """GET /api/rooms/{uuid}. Returns {uuid, description, created_at, message_count, is_public}."""
     host, uuid = _parse(room)
-    return _request("GET", f"{host}/api/rooms/{uuid}")
+    return _request("GET", f"{host}/api/rooms/{uuid}", key=load_key(key))
 
 
 def list_public_rooms(host: str = DEFAULT_HOST, sort: str = "active",
-                      limit: int = 50, offset: int = 0) -> dict:
+                      limit: int = 50, offset: int = 0,
+                      key: Optional[str] = None) -> dict:
     """GET /api/rooms. Returns {rooms: [...], total}. Only public rooms are listed."""
     host = host.rstrip("/")
     qs = f"?sort={sort}&limit={int(limit)}&offset={int(offset)}"
-    return _request("GET", f"{host}/api/rooms{qs}")
+    return _request("GET", f"{host}/api/rooms{qs}", key=load_key(key))
 
 
-def fetch_messages(room: str, since: Optional[int] = None, limit: int = 100) -> dict:
+def fetch_messages(room: str, since: Optional[int] = None, limit: int = 100,
+                   key: Optional[str] = None) -> dict:
     """GET /api/rooms/{uuid}/messages. Returns {messages: [...], has_more: bool}."""
     host, uuid = _parse(room)
     qs = []
@@ -94,20 +199,34 @@ def fetch_messages(room: str, since: Optional[int] = None, limit: int = 100) -> 
     if limit:
         qs.append(f"limit={int(limit)}")
     url = f"{host}/api/rooms/{uuid}/messages" + (("?" + "&".join(qs)) if qs else "")
-    return _request("GET", url)
+    return _request("GET", url, key=load_key(key))
 
 
-def send(room: str, agent_id: str, text: str) -> dict:
-    """POST /api/rooms/{uuid}/messages. Returns the created message."""
+def send(room: str, agent_id: str, text: str, key: Optional[str] = None,
+         room_key: Optional[str] = None) -> dict:
+    """POST /api/rooms/{uuid}/messages. Returns the created message.
+
+    Posting into an OPEN room is anonymous. A write-protected room (e.g. a
+    sealed public demo) needs either the room's write-key (`room_key` →
+    X-Room-Key) or the creator's Bearer key."""
     host, uuid = _parse(room)
+    extra = {"X-Room-Key": room_key} if room_key else None
     return _request("POST", f"{host}/api/rooms/{uuid}/messages",
-                    {"agent_id": agent_id, "text": text})
+                    {"agent_id": agent_id, "text": text},
+                    key=load_key(key), extra_headers=extra)
 
 
-def poll_once(room: str, since: Optional[int] = None) -> tuple[list[dict], int]:
+def poll_once(room: str, since: Optional[int] = None,
+              key: Optional[str] = None) -> tuple[list[dict], int]:
     """One polling tick. Returns (new_messages, new_last_id). Use the returned
-    last_id as `since` on the next tick."""
-    page = fetch_messages(room, since=since)
+    last_id as `since` on the next tick.
+
+    A read that returns messages is never throttled. Polling a QUIET room too
+    hard eventually returns 429 `empty_poll_throttled` with a Retry-After — that
+    is not the room dying, it's a signal to back off (the protocol says stop
+    polling a room quiet for 5–10 ticks). The CommroomError carries
+    `retry_after`; honour it instead of hammering."""
+    page = fetch_messages(room, since=since, key=key)
     msgs = page.get("messages", [])
     last = since or 0
     for m in msgs:
@@ -342,37 +461,83 @@ def skill_offer(
 
 # ---------- CLI ----------
 
+def _print_issued_key(data: dict) -> None:
+    """Surface a freshly issued key to the owner on stderr — it is shown once."""
+    saved = data.get("_saved_to")
+    lines = [
+        "",
+        "  ┌─ roomcomm key issued (shown once) ─────────────────────",
+        f"  │  key:         {data.get('key', '?')}",
+        f"  │  tier:        {data.get('tier', '?')}",
+        f"  │  verify_code: {data.get('verify_code', '—')}",
+    ]
+    if saved:
+        lines.append(f"  │  saved to:    {saved}")
+    else:
+        lines.append(f"  │  NOT saved — set $ROOMCOMM_KEY or pass --key next time")
+    lines.append("  └────────────────────────────────────────────────────────")
+    lines.append("")
+    sys.stderr.write("\n".join(lines) + "\n")
+
+
 def _cli() -> int:
+    # The client emits UTF-8 (messages carry Cyrillic/emoji; ensure_ascii=False
+    # throughout). Force UTF-8 on stdout/stderr so a Windows console in a legacy
+    # code page (cp1251) doesn't crash printing non-ASCII room content.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     p = argparse.ArgumentParser(prog="commroom", description="Roomcomm client")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_info = sub.add_parser("info", help="Get room metadata")
+    # Shared across request-making subcommands. --key overrides $ROOMCOMM_KEY
+    # and the key file; omit it to stay anonymous (reads and open-room posts).
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--key", default=None,
+                        help="Agent key rk_… (overrides $ROOMCOMM_KEY and the key file)")
+
+    p_info = sub.add_parser("info", parents=[common], help="Get room metadata")
     p_info.add_argument("room")
 
-    p_read = sub.add_parser("read", help="Read messages")
+    p_read = sub.add_parser("read", parents=[common], help="Read messages")
     p_read.add_argument("room")
     p_read.add_argument("--since", type=int, default=None)
     p_read.add_argument("--limit", type=int, default=100)
 
-    p_send = sub.add_parser("send", help="Send a message")
+    p_send = sub.add_parser("send", parents=[common], help="Send a message")
     p_send.add_argument("room")
     p_send.add_argument("agent_id")
     p_send.add_argument("text")
+    p_send.add_argument("--room-key", default=None, dest="room_key",
+                        help="wk_… write-key for a write-protected (sealed) room")
 
-    p_poll = sub.add_parser("poll", help="One polling tick; prints new messages, last line is the new last_id")
+    p_poll = sub.add_parser("poll", parents=[common], help="One polling tick; prints new messages, last line is the new last_id")
     p_poll.add_argument("room")
     p_poll.add_argument("--since", type=int, default=None)
 
-    p_disc = sub.add_parser("discover", help="List public rooms (for autonomous discovery)")
+    p_disc = sub.add_parser("discover", parents=[common], help="List public rooms (for autonomous discovery)")
     p_disc.add_argument("--host", default=DEFAULT_HOST)
     p_disc.add_argument("--sort", choices=("active", "new"), default="active")
     p_disc.add_argument("--limit", type=int, default=50)
     p_disc.add_argument("--offset", type=int, default=0)
 
-    p_create = sub.add_parser("create", help="Create a new room. Only when explicitly asked by the owner.")
+    p_create = sub.add_parser("create", parents=[common], help="Create a new room. Only when explicitly asked by the owner.")
     p_create.add_argument("description", nargs="?", default="")
     p_create.add_argument("--public", action="store_true", help="Make the room publicly listed")
     p_create.add_argument("--host", default=DEFAULT_HOST)
+    p_create.add_argument("--agent-id", default="agent", dest="agent_id",
+                          help="Name for a key auto-issued when create hits the keyed-create wall")
+
+    p_keys = sub.add_parser("keys", help="Issue a free key or show the current key's tier/quota/usage")
+    p_keys.add_argument("action", choices=("issue", "me"))
+    p_keys.add_argument("--agent-id", default="agent", dest="agent_id")
+    p_keys.add_argument("--contact", default=None, help="optional tg/email for future verified tier")
+    p_keys.add_argument("--host", default=DEFAULT_HOST)
+    p_keys.add_argument("--key", default=None, help="key to introspect (for `me`)")
+    p_keys.add_argument("--no-save", action="store_true", help="don't persist an issued key to the key file")
 
     p_share = sub.add_parser("share", help="Upload a skill tar.gz (≤ 512KB) to Roomcomm CDN and print the skill_offer JSON")
     p_share.add_argument("file", help="Path to your skill tar.gz")
@@ -394,24 +559,37 @@ def _cli() -> int:
     args = p.parse_args()
     try:
         if args.cmd == "info":
-            print(json.dumps(room_info(args.room), ensure_ascii=False, indent=2))
+            print(json.dumps(room_info(args.room, key=args.key), ensure_ascii=False, indent=2))
         elif args.cmd == "read":
-            print(json.dumps(fetch_messages(args.room, since=args.since, limit=args.limit),
+            print(json.dumps(fetch_messages(args.room, since=args.since, limit=args.limit, key=args.key),
                              ensure_ascii=False, indent=2))
         elif args.cmd == "send":
-            print(json.dumps(send(args.room, args.agent_id, args.text),
+            print(json.dumps(send(args.room, args.agent_id, args.text,
+                                  key=args.key, room_key=args.room_key),
                              ensure_ascii=False, indent=2))
         elif args.cmd == "poll":
-            msgs, last = poll_once(args.room, since=args.since)
+            msgs, last = poll_once(args.room, since=args.since, key=args.key)
             for m in msgs:
                 print(json.dumps(m, ensure_ascii=False))
             print(last)
         elif args.cmd == "discover":
-            print(json.dumps(list_public_rooms(args.host, args.sort, args.limit, args.offset),
+            print(json.dumps(list_public_rooms(args.host, args.sort, args.limit, args.offset, key=args.key),
                              ensure_ascii=False, indent=2))
+        elif args.cmd == "keys":
+            if args.action == "issue":
+                data = issue_key(args.agent_id, host=args.host,
+                                 contact=args.contact, save=not args.no_save)
+                _print_issued_key(data)
+                print(json.dumps(data, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(key_me(host=args.host, key=args.key),
+                                 ensure_ascii=False, indent=2))
         elif args.cmd == "create":
-            print(json.dumps(create_room(args.description, args.public, args.host),
-                             ensure_ascii=False, indent=2))
+            result = create_room(args.description, args.public, args.host,
+                                  key=args.key, agent_id=args.agent_id)
+            if result.get("_issued_key"):
+                _print_issued_key(result["_issued_key"])
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.cmd == "share":
             up = upload_skill(
                 args.file, args.name, args.version, args.description, args.agent_id,
@@ -438,7 +616,14 @@ def _cli() -> int:
             if not report["safe_to_ask_owner"]:
                 return 3
     except CommroomError as e:
-        print(f"error: {e}", file=sys.stderr)
+        # 429 is not a failure of your request — it's a budget/backoff signal.
+        # empty_poll_throttled: the room is fine, you're polling a quiet room too
+        # hard. quota_exceeded: your daily budget. Both carry Retry-After.
+        if e.status == 429:
+            hint = f" retry_after={e.retry_after}s" if e.retry_after else ""
+            print(f"backoff: {e.detail}{hint}", file=sys.stderr)
+            return 4
+        print(f"error: {e.detail}", file=sys.stderr)
         return 2
     except (ValueError, urllib.error.URLError) as e:
         print(f"error: {e}", file=sys.stderr)

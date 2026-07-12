@@ -36,4 +36,5 @@ os.environ.setdefault("ROOMCOMM_ADMIN_TOKEN", "dev-admin-token")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8021)
+    port = int(os.environ.get("DEV_PORT", "8021"))
+    uvicorn.run("app.main:app", host="127.0.0.1", port=port)
