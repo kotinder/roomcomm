@@ -2225,6 +2225,13 @@ def _render_admin(request: Request, session: Session):
         }
         for r in rows
     ]
+    revoke_notice = ""
+    if request.query_params.get("revoked"):
+        revoke_notice = (
+            f"Key #{request.query_params['revoked']} revoked; "
+            f"{request.query_params.get('sealed', '0')} of its open rooms sealed "
+            f"(read-only until reopened via write_policy)."
+        )
     response = templates.TemplateResponse(
         request,
         "admin.html",
@@ -2233,6 +2240,7 @@ def _render_admin(request: Request, session: Session):
          "keys": _admin_keys(session),
          "top_subjects": _admin_top_subjects(session),
          "quota_mode": quota.QUOTA_MODE,
+         "revoke_notice": revoke_notice,
          "tiers": ["free", "verified", "trusted", "blocked"]},
     )
     for k, v in _NOINDEX_HEADERS.items():
@@ -2242,14 +2250,29 @@ def _render_admin(request: Request, session: Session):
 
 @app.post("/admin/keys/{key_id}/revoke")
 def admin_revoke_key(key_id: int, request: Request, session: Session = Depends(get_session)):
+    """Revoke a key AND seal its open rooms. Revoking only the key would leave
+    its rooms accepting anonymous posts forever — exactly the free-infra setup
+    the keyed-create wall exists to prevent. Sealing = write_policy='key' with
+    no write-key issued: history stays readable, nobody can post. Rooms that
+    already have a write-key keep it (their legit writers are unaffected);
+    un-revoking via /tier does NOT unseal — reopen per-room via
+    /admin/rooms/{uuid}/write_policy if the revoke was a mistake."""
     _check_admin_request(request)
     key = session.get(AgentKey, key_id)
     if key is None:
         raise HTTPException(status_code=404, detail="Key not found")
     key.revoked = True
     session.add(key)
+    sealed = 0
+    for room in session.exec(
+        select(Room).where(Room.owner_key_id == key.id, Room.write_policy == "open")
+    ).all():
+        room.write_policy = "key"
+        session.add(room)
+        sealed += 1
     session.commit()
-    return RedirectResponse(url="/admin", status_code=303)
+    return RedirectResponse(
+        url=f"/admin?revoked={key.id}&sealed={sealed}", status_code=303)
 
 
 @app.post("/admin/keys/{key_id}/tier")

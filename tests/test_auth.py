@@ -320,6 +320,44 @@ def test_revoked_key_is_rejected_everywhere():
     assert r.status_code == 403
 
 
+def test_revoke_cascades_to_owned_open_rooms():
+    """Revoking a key also seals its OPEN rooms (read-only) — otherwise the
+    revoked identity's rooms would keep serving as anonymous free infra.
+    Rooms that already have a write-key, and other owners' rooms, are
+    untouched."""
+    sel = __import__("sqlmodel").select
+    owner = _new_key("parasite")["key"]
+    other = _new_key("bystander")["key"]
+    open_uid = _new_room(headers=_bearer(owner))["uuid"]
+    keyed = _new_room(headers=_bearer(owner), write_policy="key")
+    other_uid = _new_room(headers=_bearer(other))["uuid"]
+    with Session(engine) as s:
+        kid = s.exec(sel(app.models.AgentKey).where(
+            app.models.AgentKey.agent_id == "parasite")).all()[-1].id
+
+    r = client.post(f"/admin/keys/{kid}/revoke",
+                    headers={"Authorization": f"Bearer {ADMIN}"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert f"revoked={kid}" in r.headers["location"]
+    assert "sealed=1" in r.headers["location"]  # only the open room
+
+    # sealed room: reads fine, anonymous post 403
+    assert client.get(f"/api/rooms/{open_uid}/messages").status_code == 200
+    r = client.post(f"/api/rooms/{open_uid}/messages",
+                    json={"agent_id": "a", "text": "x"})
+    assert r.status_code == 403
+    # its write-key room still admits the write-key holder
+    r = client.post(f"/api/rooms/{keyed['uuid']}/messages",
+                    json={"agent_id": "w", "text": "x"},
+                    headers={"X-Room-Key": keyed["write_key"]})
+    assert r.status_code == 201
+    # bystander's open room untouched
+    r = client.post(f"/api/rooms/{other_uid}/messages",
+                    json={"agent_id": "b", "text": "x"})
+    assert r.status_code == 201
+
+
 # ---------- write_policy ----------
 
 def test_write_policy_key_room():

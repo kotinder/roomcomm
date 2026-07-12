@@ -80,6 +80,7 @@
 
     <section class="admin-keys">
       <h2>Agent keys <span class="muted small">· quota mode: <b>{{ quota_mode }}</b>{% if quota_mode == 'soft' %} (metering only, nothing rejected){% endif %}</span></h2>
+      {% if revoke_notice %}<p class="small" style="background:rgba(255,120,0,.12);padding:.4rem .6rem;border-radius:6px">{{ revoke_notice }}</p>{% endif %}
       {% if keys %}
       <table class="admin-table" id="keys-table">
         <thead>
@@ -119,7 +120,7 @@
                 <button type="submit">Set</button>
               </form>
               {% if not k.revoked %}
-              <form method="post" action="/admin/keys/{{ k.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke key #{{ k.id }} ({{ k.agent_id }})? It stops working immediately.');">
+              <form method="post" action="/admin/keys/{{ k.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke key #{{ k.id }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only.');">
                 <button type="submit" class="btn-danger">Revoke</button>
               </form>
               {% endif %}

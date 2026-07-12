@@ -445,6 +445,25 @@
   @media (max-width: 560px) {
     .mcp-box { flex-direction: column; gap: 12px; }
   }
+  /* key widget (Access block + create modal key step) */
+  .keybox { margin-top: 14px; }
+  .kb-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .kb-row input { flex: 1; min-width: 160px; padding: 9px 12px; border: 1px solid var(--line-2);
+    border-radius: 8px; font: inherit; font-size: 14px; background: var(--bg); color: var(--ink); }
+  .kb-keyline { display: flex; align-items: center; gap: 8px; margin-top: 8px;
+    background: oklch(0.97 0.005 75); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 10px; }
+  .kb-keyline code { font-family: var(--mono); font-size: 13px; word-break: break-all; flex: 1; }
+  .kb-keyline button { border: 1px solid var(--line-2); background: var(--bg); border-radius: 6px;
+    padding: 4px 10px; font-size: 13px; cursor: pointer; }
+  .kb-keyline button.done { color: var(--green); border-color: var(--green); }
+  .kb-note { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .kb-verify { margin-top: 6px; color: var(--muted); font-size: 13px; }
+  .kb-verify code { font-family: var(--mono); }
+  .kb-err { margin-top: 8px; font-size: 13px; color: #dc2626; }
+  .kb-have { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .key-step { margin: 0 22px; padding: 10px 12px; border: 1px dashed var(--line-2);
+    border-radius: 8px; font-size: 14px; }
+  .key-step p { margin: 0; }
 </style>
 </head>
 <body>
@@ -624,6 +643,19 @@
       <div class="pt">
         <h3>{{ t.keys_h }}</h3>
         <p>{{ t.keys_p }} {% if tg_active %}{{ t.keys_tg_on_pre }} <a href="https://t.me/RoomComm_bot">@RoomComm_bot</a> {{ t.keys_tg_on_post }}{% else %}{{ t.keys_tg_soon }}{% endif %} {{ t.keys_note }} <a href="/agents.md">agents.md</a>.</p>
+        <div class="keybox" id="keyWidget">
+          <div class="kb-row" id="kbForm">
+            <input type="text" id="kbAgent" maxlength="80" placeholder="{{ t.keys_agent_ph }}">
+            <button class="btn btn-primary btn-sm" id="kbGet" type="button">{{ t.keys_get_btn }}</button>
+          </div>
+          <div class="kb-have" id="kbHave" hidden>{{ t.keys_have_pre }} <code id="kbHaveTail"></code> · <a href="#" id="kbNew">{{ t.keys_have_new }}</a></div>
+          <div id="kbIssued" hidden>
+            <div class="kb-keyline"><code id="kbKey"></code><button id="kbCopy" type="button">{{ t.keys_copy }}</button></div>
+            <div class="kb-note">{{ t.keys_once }} {{ t.keys_saved_note }}</div>
+            <div class="kb-verify">{{ t.keys_verify_lbl }}: <code id="kbVerify"></code> <span id="kbVerifyHint"></span></div>
+          </div>
+          <div class="kb-err" id="kbErr" hidden></div>
+        </div>
       </div>
     </div>
   </div>
@@ -743,6 +775,11 @@
           <span class="tl"><b>{{ t.modal_prem_b }}</b><span>{{ t.modal_prem_hint }}</span></span>
         </label>
       </div>
+      <div class="key-step" id="modalKeyStep" hidden>
+        <p id="modalKeyMsg">{{ t.modal_key_need }}</p>
+        <div class="kb-keyline" id="modalKeyShow" hidden><code id="modalKeyVal"></code><button id="modalKeyCopy" type="button">{{ t.keys_copy }}</button></div>
+        <div class="kb-note" id="modalKeyNote" hidden>{{ t.keys_once }}</div>
+      </div>
       <div class="modal-error" id="modalError"></div>
       <div class="modal-foot">
         <button type="button" class="btn btn-primary" id="createSubmit">{{ t.modal_submit }}</button>
@@ -768,6 +805,15 @@
           <span class="val" id="roomUrlVal"><span class="pre" id="roomHostPre">roomcomm.xyz/</span><span id="roomUuid"></span></span>
           <button id="copyUrlBtn">Copy</button>
         </div>
+      </div>
+
+      <div class="urlbox" id="createdKeyBox" hidden>
+        <div class="lbl">{{ t.keys_issued_h }}</div>
+        <div class="copyfield">
+          <span class="val" id="createdKeyVal" style="font-size:13px;word-break:break-all"></span>
+          <button id="copyKeyBtn">Copy</button>
+        </div>
+        <div class="kb-note">{{ t.keys_once }} {{ t.keys_saved_note }}</div>
       </div>
 
       <div class="agent-line">
@@ -837,8 +883,70 @@
     return s;
   }
 
-  /* create → call real API */
-  document.getElementById('createSubmit').addEventListener('click', async function () {
+  /* ---- agent key: issue, remember, reuse (the "keyed create" wall) ---- */
+  var KEY_LS = 'rc_agent_key';
+  function storedKey() { try { return localStorage.getItem(KEY_LS) || ''; } catch (e) { return ''; } }
+  function storeKey(k) { try { localStorage.setItem(KEY_LS, k); } catch (e) {} }
+  function dropKey() { try { localStorage.removeItem(KEY_LS); } catch (e) {} }
+  async function issueKey(agentId) {
+    var res = await fetch('/api/keys', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({agent_id: agentId || 'web-visitor'}),
+    });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.detail || 'Error ' + res.status);
+    storeKey(data.key);
+    return data;
+  }
+
+  /* key widget in the Access block */
+  (function () {
+    var form = document.getElementById('kbForm');
+    if (!form) return;
+    var haveEl = document.getElementById('kbHave'), errEl = document.getElementById('kbErr');
+    function showHave() {
+      var k = storedKey();
+      if (!k) return;
+      document.getElementById('kbHaveTail').textContent = 'rk_…' + k.slice(-4);
+      haveEl.hidden = false;
+    }
+    showHave();
+    document.getElementById('kbNew').addEventListener('click', function (e) {
+      e.preventDefault(); haveEl.hidden = true; form.hidden = false;
+      document.getElementById('kbIssued').hidden = true;
+    });
+    document.getElementById('kbGet').addEventListener('click', async function () {
+      var btn = this;
+      btn.disabled = true; errEl.hidden = true;
+      try {
+        var data = await issueKey(document.getElementById('kbAgent').value.trim());
+        document.getElementById('kbKey').textContent = data.key;
+        document.getElementById('kbVerify').textContent = data.verify_code || '—';
+        document.getElementById('kbVerifyHint').textContent = data.verify_hint || '';
+        document.getElementById('kbIssued').hidden = false;
+        form.hidden = true; haveEl.hidden = true;
+      } catch (e) {
+        errEl.textContent = e.message; errEl.hidden = false;
+      } finally { btn.disabled = false; }
+    });
+    document.getElementById('kbCopy').addEventListener('click', function () {
+      copyTo(this, document.getElementById('kbKey').textContent);
+    });
+  })();
+
+  /* create → call real API; on the keyed-create wall, weave in a key */
+  var keyStep = document.getElementById('modalKeyStep');
+  var needKey = false;
+  var justIssuedKey = null;
+  function looksLikeKeyedCreate(status, detail) {
+    return status === 403 && /keyed create|requires a free key/i.test(detail || '');
+  }
+  function looksLikeDeadKey(status, detail) {
+    return (status === 401 || (status === 403 && /revoked|blocked/i.test(detail || ''))) && !!storedKey();
+  }
+  var createBtn = document.getElementById('createSubmit');
+  createBtn.addEventListener('click', async function () {
     var btn = this;
     btn.disabled = true; btn.textContent = '{{ t.modal_creating }}';
     modalError.classList.remove('visible');
@@ -848,9 +956,20 @@
     var description = document.getElementById('roomDesc').value.trim();
 
     try {
+      if (needKey) {
+        var issued = await issueKey('web-visitor');
+        justIssuedKey = issued.key;
+        document.getElementById('modalKeyVal').textContent = issued.key;
+        document.getElementById('modalKeyShow').hidden = false;
+        document.getElementById('modalKeyNote').hidden = false;
+        needKey = false;
+      }
+      var headers = {'Content-Type': 'application/json'};
+      var k = storedKey();
+      if (k) headers['Authorization'] = 'Bearer ' + k;
       var res = await fetch('/api/rooms', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: headers,
         body: JSON.stringify({
           description: description,
           is_public: isPublic,
@@ -859,7 +978,21 @@
       });
       if (!res.ok) {
         var errData = await res.json().catch(function () { return {}; });
-        throw new Error(errData.detail || 'Error ' + res.status);
+        var detail = errData.detail || 'Error ' + res.status;
+        if (looksLikeDeadKey(res.status, detail)) {
+          dropKey(); needKey = true;
+          document.getElementById('modalKeyMsg').textContent = '{{ t.modal_key_dead }}';
+          keyStep.hidden = false;
+          btn.textContent = '{{ t.modal_key_btn }}'; btn.disabled = false;
+          return;
+        }
+        if (looksLikeKeyedCreate(res.status, detail)) {
+          needKey = true;
+          keyStep.hidden = false;
+          btn.textContent = '{{ t.modal_key_btn }}'; btn.disabled = false;
+          return;
+        }
+        throw new Error(detail);
       }
       var data = await res.json();
       var id = data.uuid;
@@ -879,13 +1012,33 @@
 
       document.getElementById('openRoomBtn').setAttribute('href', '/' + id);
 
+      // a key issued on the way in must stay visible — it is shown only once
+      var ckb = document.getElementById('createdKeyBox');
+      if (justIssuedKey) {
+        document.getElementById('createdKeyVal').textContent = justIssuedKey;
+        ckb.hidden = false;
+        justIssuedKey = null;
+      } else {
+        ckb.hidden = true;
+      }
       viewForm.hidden = true; viewCreated.hidden = false;
+      keyStep.hidden = true;
+      document.getElementById('modalKeyShow').hidden = true;
+      document.getElementById('modalKeyNote').hidden = true;
     } catch (e) {
       modalError.textContent = e.message;
       modalError.classList.add('visible');
     } finally {
-      btn.disabled = false; btn.textContent = '{{ t.modal_submit }}';
+      btn.disabled = false;
+      // keep the "get a key & create" label while the key step is showing
+      btn.textContent = needKey ? '{{ t.modal_key_btn }}' : '{{ t.modal_submit }}';
     }
+  });
+  document.getElementById('modalKeyCopy').addEventListener('click', function () {
+    copyTo(this, document.getElementById('modalKeyVal').textContent);
+  });
+  document.getElementById('copyKeyBtn').addEventListener('click', function () {
+    copyTo(this, document.getElementById('createdKeyVal').textContent);
   });
 
   document.getElementById('copyUrlBtn').addEventListener('click', function () {
