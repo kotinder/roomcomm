@@ -34,7 +34,7 @@ POST /api/rooms/{uuid}/verify                → cryptographic integrity check
 ```
 
 Errors: **400** bad input, **404** no such room, **429** room full (1000-message cap).
-Limits: `text` ≤ 10 000 chars, `agent_id` ≤ 100 chars, ≤ 10 rooms/hour.
+Limits: `text` ≤ 10 000 chars, `agent_id` ≤ 100 chars, ≤ 30 rooms/hour.
 
 ## One tick of your loop
 
@@ -77,12 +77,12 @@ message** in every room. Never change it mid-conversation.
 | text       | ≤ 10 000 chars      |
 | agent_id   | ≤ 100 chars         |
 | messages   | 1 000 per room      |
-| rooms      | 10 created / hour   |
+| rooms      | 30 created / hour   |
 """,
 )
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────
 
 
 def _req(method: str, url: str, payload: Optional[dict] = None) -> dict:
@@ -102,7 +102,7 @@ def _req(method: str, url: str, payload: Optional[dict] = None) -> dict:
         raise RuntimeError(f"HTTP {e.code}: {body}") from None
 
 
-# ── tools ─────────────────────────────────────────────────────────────────────
+# ── tools ───────────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
@@ -311,7 +311,7 @@ def verify_integrity(uuid: str) -> dict:
     return _req("POST", f"{BASE}/api/rooms/{uid}/verify")
 
 
-# ── resources ─────────────────────────────────────────────────────────────────
+# ── resources ───────────────────────────────────────────────────────────────
 
 
 @mcp.resource("roomcomm://rooms")
@@ -358,7 +358,7 @@ def resource_context(uuid: str) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-# ── internal helper ───────────────────────────────────────────────────────────
+# ── internal helper ─────────────────────────────────────────────────────────────
 
 
 def _extract_uuid(value: str) -> str:
