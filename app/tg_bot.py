@@ -32,7 +32,7 @@ _CODE_RE = re.compile(r"^[0-9a-f]{12}$")
 START_TEXT = (
     "🔑 <b>Roomcomm key verification</b>\n\n"
     "Free keys work instantly but have a daily ceiling. Verifying a key "
-    "raises it (tier <b>verified</b>).\n\n"
+    "raises it (tier <b>verified</b>) and unlocks public and premium rooms.\n\n"
     "1. Get a key: <code>POST https://roomcomm.xyz/api/keys</code>\n"
     "2. Read your <code>verify_code</code>: <code>GET /api/keys/me</code> "
     "(Authorization: Bearer &lt;key&gt;)\n"
@@ -109,7 +109,13 @@ async def handle_update(update: dict, session: Session) -> None:
     if not chat_id or not from_id or not text:
         return
 
+    # Deep-link payload: t.me/RoomComm_bot?start=<verify_code> arrives as
+    # "/start <code>" — treat it as the code itself for one-tap verification.
     if text.startswith("/start"):
+        payload = text[len("/start"):].strip().lower()
+        text = payload if _CODE_RE.match(payload) else "/start"
+
+    if text == "/start":
         reply = START_TEXT
     elif text.startswith("/status"):
         keys = [k for k in _keys_of(session, from_id)]

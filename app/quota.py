@@ -225,6 +225,65 @@ def check_premium_write(room: Room, key: Optional[AgentKey]) -> None:
         raise AuthError(reason, status=403)
 
 
+def _verified_only_reason(lead_anon: str, lead_keyed: str,
+                          key: Optional[AgentKey]) -> Optional[str]:
+    """Shared tail for the verified-tier gates: None if allowed, else reason."""
+    if key is not None and key.tier in PREMIUM_TIERS:
+        return None
+    lead = lead_anon if key is None else lead_keyed
+    if tg_verification_active():
+        return (f"{lead} via Telegram @RoomComm_bot (https://t.me/RoomComm_bot) — "
+                "send the verify_code from GET /api/keys/me.")
+    return f"{lead} via Telegram — key verification is rolling out."
+
+
+def public_create_denied_reason(key: Optional[AgentKey]) -> Optional[str]:
+    """None if ``key`` may create a *public* (listed) room, else a reason.
+
+    Everything anonymous stays private-by-URL; everything on the shared
+    showcase carries an accountable, Telegram-verified human behind it.
+    Anonymous rooms are unlisted-only — omit is_public.
+    """
+    return _verified_only_reason(
+        f"public rooms require a Telegram-verified key. {GET_KEY_HINT}, then verify it",
+        "public rooms require a Telegram-verified key. Verify this key",
+        key,
+    )
+
+
+def premium_create_denied_reason(key: Optional[AgentKey]) -> Optional[str]:
+    """None if ``key`` may create a *premium* room, else a reason.
+
+    The LLM arbiter runs on every premium message — the expensive resource —
+    so creating a premium room, like posting into one, is verified-only.
+    """
+    return _verified_only_reason(
+        f"premium rooms require a Telegram-verified key. {GET_KEY_HINT}, then verify it",
+        "premium rooms require a Telegram-verified key. Verify this key",
+        key,
+    )
+
+
+def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
+    """Gate posting into a *public* room behind a Telegram-verified identity.
+
+    Anyone may read public rooms; posting into them (like creating them) is
+    verified-only, so the showcase can't be flooded or vandalized by mintable
+    anonymous keys. Private rooms are untouched: knowing the URL is enough.
+    """
+    if not room.is_public:
+        return
+    reason = _verified_only_reason(
+        f"this room is public — only Telegram-verified keys may post here. "
+        f"{GET_KEY_HINT}, then verify it",
+        "this room is public — only Telegram-verified keys may post here. "
+        "Verify this key",
+        key,
+    )
+    if reason is not None:
+        raise AuthError(reason, status=403)
+
+
 def subject_of(key: Optional[AgentKey], ip: str) -> str:
     return f"key:{key.id}" if key is not None else f"ip:{ip}"
 

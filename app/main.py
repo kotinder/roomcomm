@@ -31,10 +31,12 @@ ADMIN_TOKEN = os.environ.get("ROOMCOMM_ADMIN_TOKEN", "")
 # Empty = webhook feature off, bot stays outbound-only.
 TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "")
 
-# In-memory rate limit for POST /api/rooms: max 10 creations per hour per IP.
+# In-memory rate limit for POST /api/rooms: max 30 creations per hour per IP.
 # Resets on container restart — that's acceptable for MVP, the goal is to stop
 # obviously broken/abusive auto-spawners, not high-determination attackers.
-ROOM_CREATE_LIMIT = 10
+# Raised 10→30 ahead of Show HN (2026-07): a shared office/NAT IP at 10/hr
+# would lock out an entire HN wave.
+ROOM_CREATE_LIMIT = 30
 ROOM_CREATE_WINDOW = 3600  # seconds
 _create_buckets: dict[str, deque] = defaultdict(deque)
 _create_lock = Lock()
@@ -549,6 +551,19 @@ def create_room(
     # QUOTA_MODE; killswitch quota.KEYED_CREATE=off.
     if key is None and quota.keyed_create_required():
         raise HTTPException(status_code=403, detail=quota.keyed_create_denied_reason())
+    # Public listing requires a Telegram-verified key even when anonymous
+    # creation is allowed: the showcase is the one surface visible to everyone,
+    # so it needs an accountable human behind it. Anonymous rooms stay unlisted.
+    if payload.is_public:
+        reason = quota.public_create_denied_reason(key)
+        if reason is not None:
+            raise HTTPException(status_code=403, detail=reason)
+    # Premium is verified-only end to end: the arbiter burns LLM budget on
+    # every message, so creating the room is gated the same way as posting.
+    if payload.protocol_mode == "premium":
+        reason = quota.premium_create_denied_reason(key)
+        if reason is not None:
+            raise HTTPException(status_code=403, detail=reason)
     _check_quota(session, subject, "room", key)
     description = (payload.description or "").strip()
     if len(description) > 500:
@@ -556,9 +571,6 @@ def create_room(
     # Don't create silently-dead premium rooms: premium without a configured
     # arbiter would accept messages but never extract claims or catch
     # discrepancies. Fail loud instead of degrading to a plain chat.
-    # Anyone may create a premium room; the verified-only gate is on *posting*
-    # into it (see check_premium_write). But refuse premium when no arbiter is
-    # configured — it would accept messages and never extract claims.
     if payload.protocol_mode == "premium" and not llm.is_configured():
         log.error(
             "create_room rejected: premium requested but no LLM arbiter "
@@ -752,6 +764,7 @@ def post_message(
     subject, key = _resolve_subject(request, session)
     try:
         quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+        quota.check_public_write(room, key)
         quota.check_premium_write(room, key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)

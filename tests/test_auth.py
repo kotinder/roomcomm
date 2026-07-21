@@ -213,32 +213,38 @@ def test_per_key_quota_override():
                        json={"agent_id": "v", "text": "x"}).status_code == 429
 
 
-def test_premium_room_is_open_to_create_but_verified_only_to_post():
-    """Anyone may create a premium room, but only a Telegram-verified key may
-    post into it (the LLM arbiter runs on every message)."""
+def test_premium_rooms_are_verified_only():
+    """Premium rooms burn LLM budget, so the whole surface is verified-only:
+    both creating one and posting into it need a Telegram-verified key."""
     key = _new_key("prem-seeker")["key"]
     h = _bearer(key)
 
-    # A free key can CREATE a premium room.
-    room = client.post("/api/rooms", headers=h,
-                       json={"description": "p", "protocol_mode": "premium"})
-    assert room.status_code == 201
-    uid = room.json()["uuid"]
+    # Anonymous and free-key creation both bounce.
+    r = client.post("/api/rooms",
+                    json={"description": "p", "protocol_mode": "premium"})
+    assert r.status_code == 403 and "Telegram-verified" in r.json()["detail"]
+    r = client.post("/api/rooms", headers=h,
+                    json={"description": "p", "protocol_mode": "premium"})
+    assert r.status_code == 403
 
-    # Free key may NOT post into it.
-    free = client.post(f"/api/rooms/{uid}/messages", headers=h,
-                       json={"agent_id": "v", "text": "x"})
-    assert free.status_code == 403 and "Telegram-verified" in free.json()["detail"]
-    # Anonymous also denied.
-    assert client.post(f"/api/rooms/{uid}/messages",
-                       json={"agent_id": "a", "text": "x"}).status_code == 403
-
-    # Elevate to verified (what the Telegram bot does) → posting now allowed.
+    # Elevate to verified (what the Telegram bot does) → create works.
     with Session(engine) as s:
         kid = s.exec(__import__("sqlmodel").select(app.models.AgentKey)).all()[-1].id
     assert client.post(f"/admin/keys/{kid}/tier", data={"tier": "verified"},
                        headers={"Authorization": f"Bearer {ADMIN}"},
                        follow_redirects=False).status_code == 303
+    room = client.post("/api/rooms", headers=h,
+                       json={"description": "p", "protocol_mode": "premium"})
+    assert room.status_code == 201
+    uid = room.json()["uuid"]
+
+    # Posting: free key and anonymous denied, verified posts fine.
+    free = _new_key("prem-free")["key"]
+    r = client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
+                    json={"agent_id": "v", "text": "x"})
+    assert r.status_code == 403 and "Telegram-verified" in r.json()["detail"]
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "x"}).status_code == 403
     ok = client.post(f"/api/rooms/{uid}/messages", headers=h,
                      json={"agent_id": "v", "text": "x"})
     assert ok.status_code == 201
@@ -425,6 +431,44 @@ def test_keyed_create_requires_key():
         assert client.post("/api/rooms", json={"description": "t"}).status_code == 201
     finally:
         quota.KEYED_CREATE = prev
+
+
+def test_public_rooms_are_verified_only():
+    """The whole public surface is Telegram-verified-only: creating a listed
+    room and posting into one both need a verified key. Anonymous private
+    creation and posting stay untouched."""
+    # create gate: anonymous and free key both bounce
+    r = client.post("/api/rooms", json={"description": "t", "is_public": True})
+    assert r.status_code == 403 and "Telegram-verified" in r.json()["detail"]
+    key = _new_key("showcase-owner")["key"]
+    h = _bearer(key)
+    r = client.post("/api/rooms", json={"description": "t", "is_public": True}, headers=h)
+    assert r.status_code == 403
+
+    # anonymous private create is untouched (the wall is only on the showcase)
+    assert client.post("/api/rooms", json={"description": "t"}).status_code == 201
+
+    # elevate to verified (what the Telegram bot does) -> create works and lists
+    with Session(engine) as s:
+        kid = s.exec(__import__("sqlmodel").select(app.models.AgentKey)).all()[-1].id
+    assert client.post(f"/admin/keys/{kid}/tier", data={"tier": "verified"},
+                       headers={"Authorization": f"Bearer {ADMIN}"},
+                       follow_redirects=False).status_code == 303
+    r = client.post("/api/rooms", json={"description": "t", "is_public": True}, headers=h)
+    assert r.status_code == 201
+    uid = r.json()["uuid"]
+    assert uid in {x["uuid"] for x in client.get("/api/rooms").json()["rooms"]}
+
+    # post gate: anonymous and free key denied, verified posts fine
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "hi"}).status_code == 403
+    free = _new_key("free-poster")["key"]
+    r = client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
+                    json={"agent_id": "f", "text": "hi"})
+    assert r.status_code == 403 and "public" in r.json()["detail"]
+    r = client.post(f"/api/rooms/{uid}/messages", headers=h,
+                    json={"agent_id": "v", "text": "hi"})
+    assert r.status_code == 201
 
 
 # ---------- admin: seal an existing room's write policy in place ----------

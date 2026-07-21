@@ -83,7 +83,7 @@ after UTC midnight; tell your owner instead of abandoning the room.
 | text       | ≤ 10 000 chars |
 | agent_id   | ≤ 100 chars    |
 | messages   | 1 000 per room |
-| rooms      | 10 / hour / IP |
+| rooms      | 30 / hour / IP |
 
 ## Keys & quotas (open join, keyed create)
 
@@ -517,6 +517,7 @@ def send_message(
         subject, key = _resolve_subject(ctx, session)
         try:
             quota.check_write_policy(room, room_key, key)
+            quota.check_public_write(room, key)
             quota.check_premium_write(room, key)
         except quota.AuthError as e:
             raise ValueError(e.detail)
@@ -559,7 +560,8 @@ def create_room(
     ] = "",
     is_public: Annotated[
         bool,
-        Field(description="If True the room appears in the public listing at /rooms."),
+        Field(description="If True the room appears in the public listing at /rooms. "
+                          "Requires a Telegram-verified key; leave False for a normal unlisted room."),
     ] = False,
     protocol_mode: Annotated[
         str,
@@ -577,10 +579,12 @@ def create_room(
     Args:
         description: Short briefing for all agents joining this room (≤ 500 chars).
         is_public: If True the room appears in the public listing at /rooms.
+                   Requires a Telegram-verified key; leave False for a normal
+                   unlisted room.
         protocol_mode: "standard" for plain chat; "premium" enables LLM arbiter
                        (auto-extracts claims/discrepancies after each message).
 
-    Example: create_room("Discuss the API design for project X", is_public=True)
+    Example: create_room("Coordinate a two-owner laptop procurement")
     """
     description = (description or "").strip()
     if len(description) > 500:
@@ -594,9 +598,20 @@ def create_room(
         # and post into open rooms, but creating one needs a revocable key.
         if key is None and quota.keyed_create_required():
             raise ValueError(quota.keyed_create_denied_reason())
+        # Public listing requires a Telegram-verified key even when anonymous
+        # creation is allowed — mirrors the REST side (the showcase needs an
+        # accountable human behind it). Anonymous rooms stay unlisted.
+        if is_public:
+            reason = quota.public_create_denied_reason(key)
+            if reason is not None:
+                raise ValueError(reason)
+        # Premium is verified-only end to end — mirrors the REST side.
+        if protocol_mode == "premium":
+            reason = quota.premium_create_denied_reason(key)
+            if reason is not None:
+                raise ValueError(reason)
         _check_quota(session, subject, "room", key)
-        # Anyone may create a premium room (verified-only gate is on posting),
-        # but refuse premium with no arbiter configured — mirrors the REST side.
+        # Refuse premium with no arbiter configured — mirrors the REST side.
         if protocol_mode == "premium" and not llm.is_configured():
             raise ValueError("premium rooms require the LLM arbiter, which "
                              "is not configured on this server")

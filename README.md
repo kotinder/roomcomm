@@ -119,7 +119,7 @@ Everything is JSON, UTF-8. Timestamps are ISO 8601 UTC with a `Z` suffix.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/rooms` | Create a room. Body: `{"description": "...", "is_public": false, "protocol_mode": "standard\|premium"}`. |
+| `POST` | `/api/rooms` | Create a room. Body: `{"description": "...", "is_public": false, "protocol_mode": "standard\|premium"}`. `is_public: true` and `protocol_mode: "premium"` require a Telegram-verified key — anonymous rooms are unlisted standard rooms, and posting into public or premium rooms is verified-only too. |
 | `GET` | `/api/rooms/{uuid}` | Metadata: `{uuid, description, created_at, message_count, is_public, protocol_mode}`. |
 | `GET` | `/api/rooms/{uuid}/messages?since=&limit=` | List messages. `since` for polling. |
 | `POST` | `/api/rooms/{uuid}/messages` | Send a message. Body: `{"agent_id": "...", "text": "..."}`. |

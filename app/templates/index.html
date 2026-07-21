@@ -652,7 +652,7 @@
           <div id="kbIssued" hidden>
             <div class="kb-keyline"><code id="kbKey"></code><button id="kbCopy" type="button">{{ t.keys_copy }}</button></div>
             <div class="kb-note">{{ t.keys_once }} {{ t.keys_saved_note }}</div>
-            <div class="kb-verify">{{ t.keys_verify_lbl }}: <code id="kbVerify"></code> <span id="kbVerifyHint"></span></div>
+            <div class="kb-verify">{{ t.keys_verify_lbl }}: <code id="kbVerify"></code> <a id="kbVerifyGo" target="_blank" rel="noopener" hidden>{{ t.modal_tg_confirm_btn }} →</a> <span id="kbVerifyHint"></span></div>
           </div>
           <div class="kb-err" id="kbErr" hidden></div>
         </div>
@@ -779,6 +779,9 @@
         <p id="modalKeyMsg">{{ t.modal_key_need }}</p>
         <div class="kb-keyline" id="modalKeyShow" hidden><code id="modalKeyVal"></code><button id="modalKeyCopy" type="button">{{ t.keys_copy }}</button></div>
         <div class="kb-note" id="modalKeyNote" hidden>{{ t.keys_once }}</div>
+        <div id="modalVerifyRow" hidden style="margin-top:10px">
+          <a id="modalVerifyLink" class="btn btn-primary btn-sm" target="_blank" rel="noopener">{{ t.modal_tg_confirm_btn }}</a>
+        </div>
       </div>
       <div class="modal-error" id="modalError"></div>
       <div class="modal-foot">
@@ -923,7 +926,14 @@
         var data = await issueKey(document.getElementById('kbAgent').value.trim());
         document.getElementById('kbKey').textContent = data.key;
         document.getElementById('kbVerify').textContent = data.verify_code || '—';
-        document.getElementById('kbVerifyHint').textContent = data.verify_hint || '';
+        var kbGo = document.getElementById('kbVerifyGo');
+        if (data.verify_code && kbGo) {
+          kbGo.setAttribute('href', 'https://t.me/RoomComm_bot?start=' + data.verify_code);
+          kbGo.hidden = false;
+          document.getElementById('kbVerifyHint').textContent = '';
+        } else {
+          document.getElementById('kbVerifyHint').textContent = data.verify_hint || '';
+        }
         document.getElementById('kbIssued').hidden = false;
         form.hidden = true; haveEl.hidden = true;
       } catch (e) {
@@ -941,6 +951,9 @@
   var justIssuedKey = null;
   function looksLikeKeyedCreate(status, detail) {
     return status === 403 && /keyed create|requires a free key/i.test(detail || '');
+  }
+  function looksLikePublicNeedsTg(status, detail) {
+    return status === 403 && /Telegram-verified/i.test(detail || '');
   }
   function looksLikeDeadKey(status, detail) {
     return (status === 401 || (status === 403 && /revoked|blocked/i.test(detail || ''))) && !!storedKey();
@@ -990,6 +1003,33 @@
           needKey = true;
           keyStep.hidden = false;
           btn.textContent = '{{ t.modal_key_btn }}'; btn.disabled = false;
+          return;
+        }
+        if (looksLikePublicNeedsTg(res.status, detail)) {
+          // Weave in the verified path: make sure a key exists, then hand the
+          // user a one-tap Telegram deep link with the verify_code embedded.
+          var vc = null;
+          var k2 = storedKey();
+          if (!k2) {
+            var issued2 = await issueKey('web-visitor');
+            justIssuedKey = issued2.key;
+            document.getElementById('modalKeyVal').textContent = issued2.key;
+            document.getElementById('modalKeyShow').hidden = false;
+            document.getElementById('modalKeyNote').hidden = false;
+            vc = issued2.verify_code || null;
+          } else {
+            try {
+              var meRes = await fetch('/api/keys/me', {headers: {'Authorization': 'Bearer ' + k2}});
+              if (meRes.ok) vc = (await meRes.json()).verify_code || null;
+            } catch (e2) {}
+          }
+          document.getElementById('modalKeyMsg').textContent = '{{ t.modal_public_needs_tg }}';
+          if (vc) {
+            document.getElementById('modalVerifyLink').setAttribute('href', 'https://t.me/RoomComm_bot?start=' + vc);
+            document.getElementById('modalVerifyRow').hidden = false;
+          }
+          keyStep.hidden = false;
+          btn.textContent = '{{ t.modal_retry_btn }}'; btn.disabled = false;
           return;
         }
         throw new Error(detail);

@@ -118,6 +118,22 @@ def test_verify_flow_and_rebind(_tg_env):
         assert k2.tier == "verified" and k2.contact == "tg:42"
 
 
+def test_start_deeplink_binds(_tg_env):
+    """t.me/RoomComm_bot?start=<code> arrives as '/start <code>' — one-tap
+    bind instead of the how-to; junk payloads still get the how-to."""
+    data = _new_key("deeplink")
+    r = _hook(_tg_msg(f"/start {data['verify_code']}", tg_id=55))
+    assert r.status_code == 200
+    reply = next(s[2] for s in _tg_env if s[0] == "reply")
+    assert "verified" in reply
+    with Session(engine) as s:
+        k = s.exec(select(models.AgentKey).where(models.AgentKey.agent_id == "deeplink")).one()
+        assert k.tier == "verified" and k.contact == "tg:55"
+    _tg_env.clear()
+    _hook(_tg_msg("/start notacode", tg_id=56))
+    assert "verify" in _tg_env[0][2].lower()
+
+
 def test_status_command(_tg_env):
     data = _new_key("stat-key")
     _hook(_tg_msg(data["verify_code"], tg_id=99))
