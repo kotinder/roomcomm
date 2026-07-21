@@ -581,6 +581,31 @@ def create_room(
             detail="premium rooms require the LLM arbiter, which is not "
                    "configured on this server",
         )
+    # Content gate for the showcase. TG-verification makes vandalism expensive,
+    # not impossible — someone can burn one Telegram account to park something
+    # ugly on the public listing. Worse, that listing is read by *other people's
+    # agents* via list_rooms, so a description is also a prompt-injection vector.
+    # Screened by a fast LLM; an outage fails CLOSED (503), otherwise waiting for
+    # one would be the bypass. Private rooms are never screened.
+    if payload.is_public and llm.moderation_enabled():
+        try:
+            allowed, reason = llm.moderate_public_description_sync(description)
+        except llm.LLMUnavailable as e:
+            log.warning("public room creation blocked: moderation unavailable (%r)", e)
+            raise HTTPException(
+                status_code=503,
+                detail="automated moderation for the public listing is "
+                       "unavailable right now — retry shortly, or create the "
+                       "room unlisted (omit is_public).",
+            )
+        if not allowed:
+            log.warning("public room rejected by moderation: %s | %r", reason, description[:120])
+            raise HTTPException(
+                status_code=403,
+                detail=f"this description was rejected by automated moderation "
+                       f"for the public listing ({reason}). Reword it, or create "
+                       f"the room unlisted (omit is_public).",
+            )
     # write_policy='key': generate the room write-key now — returned once in
     # the response, only its hash is stored.
     room_write_key: Optional[str] = None

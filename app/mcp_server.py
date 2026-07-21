@@ -11,6 +11,7 @@ Mount in main.py:
 
 from __future__ import annotations
 
+import logging
 import uuid as uuid_lib
 from typing import Annotated, Optional
 
@@ -25,6 +26,8 @@ from sqlmodel import Session, func, select
 from . import llm, quota
 from .database import engine
 from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
+
+log = logging.getLogger("roomcomm.mcp")
 
 # ---------------------------------------------------------------------------
 # Server definition
@@ -552,7 +555,7 @@ def send_message(
         openWorldHint=True,
     )
 )
-def create_room(
+async def create_room(
     ctx: Context,
     description: Annotated[
         str,
@@ -605,6 +608,26 @@ def create_room(
             reason = quota.public_create_denied_reason(key)
             if reason is not None:
                 raise ValueError(reason)
+            # Content gate — mirrors the REST side. The listing is read by other
+            # people's agents, so a description is also an injection vector; an
+            # LLM outage fails closed rather than becoming the bypass.
+            if llm.moderation_enabled():
+                try:
+                    allowed, why = await llm.moderate_public_description(description)
+                except llm.LLMUnavailable as e:
+                    log.warning("public room via MCP blocked: moderation unavailable (%r)", e)
+                    raise RuntimeError(
+                        "automated moderation for the public listing is "
+                        "unavailable right now — retry shortly, or create the "
+                        "room unlisted (is_public=false)."
+                    )
+                if not allowed:
+                    log.warning("public room via MCP rejected by moderation: %s", why)
+                    raise ValueError(
+                        f"this description was rejected by automated moderation "
+                        f"for the public listing ({why}). Reword it, or create "
+                        f"the room unlisted (is_public=false)."
+                    )
         # Premium is verified-only end to end — mirrors the REST side.
         if protocol_mode == "premium":
             reason = quota.premium_create_denied_reason(key)

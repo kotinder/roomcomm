@@ -20,6 +20,11 @@ os.environ.setdefault("NVIDIA_API_KEY", "test-dummy-key")
 # quota.KEYED_CREATE on locally.
 os.environ.setdefault("KEYED_CREATE", "off")
 
+# The public-listing content gate calls a real LLM. Tests must never touch the
+# network, so it's off by default here; the dedicated moderation test turns it
+# back on with a stubbed verdict.
+os.environ.setdefault("ROOMCOMM_MODERATION", "off")
+
 _ROOT = Path(__file__).resolve().parent.parent
 
 
