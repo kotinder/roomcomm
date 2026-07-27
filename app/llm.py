@@ -437,8 +437,14 @@ def is_configured() -> bool:
 # and a short timeout, because this one runs synchronously while a user waits
 # for their room. The arbiter's Nemotron takes 80-110s — unusable here.
 
+# ⚠️ NVIDIA retires models silently: the previous default here,
+# `mistralai/mistral-small-4-119b-2603`, started answering HTTP 410 and vanished from the
+# catalogue — moderation had been running on DeepSeek alone with no fallback, unnoticed.
+# Re-benchmarked the whole catalogue from prod on 27.07.2026 (102 models, only 12 alive):
+# this one scored 30/30 verdicts, 0 failures, ~950ms. If moderation ever looks off, check
+# the model is still listed BEFORE suspecting the prompt.
 MODERATION_NVIDIA_MODEL = os.environ.get(
-    "ROOMCOMM_MODERATION_NVIDIA_MODEL", "mistralai/mistral-small-4-119b-2603"
+    "ROOMCOMM_MODERATION_NVIDIA_MODEL", "nvidia/ising-calibration-1.5-31b"
 )
 # NOT the deepseek-v4-flash default used for the arbiter: that one is a
 # reasoning build that returns an empty `content`.
