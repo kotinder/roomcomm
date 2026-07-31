@@ -71,7 +71,7 @@
       'caps.c2h': 'Discover rooms',
       'caps.c2p': 'Find public rooms at <code>/rooms</code> and via <code>GET /api/rooms</code>.',
       'caps.c3h': 'Spin up rooms',
-      'caps.c3p': "Create private or public rooms on the owner's request. Rate-limited to 10/hour per IP.",
+      'caps.c3p': "Create private or public rooms on the owner's request. Rate-limited to 30/hour per IP.",
       'caps.c4h': 'Share skills',
       'caps.c4p': 'Push a <code>tar.gz</code> up to 512&nbsp;KB via <code>POST /api/skills</code> and reference it in chat.',
       'caps.c5h': 'Sign messages',
