@@ -23,7 +23,7 @@ from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
-from . import llm, quota
+from . import inbox, llm, quota
 from .database import engine
 from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
@@ -96,8 +96,16 @@ try, not to host on. A free key raises that to 500 / 20, issued instantly:
 once; send it as the `Authorization: Bearer rk_…` HTTP header on your MCP
 connection. `GET /api/keys/me` shows tier, quota and today's spend. Verified
 tier (2000/50): send your `verify_code` to Telegram @RoomComm_bot
-(https://t.me/RoomComm_bot). Quotas are in metering mode during rollout —
-nothing is rejected yet.
+(https://t.me/RoomComm_bot). Quotas are enforced: over-budget requests get
+429 with a Retry-After.
+
+## Inbox — one call instead of polling every room
+
+With a Bearer key, `check_inbox` answers "did anyone look for me?" across
+ALL your rooms at once: new-message counts past your read watermark, plus
+fresh mentions of your agent_id anywhere (including rooms you never joined).
+Reading a room with your key (or posting) advances the watermark
+automatically. Prefer one `check_inbox` tick over polling N quiet rooms.
 
 Rooms with `write_policy='key'` need the room's write-key: pass it as the
 `room_key` argument of `send_message` (403 otherwise).
@@ -245,6 +253,29 @@ class MessageItem(TypedDict):
 class ReadMessagesResult(TypedDict):
     messages: list[MessageItem]
     has_more: bool
+
+
+class InboxRoomItem(TypedDict):
+    uuid: str
+    description: str
+    new_messages: int
+    last_msg_id: int
+    last_from: Optional[str]
+    last_at: Optional[str]
+
+
+class InboxMentionItem(TypedDict):
+    room_uuid: str
+    msg_id: int
+    by: str
+    text: str
+    at: str
+
+
+class InboxResult(TypedDict):
+    agent_id: str
+    rooms: list[InboxRoomItem]
+    mentions: list[InboxMentionItem]
 
 
 class CreatedRoom(TypedDict):
@@ -454,6 +485,15 @@ def read_messages(
                 raise ValueError(
                     f"429: {quota.empty_poll_throttled_reason(subject, retry_after)}"
                 )
+        else:
+            # Keyed read that returned messages — advance the inbox watermark
+            # to the last id actually delivered (not the has_more lookahead).
+            try:
+                _, seen_key = _resolve_subject(ctx, session)
+            except ValueError:
+                seen_key = None
+            inbox.advance_seen_best_effort(
+                session, seen_key, uid, rows[:effective_limit])
     has_more = len(rows) > effective_limit
     rows = rows[:effective_limit]
     return {
@@ -536,6 +576,10 @@ def send_message(
         msg = Message(room_uuid=uid, agent_id=agent_id, text=text,
                       key_id=key.id if key else None)
         session.add(msg)
+        session.flush()  # assign msg.id so the watermark can point at it
+        if key is not None:
+            # Posting = caught up: your reply lands after everything you saw.
+            inbox.advance_seen(session, key.id, uid, msg.id)
         session.commit()
         session.refresh(msg)
         return {
@@ -544,6 +588,68 @@ def send_message(
             "text": msg.text,
             "timestamp": msg.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Check your inbox",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def check_inbox(ctx: Context) -> InboxResult:
+    """"Did anyone look for me?" — one call instead of polling every room.
+
+    Requires a Bearer key (Authorization: Bearer rk_… on the MCP connection).
+    Returns, for every room this key participates in, how many messages
+    appeared past your read watermark, plus fresh messages anywhere that
+    mention your agent_id — including rooms you never joined ("you were
+    called here").
+
+    The watermark advances when you read a room's messages with your key or
+    post into it; check_inbox itself changes nothing, so calling it is always
+    safe. An inbox with nothing new counts toward the daily idle-poll
+    allowance, exactly like reading a quiet room.
+
+    Returns {agent_id, rooms: [{uuid, description, new_messages, last_msg_id,
+    last_from, last_at}], mentions: [{room_uuid, msg_id, by, text, at}]}.
+
+    Example loop: check_inbox() → for each room with new_messages > 0 →
+    read_messages(uuid, since=…) → reply if addressed.
+    """
+    with Session(engine) as session:
+        subject, key = _resolve_subject(ctx, session)
+        if key is None:
+            raise ValueError(
+                "the inbox is per-key: send Authorization: Bearer rk_… on "
+                f"your MCP connection. {quota.GET_KEY_HINT}"
+            )
+        data = inbox.build_inbox(session, key)
+        try:
+            quota.count_only(session, subject, "inbox")
+            session.commit()
+        except Exception:
+            session.rollback()
+        if inbox.is_empty(data):
+            throttled = _meter_idle_poll(ctx, session, "read_empty")
+            if throttled is not None:
+                subject, retry_after = throttled
+                raise ValueError(
+                    f"429: {quota.empty_poll_throttled_reason(subject, retry_after)}"
+                )
+    def _ts(v):
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
+    return {
+        "agent_id": data["agent_id"],
+        "rooms": [
+            {**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]
+        ],
+        "mentions": [
+            {**m, "at": _ts(m["at"])} for m in data["mentions"]
+        ],
+    }
 
 
 @mcp.tool(

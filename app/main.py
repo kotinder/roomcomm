@@ -137,11 +137,11 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, llm, notify, pcis, quota, tg_bot
+from . import i18n, inbox, llm, notify, pcis, quota, tg_bot
 from .database import SKILLS_DIR, engine, get_session, init_db
 from .models import (
     AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
-    Room, Skill, UsageCounter, utcnow,
+    Room, RoomSeen, Skill, UsageCounter, utcnow,
 )
 from .schemas import (
     ClaimIn,
@@ -149,6 +149,9 @@ from .schemas import (
     DiscrepancyOut,
     HandshakeIn,
     HandshakeOut,
+    InboxMentionOut,
+    InboxOut,
+    InboxRoomOut,
     KeyCreate,
     KeyMeOut,
     KeyOut,
@@ -537,6 +540,46 @@ def key_me(request: Request, session: Session = Depends(get_session)):
         contact=key.contact,
     )
 
+@app.get("/api/me/inbox", response_model=InboxOut)
+def my_inbox(request: Request, session: Session = Depends(get_session)):
+    """"Did anyone look for me?" — cross-room digest for the presented key.
+
+    One call instead of polling every room: what's new past this key's read
+    watermark in each room it participates in, plus fresh mentions of its
+    agent_id anywhere (including rooms it never joined). Reading a room's
+    messages with the Bearer key advances the watermark; so does posting.
+    The inbox itself is side-effect-free.
+
+    An inbox with nothing new counts toward the idle-poll allowance exactly
+    like an empty room read — the point of the inbox is to make one poll do
+    the work of many, not to hand out a free polling channel.
+    """
+    subject, key = _resolve_subject(request, session)
+    if key is None:
+        raise HTTPException(
+            status_code=401,
+            detail="the inbox is per-key: send Authorization: Bearer <key>. "
+                   + quota.GET_KEY_HINT,
+        )
+    data = inbox.build_inbox(session, key)
+    try:
+        quota.count_only(session, subject, "inbox")
+        session.commit()  # also persists last_used_at touched by resolve_key
+    except Exception:
+        log.debug("inbox metering failed", exc_info=True)
+        session.rollback()
+    if inbox.is_empty(data):
+        throttled = _meter_idle_poll(session, request, "read_empty")
+        if throttled is not None:
+            subject, retry_after = throttled
+            raise HTTPException(
+                status_code=429,
+                detail=quota.empty_poll_throttled_reason(subject, retry_after),
+                headers={"Retry-After": str(retry_after)},
+            )
+    return InboxOut(**data)
+
+
 @app.post("/api/rooms", response_model=RoomCreateOut, status_code=201)
 def create_room(
     payload: RoomCreate,
@@ -765,6 +808,14 @@ def list_messages(
                 detail=quota.empty_poll_throttled_reason(subject, retry_after),
                 headers={"Retry-After": str(retry_after)},
             )
+    elif request.headers.get("authorization"):
+        # Keyed read that returned messages — advance the inbox watermark to
+        # the last id actually delivered. A bad key just skips the bookkeeping.
+        try:
+            seen_key = quota.resolve_key(session, request.headers.get("authorization"))
+        except quota.AuthError:
+            seen_key = None
+        inbox.advance_seen_best_effort(session, seen_key, room_uuid, rows)
     return MessagesPage(
         messages=[
             MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp)
@@ -855,6 +906,10 @@ def post_message(
         from datetime import datetime as _dt
         msg.timestamp = _dt.fromisoformat(ts_iso.replace("Z", "+00:00"))
     session.add(msg)
+    session.flush()  # assign msg.id so the watermark below can point at it
+    if key is not None:
+        # Posting = caught up: your reply lands after everything you saw.
+        inbox.advance_seen(session, key.id, room_uuid, msg.id)
     session.commit()
     session.refresh(msg)
 
@@ -2375,6 +2430,7 @@ def admin_delete_room(
     session.exec(delete(Discrepancy).where(Discrepancy.room_uuid == room_uuid))
     session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))
     session.exec(delete(Message).where(Message.room_uuid == room_uuid))
+    session.exec(delete(RoomSeen).where(RoomSeen.room_uuid == room_uuid))
     session.delete(room)
     session.commit()
     response = RedirectResponse(url="/admin", status_code=303)

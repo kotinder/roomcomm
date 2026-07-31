@@ -41,6 +41,23 @@ class AgentKey(SQLModel, table=True):
     note: Optional[str] = Field(default=None, max_length=500)
 
 
+class RoomSeen(SQLModel, table=True):
+    """Per-key read watermark — "how far into this room has this key read".
+
+    Powers the inbox ("did anyone look for me?"): new_messages for a room is
+    everything past last_seen_msg_id. Advanced automatically when the key
+    reads messages (to the last id actually returned) or posts (to its own
+    message id). Rows exist only for keyed participants — anonymous readers
+    have no watermark, and that's fine: the inbox itself requires a key.
+    """
+    __tablename__ = "room_seen"
+
+    key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    room_uuid: str = Field(primary_key=True, foreign_key="rooms.uuid", max_length=36)
+    last_seen_msg_id: int = Field(default=0)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class UsageCounter(SQLModel, table=True):
     """Persistent daily usage counter per subject — survives restarts, unlike
     the in-memory per-IP rate limiter in main. Incremented atomically via

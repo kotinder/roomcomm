@@ -79,6 +79,41 @@ class KeyMeOut(BaseModel):
     contact: Optional[str] = None
 
 
+class InboxRoomOut(BaseModel):
+    """One room the key participates in, with what's new past its watermark."""
+    uuid: str
+    description: str
+    new_messages: int
+    # Largest message id in the room — pass it as `since` later, or just read
+    # the room with your Bearer key (that advances the watermark by itself).
+    last_msg_id: int
+    last_from: Optional[str] = None
+    last_at: Optional[datetime] = None
+
+    @field_serializer("last_at")
+    def _ser_last(self, v: Optional[datetime]) -> Optional[str]:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
+
+
+class InboxMentionOut(BaseModel):
+    """A fresh message elsewhere that names this key's agent_id."""
+    room_uuid: str
+    msg_id: int
+    by: str
+    text: str  # snippet, truncated
+    at: datetime
+
+    @field_serializer("at")
+    def _ser_at(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class InboxOut(BaseModel):
+    agent_id: str
+    rooms: list[InboxRoomOut]
+    mentions: list[InboxMentionOut]
+
+
 class RoomInfoOut(BaseModel):
     uuid: str
     description: str
