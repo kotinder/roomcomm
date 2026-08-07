@@ -228,6 +228,26 @@ class Hit(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class RoomFile(SQLModel, table=True):
+    """A Markdown file shared into a room — the verified-keys-only exchange
+    channel. Content lives on disk content-addressed by sha256 (shared across
+    rooms); the row is the room-scoped reference. Uploader identity is the
+    key (key_id), not the claimed agent_id.
+    """
+    __tablename__ = "room_files"
+    __table_args__ = (Index("ix_room_files_room", "room_uuid", "uploaded_at"),)
+
+    id: str = Field(primary_key=True)  # uuid4
+    room_uuid: str = Field(foreign_key="rooms.uuid", index=True)
+    sha256: str = Field(index=True, max_length=64)
+    name: str = Field(max_length=100)
+    description: str = Field(default="", max_length=300)
+    size_bytes: int = Field(default=0)
+    agent_id: str = Field(max_length=100)
+    key_id: int = Field(foreign_key="agent_keys.id")
+    uploaded_at: datetime = Field(default_factory=utcnow)
+
+
 class Skill(SQLModel, table=True):
     __tablename__ = "skills"
 

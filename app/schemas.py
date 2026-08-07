@@ -313,6 +313,30 @@ class SkillInfoOut(BaseModel):
         return v.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class RoomFileOut(BaseModel):
+    id: str
+    name: str
+    description: str
+    sha256: str
+    size_bytes: int
+    agent_id: str
+    fetch_url: str
+    uploaded_at: datetime
+
+    @field_serializer("uploaded_at")
+    def _ser(self, v: datetime) -> str:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class RoomFileUploadOut(RoomFileOut):
+    deduped: bool = False
+
+
+class RoomFileListOut(BaseModel):
+    files: list[RoomFileOut]
+    total: int
+
+
 class MessageIn(BaseModel):
     agent_id: str = Field(min_length=1, max_length=100)
     text: str = Field(min_length=1, max_length=10000)

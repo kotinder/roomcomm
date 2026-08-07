@@ -19,7 +19,7 @@ from typing import Optional
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, delete, select, func
@@ -47,6 +47,13 @@ SKILL_UPLOAD_WINDOW = 3600
 SKILL_MAX_BYTES = 512 * 1024
 _skill_buckets: dict[str, deque] = defaultdict(deque)
 _skill_lock = Lock()
+
+# Room-file (MD exchange) upload limits — same bucket shape as skills. The
+# real gate is the verified tier; this only stops a runaway verified client.
+FILE_UPLOAD_LIMIT = 20
+FILE_UPLOAD_WINDOW = 3600
+_file_buckets: dict[str, deque] = defaultdict(deque)
+_file_lock = Lock()
 
 # Key issuance burst limit — anti key-farming (keys are free and instant,
 # so this plus the modest per-key quota is what makes farming unprofitable).
@@ -121,6 +128,11 @@ def _check_skill_rate(request: Request) -> None:
                        SKILL_UPLOAD_LIMIT, SKILL_UPLOAD_WINDOW, "skill uploads")
 
 
+def _check_file_rate(request: Request) -> None:
+    _check_bucket_rate(request, _file_buckets, _file_lock,
+                       FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads")
+
+
 def _check_key_rate(request: Request) -> None:
     _check_bucket_rate(request, _key_buckets, _key_lock,
                        KEY_CREATE_LIMIT, KEY_CREATE_WINDOW, "keys issued")
@@ -137,7 +149,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, inbox, llm, notify, pcis, quota, tg_bot
+from . import files, i18n, inbox, llm, notify, pcis, quota, tg_bot
 from .database import SKILLS_DIR, engine, get_session, init_db
 from .models import (
     AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
@@ -164,6 +176,9 @@ from .schemas import (
     RevisionOut,
     RoomCreate,
     RoomCreateOut,
+    RoomFileListOut,
+    RoomFileOut,
+    RoomFileUploadOut,
     RoomInfoOut,
     RoomListItem,
     RoomListPage,
@@ -222,6 +237,8 @@ _UUID_PAGE_RE = re.compile(
     r"^/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 _MSG_POST_RE = re.compile(r"^/api/rooms/[^/]+/messages$")
+_FILE_POST_RE = re.compile(r"^/api/rooms/[^/]+/files$")
+_FILE_GET_RE = re.compile(r"^/api/rooms/[^/]+/files/")
 
 
 def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
@@ -237,6 +254,8 @@ def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
             return "message"
         if path == "/api/skills":
             return "skill_upload"
+        if _FILE_POST_RE.match(path):
+            return "file_upload"
     elif method == "GET":
         if path in ("/", "/rooms"):
             return "landing"
@@ -244,6 +263,8 @@ def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
             return "room_view"
         if path.startswith("/api/skills/"):
             return "skill_download"
+        if _FILE_GET_RE.match(path):
+            return "file_download"
     return None
 
 
@@ -1918,6 +1939,165 @@ def download_skill(
     )
 
 
+# ---------- Room files (verified-only MD exchange) ----------
+# Agents in a room exchange Markdown documents — briefs, drafts, contracts —
+# too big or too durable for the message stream. The channel is gated behind
+# the Telegram-verified tier in BOTH directions (upload and download): every
+# transfer has an accountable human on each end, so the file store can't be
+# used as an anonymous dead-drop. Core logic lives in files.py (shared with
+# the MCP tools); these handlers translate it to HTTP.
+
+def file_exchange_enabled() -> bool:
+    """MD file exchange is on by default; disable with ROOMCOMM_FILE_EXCHANGE=0."""
+    return os.environ.get("ROOMCOMM_FILE_EXCHANGE", "on").strip().lower() \
+        not in {"0", "false", "no", "off"}
+
+
+def _require_file_exchange() -> None:
+    if not file_exchange_enabled():
+        raise HTTPException(status_code=404, detail="file exchange is disabled")
+
+
+def _room_file_out(request: Request, rf, deduped: Optional[bool] = None):
+    base = str(request.base_url).rstrip("/")
+    kwargs = dict(
+        id=rf.id,
+        name=rf.name,
+        description=rf.description,
+        sha256=rf.sha256,
+        size_bytes=rf.size_bytes,
+        agent_id=rf.agent_id,
+        fetch_url=f"{base}/api/rooms/{rf.room_uuid}/files/{rf.id}",
+        uploaded_at=rf.uploaded_at,
+    )
+    if deduped is None:
+        return RoomFileOut(**kwargs)
+    return RoomFileUploadOut(**kwargs, deduped=deduped)
+
+
+def _file_exchange_key(request: Request, session: Session) -> AgentKey:
+    """Resolve and gate the caller for any file-exchange operation:
+    valid Bearer key of tier verified/trusted, else 401/403."""
+    _, key = _resolve_subject(request, session)
+    try:
+        quota.check_file_exchange(key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return key
+
+
+@app.post("/api/rooms/{room_uuid}/files", response_model=RoomFileUploadOut,
+          status_code=201, dependencies=[Depends(_require_file_exchange)])
+async def upload_room_file(
+    room_uuid: str,
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form("", max_length=100),
+    description: str = Form("", max_length=300),
+    agent_id: str = Form("", max_length=100),
+    session: Session = Depends(get_session),
+):
+    """Share a Markdown file (≤ 256 KB, UTF-8) into a room.
+
+    Requires a Telegram-verified key. Write-protected rooms additionally need
+    the room write-key (X-Room-Key header) unless you own the room. Dedup per
+    (room, sha256): re-sharing the same bytes returns the existing record with
+    `deduped: true`.
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    room = _get_room_or_404(session, room_uuid)
+    key = _file_exchange_key(request, session)
+    try:
+        quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    _check_file_rate(request)
+
+    data = await file.read(files.MAX_BYTES + 1)
+    try:
+        rf, deduped = files.store(
+            session, room, key,
+            agent_id=(agent_id or "").strip() or key.agent_id or "unknown",
+            name=name or file.filename,
+            data=data,
+            description=description,
+        )
+    except files.FileError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return _room_file_out(request, rf, deduped=deduped)
+
+
+@app.get("/api/rooms/{room_uuid}/files", response_model=RoomFileListOut,
+         dependencies=[Depends(_require_file_exchange)])
+def list_room_files(
+    room_uuid: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """List the files shared into a room. Verified keys only."""
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    _file_exchange_key(request, session)
+    session.commit()  # persist last_used_at touched by resolve_key
+    rows = files.list_room_files(session, room_uuid)
+    return RoomFileListOut(
+        files=[_room_file_out(request, rf) for rf in rows],
+        total=len(rows),
+    )
+
+
+@app.get("/api/rooms/{room_uuid}/files/{file_id}",
+         dependencies=[Depends(_require_file_exchange)])
+def download_room_file(
+    room_uuid: str,
+    file_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Fetch a shared file's Markdown content. Verified keys only.
+
+    Served through the app (not the nginx CDN) precisely because the download
+    side of the exchange is auth-gated too.
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    _file_exchange_key(request, session)
+    session.commit()  # persist last_used_at touched by resolve_key
+    try:
+        rf = files.get_room_file(session, room_uuid, file_id)
+        content = files.load_content(rf)
+    except files.FileError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'inline; filename="{rf.name}"'},
+    )
+
+
+@app.delete("/api/rooms/{room_uuid}/files/{file_id}", status_code=204,
+            dependencies=[Depends(_require_file_exchange)])
+def delete_room_file(
+    room_uuid: str,
+    file_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Delete a shared file — only the key that uploaded it may do so."""
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    key = _file_exchange_key(request, session)
+    try:
+        rf = files.get_room_file(session, room_uuid, file_id)
+    except files.FileError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    if rf.key_id != key.id:
+        raise HTTPException(status_code=403,
+                            detail="only the key that shared this file may delete it")
+    files.delete(session, rf)
+    return Response(status_code=204)
+
+
 # ---------- HTML ----------
 
 @app.get("/", response_class=HTMLResponse)
@@ -2149,6 +2329,8 @@ STATS_EVENTS = [
     ("mcp_hint", "MCP page"),
     ("skill_download", "Skill DL"),
     ("skill_upload", "Skill UL"),
+    ("file_download", "File DL"),
+    ("file_upload", "File UL"),
 ]
 
 

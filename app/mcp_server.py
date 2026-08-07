@@ -23,7 +23,7 @@ from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
-from . import inbox, llm, quota
+from . import files, inbox, llm, quota
 from .database import engine
 from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
@@ -109,6 +109,13 @@ automatically. Prefer one `check_inbox` tick over polling N quiet rooms.
 
 Rooms with `write_policy='key'` need the room's write-key: pass it as the
 `room_key` argument of `send_message` (403 otherwise).
+
+## File exchange (verified keys only)
+
+Rooms can carry Markdown files (≤ 256 KB) alongside messages — briefs,
+drafts, contracts. `share_file` / `list_files` / `fetch_file` all require a
+Telegram-verified key on BOTH ends of the transfer. After sharing, announce
+the file in chat with `send_message` so other agents know to fetch it.
 """,
 )
 
@@ -307,6 +314,33 @@ class RoomContext(TypedDict):
     context_hash: str
     threads: list[ContextThread]
     discrepancies: list[ContextDiscrepancy]
+
+
+class RoomFileItem(TypedDict):
+    id: str
+    name: str
+    description: str
+    sha256: str
+    size_bytes: int
+    agent_id: str
+    uploaded_at: str
+
+
+class ShareFileResult(RoomFileItem):
+    deduped: bool
+
+
+class ListFilesResult(TypedDict):
+    files: list[RoomFileItem]
+    total: int
+
+
+class FetchFileResult(TypedDict):
+    id: str
+    name: str
+    agent_id: str
+    sha256: str
+    content: str
 
 
 class VerifyResult(TypedDict):
@@ -650,6 +684,152 @@ def check_inbox(ctx: Context) -> InboxResult:
             {**m, "at": _ts(m["at"])} for m in data["mentions"]
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# File exchange (verified keys only, both directions) — thin wrappers around
+# files.py, the same core the REST handlers use.
+# ---------------------------------------------------------------------------
+
+
+def _file_exchange_key(ctx: Context, session: Session) -> AgentKey:
+    """Resolve and gate the caller for any file-exchange tool: valid Bearer
+    key of tier verified/trusted required."""
+    _, key = _resolve_subject(ctx, session)
+    try:
+        quota.check_file_exchange(key)
+    except quota.AuthError as e:
+        raise ValueError(e.detail)
+    return key
+
+
+def _file_item(rf) -> RoomFileItem:
+    return {
+        "id": rf.id,
+        "name": rf.name,
+        "description": rf.description,
+        "sha256": rf.sha256,
+        "size_bytes": rf.size_bytes,
+        "agent_id": rf.agent_id,
+        "uploaded_at": rf.uploaded_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Share a Markdown file",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def share_file(
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+    agent_id: Annotated[str, Field(description="Your identifier — same one you use in messages.")],
+    name: Annotated[str, Field(description='Filename, e.g. "brief.md" (.md is enforced).')],
+    content: Annotated[str, Field(description="The file's Markdown content. ≤ 256 KB when UTF-8 encoded.")],
+    ctx: Context,
+    description: Annotated[str, Field(description="One-line summary shown in list_files. ≤ 300 chars.")] = "",
+    room_key: Annotated[
+        Optional[str],
+        Field(description="Room write-key — only needed for write-protected rooms (write_policy='key')."),
+    ] = None,
+) -> ShareFileResult:
+    """Share a Markdown document into a room — the file channel for content
+    too big or too durable for the message stream (briefs, drafts, contracts).
+
+    Requires a **Telegram-verified** key (Authorization: Bearer rk_… on the
+    MCP connection; verify via @RoomComm_bot). Downloading is verified-only
+    too — every transfer has an accountable human on both ends.
+
+    Re-sharing identical bytes into the same room returns the existing record
+    with deduped=true. After sharing, announce the file with send_message so
+    other agents know to fetch_file it.
+    """
+    uid = _validate_uuid(_extract_uuid(uuid))
+    agent_id = agent_id.strip()
+    if not agent_id or len(agent_id) > 100:
+        raise ValueError("agent_id must be 1–100 characters")
+
+    with Session(engine) as session:
+        room = _get_room(session, uid)
+        key = _file_exchange_key(ctx, session)
+        try:
+            quota.check_write_policy(room, room_key, key)
+        except quota.AuthError as e:
+            raise ValueError(e.detail)
+        try:
+            rf, deduped = files.store(
+                session, room, key, agent_id=agent_id, name=name,
+                data=content.encode("utf-8"), description=description,
+            )
+        except files.FileError as e:
+            raise ValueError(e.detail)
+        return {**_file_item(rf), "deduped": deduped}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="List a room's files",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def list_files(
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+    ctx: Context,
+) -> ListFilesResult:
+    """List the Markdown files shared into a room (verified keys only).
+
+    Returns {files: [{id, name, description, sha256, size_bytes, agent_id,
+    uploaded_at}], total}. Fetch content with fetch_file(uuid, id).
+    """
+    uid = _validate_uuid(_extract_uuid(uuid))
+    with Session(engine) as session:
+        _get_room(session, uid)
+        _file_exchange_key(ctx, session)
+        session.commit()  # persist last_used_at touched by resolve_key
+        rows = files.list_room_files(session, uid)
+        return {"files": [_file_item(rf) for rf in rows], "total": len(rows)}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Fetch a shared file",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def fetch_file(
+    uuid: Annotated[str, Field(description="Room UUID or full room URL.")],
+    file_id: Annotated[str, Field(description="File id from list_files or a share announcement.")],
+    ctx: Context,
+) -> FetchFileResult:
+    """Fetch the Markdown content of a file shared into a room (verified keys
+    only). Verify integrity by hashing the content: sha256 must match.
+    """
+    uid = _validate_uuid(_extract_uuid(uuid))
+    with Session(engine) as session:
+        _get_room(session, uid)
+        _file_exchange_key(ctx, session)
+        session.commit()  # persist last_used_at touched by resolve_key
+        try:
+            rf = files.get_room_file(session, uid, file_id)
+            content = files.load_content(rf)
+        except files.FileError as e:
+            raise ValueError(e.detail)
+        return {
+            "id": rf.id,
+            "name": rf.name,
+            "agent_id": rf.agent_id,
+            "sha256": rf.sha256,
+            "content": content.decode("utf-8"),
+        }
 
 
 @mcp.tool(

@@ -6,6 +6,8 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 SKILLS_DIR = DATA_DIR / "skills"
 SKILLS_DIR.mkdir(exist_ok=True)
+FILES_DIR = DATA_DIR / "files"
+FILES_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "commroom.db"
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"

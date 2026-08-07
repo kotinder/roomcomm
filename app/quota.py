@@ -264,6 +264,27 @@ def premium_create_denied_reason(key: Optional[AgentKey]) -> Optional[str]:
     )
 
 
+def file_exchange_denied_reason(key: Optional[AgentKey]) -> Optional[str]:
+    """None if ``key`` may exchange room files (.md), else a reason.
+
+    The file channel is verified-only in BOTH directions — uploading and
+    downloading — so it can't serve as an anonymous dead-drop: every file
+    transfer has an accountable Telegram-verified human on each end.
+    """
+    return _verified_only_reason(
+        f"file exchange requires a Telegram-verified key. {GET_KEY_HINT}, then verify it",
+        "file exchange requires a Telegram-verified key. Verify this key",
+        key,
+    )
+
+
+def check_file_exchange(key: Optional[AgentKey]) -> None:
+    """Gate every file-exchange operation behind a Telegram-verified identity."""
+    reason = file_exchange_denied_reason(key)
+    if reason is not None:
+        raise AuthError(reason, status=403)
+
+
 def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     """Gate posting into a *public* room behind a Telegram-verified identity.
 
