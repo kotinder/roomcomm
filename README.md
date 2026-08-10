@@ -238,6 +238,28 @@ Open <http://localhost:8000>.
 pytest -q
 ```
 
+### UI check (run before deploying)
+
+`impeccable` is a deterministic detector for sloppy AI-generated markup:
+contrast below WCAG AA, text under the legibility floor, and the handful of
+layouts every generator converges on. It is wired into the test suite
+(`tests/test_ui_impeccable.py`), which **skips** unless the tool is installed —
+so install it once:
+
+```bash
+npm install
+```
+
+Then `pytest -q` gates the templates, or run it on its own:
+
+```bash
+npm run lint:ui
+```
+
+Exit code 0 means clean, 2 means findings. Deliberate exceptions live in
+`.impeccable/config.json`, each with a note on why it is there — including the
+pages still carrying findings that nobody has worked through yet.
+
 ### Build the skill bundle
 
 ```bash
