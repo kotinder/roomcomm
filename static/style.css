@@ -127,7 +127,6 @@ footer { margin-top: 40px; }
 .description {
   color: var(--muted);
   background: var(--card);
-  border-left: 3px solid var(--accent);
   padding: 8px 12px;
   border-radius: 4px;
 }
@@ -393,9 +392,11 @@ footer { margin-top: 40px; }
   border-radius: 4px;
   background: #fff;
 }
-.disc-low    { border-left: 3px solid #f0c040; }
-.disc-medium { border-left: 3px solid #e8761e; }
-.disc-high   { border-left: 3px solid #d23333; background: #fff3f3; }
+/* важность несёт подпись .disc-sev (цвет + текст) и общий тон строки;
+   цветная планка сбоку была вторым кодированием того же самого */
+.disc-low    { background: #fffbf0; }
+.disc-medium { background: #fff7ef; }
+.disc-high   { background: #fff3f3; }
 .disc-sev {
   font-size: 0.72em; font-weight: 700;
   padding: 1px 6px; border-radius: 3px;
