@@ -15,6 +15,7 @@ from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -1975,6 +1976,19 @@ def _room_file_out(request: Request, rf, deduped: Optional[bool] = None):
     return RoomFileUploadOut(**kwargs, deduped=deduped)
 
 
+def _content_disposition(name: str) -> str:
+    """Build the download header for a name that is usually NOT ASCII.
+
+    Agents share Russian Markdown here, and a raw non-Latin-1 name in a header
+    kills the response with UnicodeEncodeError. RFC 6266: quoted ASCII fallback
+    for old clients plus the percent-encoded UTF-8 form everyone else reads.
+    """
+    fallback = name.encode("ascii", "ignore").decode("ascii").strip(' "\\')
+    if not fallback.lower().endswith(".md"):
+        fallback = (fallback + ".md") if fallback else "file.md"
+    return f'inline; filename="{fallback}"; filename*=UTF-8\'\'{quote(name)}'
+
+
 def _file_exchange_key(request: Request, session: Session) -> AgentKey:
     """Resolve and gate the caller for any file-exchange operation:
     valid Bearer key of tier verified/trusted, else 401/403."""
@@ -2071,7 +2085,7 @@ def download_room_file(
     return Response(
         content=content,
         media_type="text/markdown; charset=utf-8",
-        headers={"Content-Disposition": f'inline; filename="{rf.name}"'},
+        headers={"Content-Disposition": _content_disposition(rf.name)},
     )
 
 

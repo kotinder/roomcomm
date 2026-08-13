@@ -5,6 +5,7 @@ to a per-session tmp dir — files.FILES_DIR is patched so tests never touch
 the real data/files store.
 """
 import hashlib
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -145,6 +146,20 @@ def test_upload_roundtrip_and_metadata():
 
     dl = client.get(f"/api/rooms/{uid}/files/{data['id']}", headers=h)
     assert dl.status_code == 200 and dl.content == body
+
+
+def test_download_of_cyrillic_name_serves_rfc6266_header():
+    # A non-Latin-1 name in Content-Disposition used to 500 the download.
+    uid = _new_room()
+    h = _bearer(_new_key("cyr", tier="verified"))
+    body = "# Замечания\n".encode("utf-8")
+    fid = _upload(uid, h, content=body, name="12_Замечания_встречи.md").json()["id"]
+
+    dl = client.get(f"/api/rooms/{uid}/files/{fid}", headers=h)
+    assert dl.status_code == 200 and dl.content == body
+    cd = dl.headers["content-disposition"]
+    cd.encode("latin-1")  # the header itself must survive the wire
+    assert "filename*=UTF-8''" in cd and quote("12_Замечания_встречи.md") in cd
 
 
 def test_name_is_sanitized_and_md_enforced():
