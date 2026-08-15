@@ -18,13 +18,19 @@
     #rooms-table th.sortable:hover { text-decoration: underline; }
     #rooms-table th.sortable .arrow { opacity: .4; font-size: .85em; }
     #rooms-table th.sortable[aria-sort] .arrow { opacity: 1; }
+    .room-tabs { display: flex; gap: .4rem; margin-bottom: .6rem; flex-wrap: wrap; }
+    .room-tab { font: inherit; font-size: .9rem; padding: .3rem .8rem; cursor: pointer;
+                border: 1px solid var(--border, #ccc); border-radius: 999px;
+                background: transparent; color: inherit; }
+    .room-tab[aria-pressed="true"] { border-color: currentColor; font-weight: 600; }
+    .room-tab .muted { margin-left: .35rem; }
   </style>
 </head>
 <body>
   <main class="container admin">
     <header>
       <h1>Roomcomm <span class="muted">· admin</span></h1>
-      <p class="muted">Total rooms: {{ total }}. Sorted by last activity.</p>
+      <p class="muted">Total rooms: {{ total }} ({{ room_count }} rooms, {{ arena_count }} arena tables). Sorted by last activity.</p>
     </header>
 
     <section class="admin-stats">
@@ -147,6 +153,11 @@
     </section>
 
     {% if items %}
+    <div class="room-tabs" id="room-tabs" role="tablist">
+      <button type="button" class="room-tab" data-kind="room" aria-pressed="true">Rooms <span class="muted">{{ room_count }}</span></button>
+      <button type="button" class="room-tab" data-kind="arena" aria-pressed="false">Arena <span class="muted">{{ arena_count }}</span></button>
+      <button type="button" class="room-tab" data-kind="all" aria-pressed="false">All <span class="muted">{{ total }}</span></button>
+    </div>
     <table class="admin-table" id="rooms-table">
       <thead>
         <tr>
@@ -161,10 +172,10 @@
       </thead>
       <tbody>
         {% for r in items %}
-        <tr>
+        <tr data-kind="{{ r.kind }}">
           <td class="mono" data-sort="{{ r.short_uuid }}"><a href="/{{ r.uuid }}" target="_blank">{{ r.short_uuid }}</a></td>
           <td data-sort="{{ 'public' if r.is_public else 'private' }}">{% if r.is_public %}<span class="badge badge-public" title="public">🌐</span>{% else %}<span class="badge badge-private" title="private">🔒</span>{% endif %}</td>
-          <td data-sort="{{ (r.description or '')|lower }}">{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
+          <td data-sort="{{ (r.description or '')|lower }}">{% if r.arena_code %}<a href="{{ r.arena_url }}" target="_blank" rel="noopener" class="mono">{{ r.arena_code }}</a> {% endif %}{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
           <td class="mono small" data-sort="{{ r.created_at.strftime('%Y-%m-%dT%H:%M:%S') }}">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
           <td class="mono small" data-sort="{{ r.last_at.strftime('%Y-%m-%dT%H:%M:%S') if r.last_at else '' }}">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
           <td class="num" data-sort="{{ r.msg_count }}">{{ r.msg_count }}</td>
@@ -225,6 +236,32 @@
           sortBy(col, th.getAttribute('data-type') || 'text', asc);
         });
       });
+
+      // Arena table-talk rooms are one per match played, so they outnumber
+      // everything else and none of them is a room anyone administers. Default
+      // view hides them; the tab is there when a game needs looking at.
+      var tabs = document.getElementById('room-tabs');
+      if (!tabs) return;
+      var buttons = tabs.querySelectorAll('.room-tab');
+
+      function show(kind) {
+        Array.prototype.forEach.call(tbody.rows, function (row) {
+          var mine = kind === 'all' || row.getAttribute('data-kind') === kind;
+          row.style.display = mine ? '' : 'none';
+        });
+        Array.prototype.forEach.call(buttons, function (b) {
+          b.setAttribute('aria-pressed', b.getAttribute('data-kind') === kind ? 'true' : 'false');
+        });
+        try { localStorage.setItem('admin.roomTab', kind); } catch (e) {}
+      }
+
+      Array.prototype.forEach.call(buttons, function (b) {
+        b.addEventListener('click', function () { show(b.getAttribute('data-kind')); });
+      });
+
+      var saved = null;
+      try { saved = localStorage.getItem('admin.roomTab'); } catch (e) {}
+      show(saved === 'arena' || saved === 'all' ? saved : 'room');
     })();
   </script>
 </body>

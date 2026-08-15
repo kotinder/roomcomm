@@ -2485,6 +2485,22 @@ def admin_page_legacy(token: str, request: Request):
     return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
 
 
+# The Igra Station arena opens one roomcomm room per table and names it in the
+# room description. Those rooms are match transcripts, not conversations anyone
+# administers, and there is one of them per game played — left mixed into the
+# room list they bury the rooms that actually matter. Recognised here so the
+# admin list can put them on their own tab.
+ARENA_BASE = os.environ.get("ARENA_BASE", "https://arena.roomcomm.xyz")
+_ARENA_ROOM_RE = re.compile(
+    r"^table talk for (?:the )?igra station arena match ([a-z0-9]{4,16})\b")
+
+
+def _arena_match_code(description: str) -> Optional[str]:
+    """Match code if this room is an arena table-talk room, else None."""
+    m = _ARENA_ROOM_RE.match((description or "").strip().lower())
+    return m.group(1).upper() if m else None
+
+
 def _render_admin(request: Request, session: Session):
     rows = session.exec(
         select(
@@ -2502,18 +2518,23 @@ def _render_admin(request: Request, session: Session):
         return (last is None, -(last.timestamp() if last else 0), -row[0].created_at.timestamp())
 
     rows = sorted(rows, key=sort_key)
-    items = [
-        {
+    items = []
+    for r in rows:
+        description = (r[0].description or "").strip()
+        arena_code = _arena_match_code(description)
+        items.append({
             "uuid": r[0].uuid,
             "short_uuid": r[0].uuid[:8],
-            "description": (r[0].description or "").strip(),
+            "description": description,
             "created_at": r[0].created_at,
             "last_at": r[2],
             "msg_count": r[1],
             "is_public": r[0].is_public,
-        }
-        for r in rows
-    ]
+            "kind": "arena" if arena_code else "room",
+            "arena_code": arena_code,
+            "arena_url": f"{ARENA_BASE}/m/{arena_code}" if arena_code else None,
+        })
+    arena_count = sum(1 for i in items if i["kind"] == "arena")
     revoke_notice = ""
     if request.query_params.get("revoked"):
         revoke_notice = (
@@ -2525,6 +2546,8 @@ def _render_admin(request: Request, session: Session):
         request,
         "admin.html",
         {"items": items, "total": len(items),
+         "arena_count": arena_count,
+         "room_count": len(items) - arena_count,
          "stats": _admin_stats(session),
          "keys": _admin_keys(session),
          "top_subjects": _admin_top_subjects(session),

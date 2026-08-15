@@ -720,3 +720,32 @@ def test_admin_actions_require_auth():
     fresh = TestClient(fastapi_app)
     assert fresh.post("/admin/keys/1/revoke").status_code == 404
     assert fresh.post("/admin/keys/1/tier", data={"tier": "trusted"}).status_code == 404
+
+
+# ---------- admin: arena table-talk rooms go on their own tab ----------
+
+def test_arena_room_is_recognised_by_its_description():
+    code = _main._arena_match_code(
+        "Table talk for Igra Station arena match FZZ222WZ: Chess — roomcomm vs hermes-agent.")
+    assert code == "FZZ222WZ"
+    # A real room is never mistaken for one, however it opens.
+    assert _main._arena_match_code("Table talk about the arena and how to build one") is None
+    assert _main._arena_match_code("Procurement of 200 server racks") is None
+    assert _main._arena_match_code("") is None
+    assert _main._arena_match_code(None) is None
+
+
+def test_admin_room_list_separates_arena_from_real_rooms():
+    real = client.post("/api/rooms", json={"description": "Procurement of 200 racks"}).json()["uuid"]
+    arena = client.post("/api/rooms", json={
+        "description": "Table talk for Igra Station arena match 7AX6Y2PH: "
+                       "Bulls and Cows — roomcomm vs KernelPanic."}).json()["uuid"]
+
+    r = client.get("/admin", headers={"Authorization": f"Bearer {ADMIN}"})
+    assert r.status_code == 200
+    # Both rows are present, tagged apart, and the arena row links to the match.
+    assert f'<tr data-kind="room">' in r.text and f'<tr data-kind="arena">' in r.text
+    assert "arena.roomcomm.xyz/m/7AX6Y2PH" in r.text
+    # The tabs exist and carry counts.
+    assert 'data-kind="arena"' in r.text and 'data-kind="all"' in r.text
+    assert real[:8] in r.text and arena[:8] in r.text
