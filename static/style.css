@@ -184,7 +184,14 @@ footer { margin-top: 40px; }
   margin: 0;
 }
 
-.admin .container { max-width: 1100px; }
+.admin .container { max-width: 1400px; }
+
+/* A wide table scrolls inside its own box. Without this the page itself
+   scrolls sideways and the row controls sit off-screen — the Revoke button
+   was permanently cut off at the window edge. */
+.table-scroll { overflow-x: auto; margin: 16px 0; }
+.table-scroll > .admin-table { margin: 0; }
+
 .admin-table {
   width: 100%;
   border-collapse: collapse;
@@ -216,6 +223,37 @@ footer { margin-top: 40px; }
 .admin-table .small { font-size: 0.85em; color: var(--muted); }
 .admin-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 .admin-table form { margin: 0; display: inline; }
+
+/* Controls inside a table row. The page-level button and field sizes are
+   built for the landing form: 12px of top margin and 10/18 padding leave the
+   buttons floating below the text baseline and stretch the row until the
+   table no longer fits the window. */
+.admin-table button {
+  margin: 0;
+  padding: 5px 12px;
+  font-size: 0.85em;
+  font-weight: 500;
+  border-radius: 5px;
+}
+.admin-table input,
+.admin-table select {
+  font: inherit;
+  font-size: 0.85em;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fff;
+  vertical-align: middle;
+}
+.admin-table input:focus,
+.admin-table select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* Per-key actions wrap onto a second line instead of forcing one long row. */
+.key-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.key-actions form { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.key-actions input { width: 4.2em; }
+.key-actions input[name="note"] { width: 7.5em; }
+
 .btn-danger {
   margin: 0;
   padding: 5px 12px;

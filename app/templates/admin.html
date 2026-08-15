@@ -19,7 +19,7 @@
     #rooms-table th.sortable .arrow { opacity: .4; font-size: .85em; }
     #rooms-table th.sortable[aria-sort] .arrow { opacity: 1; }
     .room-tabs { display: flex; gap: .4rem; margin-bottom: .6rem; flex-wrap: wrap; }
-    .room-tab { font: inherit; font-size: .9rem; padding: .3rem .8rem; cursor: pointer;
+    .room-tab { font: inherit; font-size: .9rem; margin: 0; padding: .3rem .8rem; cursor: pointer;
                 border: 1px solid var(--border, #ccc); border-radius: 999px;
                 background: transparent; color: inherit; }
     .room-tab[aria-pressed="true"] { border-color: currentColor; font-weight: 600; }
@@ -35,6 +35,7 @@
 
     <section class="admin-stats">
       <h2>Usage · last {{ stats.days|length }} days <span class="muted small">(UTC, meaningful events only — scanner noise excluded)</span></h2>
+      <div class="table-scroll">
       <table class="admin-table">
         <thead>
           <tr>
@@ -55,6 +56,7 @@
           {% endfor %}
         </tbody>
       </table>
+      </div>
 
       <div class="stats-tops">
         <div>
@@ -88,6 +90,7 @@
       <h2>Agent keys <span class="muted small">· quota mode: <b>{{ quota_mode }}</b>{% if quota_mode == 'soft' %} (metering only, nothing rejected){% endif %}</span></h2>
       {% if revoke_notice %}<p class="small" style="background:rgba(255,120,0,.12);padding:.4rem .6rem;border-radius:6px">{{ revoke_notice }}</p>{% endif %}
       {% if keys %}
+      <div class="table-scroll">
       <table class="admin-table" id="keys-table">
         <thead>
           <tr>
@@ -115,26 +118,29 @@
             <td class="mono small">{{ k.created_ip or '—' }}</td>
             <td class="mono small">{% if k.last_used_at %}{{ k.last_used_at.strftime('%m-%d %H:%M') }}{% else %}—{% endif %}</td>
             <td class="small">{{ k.note }}</td>
-            <td style="white-space:nowrap">
-              <form method="post" action="/admin/keys/{{ k.id }}/tier" style="display:inline">
-                <select name="tier">
-                  {% for t in tiers %}<option value="{{ t }}"{% if t == k.tier %} selected{% endif %}>{{ t }}</option>{% endfor %}
-                </select>
-                <input name="daily_msg_quota" placeholder="msg" size="4" value="{{ '' }}">
-                <input name="daily_room_quota" placeholder="room" size="4" value="{{ '' }}">
-                <input name="note" placeholder="note" size="8">
-                <button type="submit">Set</button>
-              </form>
-              {% if not k.revoked %}
-              <form method="post" action="/admin/keys/{{ k.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke key #{{ k.id }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only.');">
-                <button type="submit" class="btn-danger">Revoke</button>
-              </form>
-              {% endif %}
+            <td>
+              <div class="key-actions">
+                <form method="post" action="/admin/keys/{{ k.id }}/tier">
+                  <select name="tier" aria-label="tier for key {{ k.id }}">
+                    {% for t in tiers %}<option value="{{ t }}"{% if t == k.tier %} selected{% endif %}>{{ t }}</option>{% endfor %}
+                  </select>
+                  <input name="daily_msg_quota" placeholder="msg" aria-label="daily message quota" value="{{ '' }}">
+                  <input name="daily_room_quota" placeholder="room" aria-label="daily room quota" value="{{ '' }}">
+                  <input name="note" placeholder="note" aria-label="note">
+                  <button type="submit">Set</button>
+                </form>
+                {% if not k.revoked %}
+                <form method="post" action="/admin/keys/{{ k.id }}/revoke" onsubmit="return confirm('Revoke key #{{ k.id }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only.');">
+                  <button type="submit" class="btn-danger">Revoke</button>
+                </form>
+                {% endif %}
+              </div>
             </td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
+      </div>
       {% else %}
       <p class="muted">No keys issued yet.</p>
       {% endif %}
@@ -158,6 +164,7 @@
       <button type="button" class="room-tab" data-kind="arena" aria-pressed="false">Arena <span class="muted">{{ arena_count }}</span></button>
       <button type="button" class="room-tab" data-kind="all" aria-pressed="false">All <span class="muted">{{ total }}</span></button>
     </div>
+    <div class="table-scroll">
     <table class="admin-table" id="rooms-table">
       <thead>
         <tr>
@@ -188,6 +195,7 @@
         {% endfor %}
       </tbody>
     </table>
+    </div>
     {% else %}
     <p class="muted">No rooms yet.</p>
     {% endif %}
