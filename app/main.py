@@ -2405,19 +2405,24 @@ def _admin_keys(session: Session) -> list[dict]:
         q_room = quota.daily_quota(k, "room")
         items.append({
             "id": k.id,
+            # Only the hash is stored, so there is no key prefix to show; the
+            # row id is what the admin URLs and the revoke notice speak in.
+            "prefix": f"#{k.id}",
             "agent_id": k.agent_id or "—",
             "tier": k.tier,
             "contact": k.contact or "",
             "tg_id": (k.contact or "")[3:] if (k.contact or "").startswith("tg:") else "",
-            "created_ip": k.created_ip,
+            "issued_ip": k.created_ip,
             "created_at": k.created_at,
             "last_used_at": k.last_used_at,
             "revoked": k.revoked,
             "note": k.note or "",
-            "used_msg": u.get("msg", 0),
-            "used_room": u.get("room", 0),
-            "quota_msg": q_msg,
-            "quota_room": q_room,
+            "msgs_today": u.get("msg", 0),
+            "rooms_today": u.get("room", 0),
+            "msgs_quota": q_msg,
+            "rooms_quota": q_room,
+            "msg_override": k.daily_msg_quota,
+            "room_override": k.daily_room_quota,
             "maxed": u.get("msg", 0) >= q_msg or u.get("room", 0) >= q_room,
         })
     return items
@@ -2552,6 +2557,7 @@ def _render_admin(request: Request, session: Session):
          "keys": _admin_keys(session),
          "top_subjects": _admin_top_subjects(session),
          "quota_mode": quota.QUOTA_MODE,
+         "admin_base": "/admin",
          "revoke_notice": revoke_notice,
          "tiers": ["free", "verified", "trusted", "blocked"]},
     )

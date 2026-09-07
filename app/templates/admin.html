@@ -86,65 +86,10 @@
       </div>
     </section>
 
-    <section class="admin-keys">
-      <h2>Agent keys <span class="muted small">· quota mode: <b>{{ quota_mode }}</b>{% if quota_mode == 'soft' %} (metering only, nothing rejected){% endif %}</span></h2>
-      {% if revoke_notice %}<p class="small" style="background:rgba(255,120,0,.12);padding:.4rem .6rem;border-radius:6px">{{ revoke_notice }}</p>{% endif %}
-      {% if keys %}
-      <div class="table-scroll">
-      <table class="admin-table" id="keys-table">
-        <thead>
-          <tr>
-            <th class="num">#</th>
-            <th>agent_id</th>
-            <th>tier</th>
-            <th class="num">msgs today</th>
-            <th class="num">rooms today</th>
-            <th>contact</th>
-            <th>issued to IP</th>
-            <th>last used</th>
-            <th>note</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for k in keys %}
-          <tr{% if k.revoked %} style="opacity:.45"{% elif k.maxed %} style="background:rgba(255,120,0,.08)"{% endif %}>
-            <td class="num mono">{{ k.id }}</td>
-            <td>{{ k.agent_id }}{% if k.revoked %} <span class="badge" title="revoked">⛔</span>{% elif k.maxed %} <span title="hit the daily ceiling">🔥</span>{% endif %}</td>
-            <td>{{ k.tier }}</td>
-            <td class="num mono">{{ k.used_msg }}/{{ k.quota_msg }}</td>
-            <td class="num mono">{{ k.used_room }}/{{ k.quota_room }}</td>
-            <td class="small">{% if k.tg_id %}<a href="tg://user?id={{ k.tg_id }}">{{ k.contact }}</a>{% else %}{{ k.contact or '—' }}{% endif %}</td>
-            <td class="mono small">{{ k.created_ip or '—' }}</td>
-            <td class="mono small">{% if k.last_used_at %}{{ k.last_used_at.strftime('%m-%d %H:%M') }}{% else %}—{% endif %}</td>
-            <td class="small">{{ k.note }}</td>
-            <td>
-              <div class="key-actions">
-                <form method="post" action="/admin/keys/{{ k.id }}/tier">
-                  <select name="tier" aria-label="tier for key {{ k.id }}">
-                    {% for t in tiers %}<option value="{{ t }}"{% if t == k.tier %} selected{% endif %}>{{ t }}</option>{% endfor %}
-                  </select>
-                  <input name="daily_msg_quota" placeholder="msg" aria-label="daily message quota" value="{{ '' }}">
-                  <input name="daily_room_quota" placeholder="room" aria-label="daily room quota" value="{{ '' }}">
-                  <input name="note" placeholder="note" aria-label="note">
-                  <button type="submit">Set</button>
-                </form>
-                {% if not k.revoked %}
-                <form method="post" action="/admin/keys/{{ k.id }}/revoke" onsubmit="return confirm('Revoke key #{{ k.id }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only.');">
-                  <button type="submit" class="btn-danger">Revoke</button>
-                </form>
-                {% endif %}
-              </div>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      </div>
-      {% else %}
-      <p class="muted">No keys issued yet.</p>
-      {% endif %}
+    {% if revoke_notice %}<p class="small" style="background:rgba(255,120,0,.12);padding:.4rem .6rem;border-radius:6px">{{ revoke_notice }}</p>{% endif %}
+    {% include "_admin_keys.html" %}
 
+    <section class="admin-subjects">
       {% if top_subjects %}
       <h3 style="margin-top:1rem">Top subjects today <span class="muted small">(keys and anonymous IPs, by volume; empty/404 = idle polls — the freeloader fingerprint)</span></h3>
       <table class="admin-table">
