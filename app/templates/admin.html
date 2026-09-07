@@ -10,6 +10,7 @@
   <style>
     .admin-stats { margin-bottom: 2rem; }
     .admin-stats h2 { margin-bottom: .5rem; }
+    .rooms-head { margin: 36px 0 4px; }
     .stats-tops { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
     .stats-tops h3 { margin: 0 0 .3rem; font-size: .95rem; }
     .stats-tops td.num { white-space: nowrap; }
@@ -24,7 +25,6 @@
   <main class="container admin">
     <header>
       <h1>Roomcomm <span class="muted">· admin</span></h1>
-      <p class="muted">Total rooms: {{ total }}. Sorted by last activity.</p>
     </header>
 
     <section class="admin-stats">
@@ -78,6 +78,9 @@
       </div>
     </section>
 
+    {% if keys is defined %}{% include "_admin_keys.html" %}{% endif %}
+
+    <h2 class="rooms-head">Rooms <span class="muted small">· {{ total }}, sorted by last activity</span></h2>
     {% if items %}
     <table class="admin-table" id="rooms-table">
       <thead>
