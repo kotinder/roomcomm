@@ -11,7 +11,8 @@ import time
 import uuid as uuid_lib
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -150,10 +151,11 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import files, i18n, inbox, llm, notify, pcis, quota, tg_bot
+from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota,
+               tg_bot, ttl)
 from .database import SKILLS_DIR, engine, get_session, init_db
 from .models import (
-    AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
+    AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
     Room, RoomSeen, Skill, UsageCounter, utcnow,
 )
 from .schemas import (
@@ -365,6 +367,32 @@ class _McpBrowserHintMiddleware:
 app.add_middleware(_McpBrowserHintMiddleware)
 
 
+# True while serving a request that carries the admin token (Bearer or
+# cookie). Read by _room_expired so expired rooms stay open to the admin on
+# every endpoint without threading `request` through each handler. Raw ASGI
+# (not BaseHTTPMiddleware) so the value reliably reaches sync handlers,
+# which Starlette runs in a threadpool with a copy of this context.
+_ADMIN_CALLER: ContextVar[bool] = ContextVar("roomcomm_admin_caller", default=False)
+
+
+class _AdminCallerMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        token = _ADMIN_CALLER.set(_request_is_admin(Request(scope)))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _ADMIN_CALLER.reset(token)
+
+
+app.add_middleware(_AdminCallerMiddleware)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_handler(request: Request, exc: Exception):
     """Catch-all for unhandled exceptions: log, notify Telegram, return 500.
@@ -404,10 +432,44 @@ def _validate_uuid(value: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid UUID")
 
 
+def _resolve_expiry(payload: RoomCreate) -> datetime:
+    """Expiry for a room being created — the policy lives in app/ttl.py."""
+    try:
+        return ttl.resolve(ttl_hours=payload.ttl_hours, expires_at=payload.expires_at)
+    except ttl.TTLRangeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# Thin aliases. The TTL policy lives in app/ttl.py, shared with the MCP
+# transport so the two cannot drift on when a room stops answering.
+def _room_expired(room: Room, now: Optional[datetime] = None) -> bool:
+    """Expired *for this caller*. The admin (Bearer or session cookie, flagged
+    per request by _AdminCallerMiddleware) never hits the TTL wall — expired
+    rooms stay readable and writable for them everywhere, not only in /admin."""
+    return ttl.is_expired(room, now) and not _ADMIN_CALLER.get()
+
+
+
+_expires_in_seconds = ttl.seconds_left
+_expired_detail = ttl.expired_message
+
+
 def _get_room_or_404(session: Session, room_uuid: str) -> Room:
+    """Room lookup for every agent-facing endpoint.
+
+    Missing → 404. Past its TTL → 410 Gone, with a `room_expired:` prefix in
+    `detail` (same convention as `quota_exceeded:` / `room_full:`). 410 rather
+    than 404 so an agent can tell "this room ran out" from "wrong UUID", and
+    because both are terminal: neither is worth retrying.
+
+    The admin panel deliberately does NOT go through here — an expired room
+    stays fully readable and revivable from /admin.
+    """
     room = session.get(Room, room_uuid)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
+    if _room_expired(room):
+        raise HTTPException(status_code=410, detail=_expired_detail(room))
     return room
 
 
@@ -671,6 +733,7 @@ def create_room(
                        f"for the public listing ({reason}). Reword it, or create "
                        f"the room unlisted (omit is_public).",
             )
+    expires_at = _resolve_expiry(payload)
     # write_policy='key': generate the room write-key now — returned once in
     # the response, only its hash is stored.
     room_write_key: Optional[str] = None
@@ -686,6 +749,7 @@ def create_room(
         write_policy=payload.write_policy,
         write_key_hash=write_key_hash,
         owner_key_id=key.id if key else None,
+        expires_at=expires_at,
     )
     session.add(room)
     session.commit()
@@ -714,6 +778,7 @@ def create_room(
         protocol_mode=room.protocol_mode,
         write_policy=room.write_policy,
         write_key=room_write_key,
+        expires_at=room.expires_at,
     )
 
 
@@ -742,6 +807,10 @@ def list_public_rooms(
         .group_by(Room.uuid)
     )
     rows = session.exec(stmt).all()
+    # Expired rooms leave the showcase: every listed room must be one an agent
+    # can actually join, or discovery hands out dead UUIDs.
+    _now = utcnow()
+    rows = [r for r in rows if not _room_expired(r[0], _now)]
 
     def sort_key(row):
         if sort == "new":
@@ -780,6 +849,8 @@ def get_room(room_uuid: str, request: Request, session: Session = Depends(get_se
     if room is None:
         # Room-info polling of a nonexistent room is idle polling too.
         raise _missing_room_response(session, request)
+    if _room_expired(room):
+        raise HTTPException(status_code=410, detail=_expired_detail(room))
     count = session.exec(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
@@ -792,6 +863,8 @@ def get_room(room_uuid: str, request: Request, session: Session = Depends(get_se
         protocol_mode=room.protocol_mode,
         arbiter_active=(room.protocol_mode == "premium" and llm.is_configured()),
         last_extraction_error=room.last_extraction_error,
+        expires_at=room.expires_at,
+        expires_in_seconds=_expires_in_seconds(room),
     )
 
 
@@ -804,8 +877,11 @@ def list_messages(
     session: Session = Depends(get_session),
 ):
     room_uuid = _validate_uuid(room_uuid)
-    if session.get(Room, room_uuid) is None:
+    _room = session.get(Room, room_uuid)
+    if _room is None:
         raise _missing_room_response(session, request)
+    if _room_expired(_room):
+        raise HTTPException(status_code=410, detail=_expired_detail(_room))
     effective_limit = min(limit, MAX_LIMIT)
 
     stmt = select(Message).where(Message.room_uuid == room_uuid)
@@ -838,9 +914,15 @@ def list_messages(
         except quota.AuthError:
             seen_key = None
         inbox.advance_seen_best_effort(session, seen_key, room_uuid, rows)
+    # Provenance travels with every message: a display name alone never said
+    # who posted it (audit F2). One query for the whole page.
+    refs = authorship.refs_for(session, rows)
     return MessagesPage(
         messages=[
-            MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp)
+            MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp,
+                       pubkey_hex=m.pubkey_hex, signature_hex=m.signature_hex,
+                       memory_root=m.memory_root,
+                       auth=authorship.auth_level(m), key_ref=refs.get(m.key_id))
             for m in rows
         ],
         has_more=has_more,
@@ -866,6 +948,12 @@ def post_message(
         quota.check_premium_write(room, key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
+    # A handful of names speak for the service itself; borrowing one is the
+    # forgery with consequences (audit F2). Every other name stays free.
+    denied = authorship.protected_denied_reason(
+        payload.agent_id, key, quota.PREMIUM_TIERS)
+    if denied:
+        raise HTTPException(status_code=403, detail=denied)
     _check_quota(session, subject, "msg", key)
     count = session.exec(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
@@ -932,6 +1020,10 @@ def post_message(
     if key is not None:
         # Posting = caught up: your reply lands after everything you saw.
         inbox.advance_seen(session, key.id, room_uuid, msg.id)
+    # A room that is being used does not run out. The TTL counts from the last
+    # message, so it retires silence rather than interrupting a conversation.
+    if ttl.extend_on_activity(room):
+        session.add(room)
     session.commit()
     session.refresh(msg)
 
@@ -950,6 +1042,7 @@ def post_message(
         id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp,
         pubkey_hex=msg.pubkey_hex, signature_hex=msg.signature_hex,
         memory_root=msg.memory_root,
+        auth=authorship.auth_level(msg), key_ref=authorship.key_ref(key),
     )
 
 
@@ -1177,6 +1270,11 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
     room = session.get(Room, room_uuid)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
+    # Defensive: callers reach this through _get_room_or_404, but the arbiter
+    # also runs as a background task that can outlive the request that queued
+    # it — don't burn LLM budget on a room that expired in the meantime.
+    if _room_expired(room):
+        raise HTTPException(status_code=410, detail=_expired_detail(room))
 
     if full:
         room.last_extracted_msg_id = 0
@@ -1543,6 +1641,144 @@ def handshake(
         pubkey_hex=h.pubkey_hex, signature_hex=h.signature_hex,
         created_at=h.created_at, signature_valid=sig_valid,
     )
+
+
+@app.get("/api/anchors")
+def list_anchors(
+    limit: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+):
+    """Recent external anchors, newest first.
+
+    Each row is a Merkle root over every room's state at that moment, plus the
+    receipt from wherever it was published. `receipt: null` means the root was
+    computed but publication failed — shown rather than hidden, because a run
+    of failed publications must not look like an anchored history.
+    """
+    rows = session.exec(
+        select(Anchor).order_by(Anchor.id.desc()).limit(limit)
+    ).all()
+    return {
+        "anchors": [
+            {
+                "id": a.id,
+                "root": a.root,
+                "leaf_count": a.leaf_count,
+                "digest_version": a.digest_version,
+                "created_at": a.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "receipt": a.receipt,
+                "published_via": a.published_via,
+                # Timestamped by a third party is the claim that matters: a
+                # published receipt we control proves less than a signature we
+                # cannot forge.
+                "tsa_url": a.tsa_url,
+                "tsa_time": a.tsa_time,
+                "timestamped": a.tsa_token is not None,
+                "token_url": f"/api/anchors/{a.id}/tsa" if a.tsa_token else None,
+                "published": a.receipt is not None or a.tsa_token is not None,
+            }
+            for a in rows
+        ],
+        "arbiter_pubkey": pcis.arbiter_pubkey_hex(),
+    }
+
+
+@app.get("/api/anchors/{anchor_id}/tsa")
+def anchor_tsa_token(anchor_id: int, session: Session = Depends(get_session)):
+    """The raw RFC 3161 token for an anchor, for offline verification.
+
+    This is the one artefact here that does not depend on trusting this
+    server: a public timestamp authority signed the root with its own key, at
+    a time we cannot move. Check it with standard tooling —
+
+        curl -o token.tsr https://roomcomm.xyz/api/anchors/1/tsa
+        printf '%s' "<root from /api/anchors>" > root.txt
+        openssl ts -verify -data root.txt -in token.tsr -CAfile <tsa-ca.pem>
+    """
+    row = session.get(Anchor, anchor_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such anchor")
+    if not row.tsa_token:
+        raise HTTPException(
+            status_code=404,
+            detail="this anchor has no timestamp token — the root was stored "
+                   "but no timestamp authority signed it",
+        )
+    return Response(
+        content=row.tsa_token,
+        media_type="application/timestamp-reply",
+        headers={"Content-Disposition": f'attachment; filename="anchor-{anchor_id}.tsr"'},
+    )
+
+
+@app.get("/api/rooms/{room_uuid}/anchor")
+def room_anchor(room_uuid: str, session: Session = Depends(get_session)):
+    """Proof that this room's history was included in a published root.
+
+    Returns the room's current digest, the newest anchor that covers it, and
+    the sibling path from the one to the other. Recompute the digest from
+    `GET /api/rooms/{uuid}/messages`, replay the path, and compare the result
+    with the root as published externally — at no point do you have to take
+    this server's word for anything.
+
+    `digest_matches_anchor` is false when the room has changed since the
+    anchor: normal for a live conversation, and the reason `anchored_digest`
+    is reported separately.
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    # Expired rooms answer here on purpose: the whole point of an anchor is to
+    # still be checkable once the conversation itself is over.
+    if session.get(Room, room_uuid) is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    # One room's digest, computed now — cheap. The proof itself comes from the
+    # leaf set stored with the anchor, never from a fresh sweep of the server:
+    # a proof has to run against the state as it was when the root was
+    # published, and rebuilding every leaf per request cost 2.4 s on production
+    # data, which is both slow and a free way to load the box.
+    current_digest = anchor.room_digest(session, room_uuid)
+    latest = session.exec(select(Anchor).order_by(Anchor.id.desc()).limit(1)).first()
+    if latest is None:
+        return {
+            "room_uuid": room_uuid,
+            "current_digest": current_digest,
+            "digest_version": anchor.DIGEST_VERSION,
+            "anchor": None,
+            "note": "no anchor has been published yet",
+        }
+
+    leaves = anchor.load_leaves(latest)
+    anchored_digest = dict(leaves).get(room_uuid) if leaves else None
+    proof = anchor.inclusion_proof(leaves, room_uuid) if leaves else None
+
+    body = {
+        "room_uuid": room_uuid,
+        # What the room hashes to right now.
+        "current_digest": current_digest,
+        # What it hashed to when the root below was published. Different means
+        # the room has simply moved on — normal for a live conversation.
+        "anchored_digest": anchored_digest,
+        "unchanged_since_anchor": (
+            anchored_digest is not None and anchored_digest == current_digest
+        ),
+        "digest_version": latest.digest_version or anchor.DIGEST_VERSION,
+        "anchor": {
+            "id": latest.id,
+            "root": latest.root,
+            "leaf_count": latest.leaf_count,
+            "created_at": latest.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "receipt": latest.receipt,
+            "published_via": latest.published_via,
+        },
+        "proof": proof,
+    }
+    if anchored_digest is None:
+        body["note"] = (
+            "this room is not covered by the latest anchor — either it was "
+            "created after that root was published, or the anchor predates "
+            "stored leaf sets"
+        )
+    return body
 
 
 @app.get("/api/arbiter/pubkey")
@@ -2234,6 +2470,31 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         )
         return _apply_lang_cookie(request, resp)
 
+    if _room_expired(room):
+        # Same shape as "not found" for the viewer — the room is gone as far as
+        # anyone outside /admin is concerned — but say *why*, so the owner knows
+        # this was a TTL and not a deletion, and gets a 410 rather than a 404.
+        when = room.expires_at.strftime("%Y-%m-%d %H:%M UTC") if room.expires_at else "?"
+        if _wants_markdown(request):
+            return PlainTextResponse(
+                f"# Room expired\n\nThis room reached its TTL at {when} and is "
+                f"no longer readable.\nRooms here are ephemeral by design. "
+                f"Start a new one at {str(request.base_url).rstrip('/')}/.\n",
+                status_code=410, media_type="text/markdown; charset=utf-8",
+            )
+        resp = templates.TemplateResponse(
+            request,
+            "room.html",
+            {
+                "room": None, "messages": [], "not_found": True,
+                "expired_at": when,
+                "lang": lang, "t": t,
+                "base_url": str(request.base_url).rstrip('/'),
+            },
+            status_code=410,
+        )
+        return _apply_lang_cookie(request, resp)
+
     if _wants_markdown(request):
         return PlainTextResponse(
             _render_room_agent_md(request, room, room_uuid),
@@ -2253,6 +2514,11 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
             "not_found": False,
             "short_uuid": room.uuid[:8],
             "agent_md": agent_md,
+            # Only reachable past the TTL by the admin (see _room_expired).
+            "admin_expired_at": (
+                room.expires_at.strftime("%Y-%m-%d %H:%M UTC")
+                if ttl.is_expired(room) else None
+            ),
             "lang": lang,
             "t": t,
             "base_url": str(request.base_url).rstrip('/'),
@@ -2318,14 +2584,24 @@ def _check_admin_request(request: Request) -> None:
     raise HTTPException(status_code=404, detail="Not found")
 
 
+def _request_is_admin(request: Request) -> bool:
+    try:
+        _check_admin_request(request)
+        return True
+    except HTTPException:
+        return False
+
+
 def _set_admin_cookie(response, request: Request):
+    # path="/" (not "/admin"): the cookie must also reach /{uuid} and /api/*,
+    # otherwise the admin is anonymous there and expired rooms answer 410.
     response.set_cookie(
         ADMIN_COOKIE, ADMIN_TOKEN,
         max_age=60 * 60 * 24 * 30,  # 30 days
         httponly=True,
         samesite="strict",
         secure=request.url.scheme == "https",
-        path="/admin",
+        path="/",
     )
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
@@ -2479,7 +2755,8 @@ def admin_login(request: Request, token: str = Form(default="")):
 def admin_logout(request: Request):
     _check_admin_request(request)
     resp = RedirectResponse(url="/", status_code=303)
-    resp.delete_cookie(ADMIN_COOKIE, path="/admin")
+    resp.delete_cookie(ADMIN_COOKIE, path="/")
+    resp.delete_cookie(ADMIN_COOKIE, path="/admin")  # pre-2026-09-24 cookies
     return resp
 
 
@@ -2538,6 +2815,14 @@ def _render_admin(request: Request, session: Session):
             "kind": "arena" if arena_code else "room",
             "arena_code": arena_code,
             "arena_url": f"{ARENA_BASE}/m/{arena_code}" if arena_code else None,
+            # TTL state. Expired rooms stay listed here on purpose: /admin is
+            # the one surface that can still read or revive them.
+            "expires_at": r[0].expires_at,
+            "expired": ttl.is_expired(r[0]),
+            "expires_in_hours": (
+                None if r[0].expires_at is None
+                else round(ttl.seconds_left(r[0]) / 3600, 1)
+            ),
         })
     arena_count = sum(1 for i in items if i["kind"] == "arena")
     revoke_notice = ""
@@ -2708,4 +2993,63 @@ def admin_set_write_policy(
         "uuid": room.uuid,
         "write_policy": room.write_policy,
         "owner_key_id": room.owner_key_id,
+    }
+
+
+@app.post("/admin/rooms/{room_uuid}/ttl")
+def admin_set_room_ttl(
+    room_uuid: str,
+    request: Request,
+    ttl_hours: str = Form(default=""),
+    session: Session = Depends(get_session),
+):
+    """Extend, shorten, pin or expire a room — the admin escape hatch on TTL.
+
+    `ttl_hours`:
+      * a positive integer — the room now expires that many hours from *now*,
+        which also revives an already-expired room;
+      * `never` — pin the room open (expires_at = NULL). Deliberately reachable
+        only from here: the public API has no immortal rooms, or "ephemeral"
+        goes back to being decoration;
+      * `now` — expire it immediately, without deleting the history.
+
+    Returns JSON (scriptable), not the admin redirect.
+    """
+    _check_admin_request(request)
+    try:
+        room_uuid = str(uuid_lib.UUID(room_uuid))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid UUID")
+    # Deliberately NOT _get_room_or_404: an expired room must stay reachable
+    # from here, otherwise it could never be revived.
+    room = session.get(Room, room_uuid)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    raw = (ttl_hours or "").strip().lower()
+    if raw == "never":
+        room.expires_at = None
+    elif raw == "now":
+        room.expires_at = utcnow()
+    else:
+        try:
+            hours = int(raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="ttl_hours must be a positive integer, 'never' or 'now'",
+            )
+        if hours < 1:
+            raise HTTPException(status_code=400, detail="ttl_hours must be >= 1")
+        room.expires_at = utcnow() + timedelta(hours=hours)
+
+    session.add(room)
+    session.commit()
+    session.refresh(room)
+    log.info("admin set TTL for room %s → %s", room.uuid, ttl.format_expiry(room))
+    return {
+        "ok": True,
+        "uuid": room.uuid,
+        "expires_at": room.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ") if room.expires_at else None,
+        "expired": ttl.is_expired(room),
     }
