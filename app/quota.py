@@ -142,6 +142,11 @@ def generate_verify_code() -> str:
     return secrets.token_hex(6)
 
 
+# Subject for requests made with the admin token as Bearer (REST and MCP):
+# no AgentKey behind it, no quota.
+ADMIN_SUBJECT = "admin"
+
+
 def resolve_key(session: Session, authorization: Optional[str]) -> Optional[AgentKey]:
     """Map an Authorization header to an AgentKey, or None when absent.
 
@@ -459,10 +464,14 @@ def check_and_count(session: Session, subject: str, kind: str,
                     key: Optional[AgentKey]) -> None:
     """Increment today's counter for (subject, kind); reject when over budget.
 
+    The admin token (subject ADMIN_SUBJECT) is never metered.
+
     The increment rides the caller's transaction: on a 4xx raised here (or any
     later handler failure) it rolls back with everything else, so in hard mode
     the stored counter never exceeds the quota.
     """
+    if subject == ADMIN_SUBJECT:
+        return
     quota = daily_quota(key, kind)
     day = utcnow().strftime("%Y-%m-%d")
     conn = session.connection()

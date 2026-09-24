@@ -360,3 +360,46 @@ def test_admin_cookie_reaches_room_pages(monkeypatch):
     assert "Path=/;" in login.headers["set-cookie"] or login.headers["set-cookie"].rstrip().endswith("Path=/")
     c.cookies.set(_main.ADMIN_COOKIE, "test-admin-token")
     assert c.get(f"/{room['uuid']}").status_code == 200
+
+
+# --- MCP: same rule as REST -------------------------------------------------
+
+def _mcp_call(c, tool: str, args: dict, headers: dict) -> dict:
+    h = {"Accept": "application/json, text/event-stream",
+         "Content-Type": "application/json", **headers}
+    init = c.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                   "clientInfo": {"name": "t", "version": "0"}}})
+    assert init.status_code == 200, init.text
+    sid = init.headers.get("mcp-session-id")
+    if sid:
+        h["mcp-session-id"] = sid
+    c.post("/mcp", headers=h, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+    r = c.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": tool, "arguments": args}})
+    assert r.status_code == 200, r.text
+    body = r.text
+    if body.lstrip().startswith("event:") or "data:" in body[:20]:
+        body = [l[5:].strip() for l in body.splitlines() if l.startswith("data:")][-1]
+    import json as _json
+    return _json.loads(body)["result"]
+
+
+def test_mcp_expired_room_open_to_admin_only(monkeypatch):
+    # One `with` block: the MCP session manager's lifespan runs once per process.
+    import app.mcp_server as _mcp
+    monkeypatch.setattr(_mcp, "engine", engine)  # MCP opens its own sessions
+    monkeypatch.setattr(_main, "ADMIN_TOKEN", "test-admin-token")
+    room = _create(description="mcp after death")
+    _expire(room["uuid"])
+    uid = {"uuid": room["uuid"]}
+    with TestClient(fastapi_app, base_url="http://localhost") as c:
+        anon = _mcp_call(c, "get_room", uid, {})
+        assert anon.get("isError") and "410" in anon["content"][0]["text"]
+        for admin_headers in ({"Authorization": "Bearer test-admin-token"},
+                              {"X-Roomcomm-Admin": "test-admin-token"}):
+            for tool in ("get_room", "read_messages"):
+                r = _mcp_call(c, tool, uid, admin_headers)
+                assert not r.get("isError"), (tool, admin_headers, r)

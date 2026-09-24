@@ -479,6 +479,8 @@ def _get_room_or_404(session: Session, room_uuid: str) -> Room:
 
 def _resolve_subject(request: Request, session: Session) -> tuple[str, Optional[AgentKey]]:
     """(subject, key) for this request: 'key:<id>' with valid Bearer, else 'ip:<addr>'."""
+    if _bearer_is_admin(request.headers.get("authorization")):
+        return quota.ADMIN_SUBJECT, None
     try:
         key = quota.resolve_key(session, request.headers.get("authorization"))
     except quota.AuthError as e:
@@ -2557,6 +2559,7 @@ async def tg_webhook(request: Request, session: Session = Depends(get_session)):
 # works as a one-shot login redirect so old bookmarks keep functioning.
 
 ADMIN_COOKIE = "admin_token"
+ADMIN_HEADER = "x-roomcomm-admin"
 ADMIN_LOGIN_LIMIT = 10          # failed attempts per hour per IP
 ADMIN_LOGIN_WINDOW = 3600
 _admin_login_buckets: dict[str, deque] = defaultdict(deque)
@@ -2567,6 +2570,11 @@ def _admin_token_ok(token: Optional[str]) -> bool:
     return bool(ADMIN_TOKEN) and bool(token) and secrets.compare_digest(token, ADMIN_TOKEN)
 
 
+def _bearer_is_admin(authorization: Optional[str]) -> bool:
+    auth = authorization or ""
+    return auth.lower().startswith("bearer ") and _admin_token_ok(auth[7:].strip())
+
+
 def _check_admin(token: str) -> None:
     if not _admin_token_ok(token):
         raise HTTPException(status_code=404, detail="Not found")
@@ -2575,10 +2583,12 @@ def _check_admin(token: str) -> None:
 def _check_admin_request(request: Request) -> None:
     """Admin auth from header (Bearer) or session cookie. 404 on failure —
     same hide-the-door behavior as before."""
-    auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        if _admin_token_ok(auth[7:].strip()):
-            return
+    if _bearer_is_admin(request.headers.get("authorization")):
+        return
+    # Separate header so an agent can keep its own key in Authorization
+    # (authorship, verified-only gates) and still be the admin.
+    if _admin_token_ok(request.headers.get(ADMIN_HEADER)):
+        return
     if _admin_token_ok(request.cookies.get(ADMIN_COOKIE)):
         return
     raise HTTPException(status_code=404, detail="Not found")
