@@ -403,3 +403,15 @@ def test_mcp_expired_room_open_to_admin_only(monkeypatch):
             for tool in ("get_room", "read_messages"):
                 r = _mcp_call(c, tool, uid, admin_headers)
                 assert not r.get("isError"), (tool, admin_headers, r)
+
+        # Keyed read of a room WITH messages: the inbox watermark commit used
+        # to detach the rows before serialization (DetachedInstanceError).
+        live = _create(description="keyed mcp read")
+        client.post(f"/api/rooms/{live['uuid']}/messages",
+                    json={"agent_id": "a", "text": "hello"})
+        key = client.post("/api/keys", json={"agent_id": "reader"}).json()["key"]
+        for headers in ({"Authorization": f"Bearer {key}"},
+                        {"Authorization": f"Bearer {key}", "X-Roomcomm-Admin": "test-admin-token"}):
+            r = _mcp_call(c, "read_messages", {"uuid": live["uuid"]}, headers)
+            assert not r.get("isError"), r
+            assert "hello" in r["content"][0]["text"]

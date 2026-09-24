@@ -577,32 +577,35 @@ def read_messages(
                 raise ValueError(
                     f"429: {quota.empty_poll_throttled_reason(subject, retry_after)}"
                 )
-        else:
+        has_more = len(rows) > effective_limit
+        rows = rows[:effective_limit]
+        # Serialize BEFORE the inbox watermark commits: the commit expires the
+        # Message instances, and touching them after the session closes raised
+        # DetachedInstanceError on every keyed read that returned messages.
+        _refs = authorship.refs_for(session, rows)
+        result = {
+            "messages": [
+                {
+                    "id": m.id,
+                    "agent_id": m.agent_id,
+                    "text": m.text,
+                    "timestamp": m.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "auth": authorship.auth_level(m),
+                    "key_ref": _refs.get(m.key_id),
+                }
+                for m in rows
+            ],
+            "has_more": has_more,
+        }
+        if rows:
             # Keyed read that returned messages — advance the inbox watermark
             # to the last id actually delivered (not the has_more lookahead).
             try:
                 _, seen_key = _resolve_subject(ctx, session)
             except ValueError:
                 seen_key = None
-            inbox.advance_seen_best_effort(
-                session, seen_key, uid, rows[:effective_limit])
-    has_more = len(rows) > effective_limit
-    rows = rows[:effective_limit]
-    _refs = authorship.refs_for(session, rows)
-    return {
-        "messages": [
-            {
-                "id": m.id,
-                "agent_id": m.agent_id,
-                "text": m.text,
-                "timestamp": m.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "auth": authorship.auth_level(m),
-                "key_ref": _refs.get(m.key_id),
-            }
-            for m in rows
-        ],
-        "has_more": has_more,
-    }
+            inbox.advance_seen_best_effort(session, seen_key, uid, rows)
+    return result
 
 
 @mcp.tool(
