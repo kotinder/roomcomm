@@ -415,3 +415,52 @@ def test_mcp_expired_room_open_to_admin_only(monkeypatch):
             r = _mcp_call(c, "read_messages", {"uuid": live["uuid"]}, headers)
             assert not r.get("isError"), r
             assert "hello" in r["content"][0]["text"]
+
+        # A wrong admin token over MCP is refused and counts as ONE failed
+        # guess per HTTP request, same as REST.
+        _main._admin_fail_buckets.clear()
+        bad = {"X-Real-IP": "203.0.113.9", "X-Roomcomm-Admin": "wrong"}
+        r = _mcp_call(c, "get_room", uid, bad)
+        assert r.get("isError") and "410" in r["content"][0]["text"]
+        # initialize + initialized + tools/call = 3 HTTP requests
+        assert len(_main._admin_fail_buckets["203.0.113.9"]) == 3
+        _main._admin_fail_buckets.clear()
+
+
+# --- admin brute-force lockout ------------------------------------------------
+
+@pytest.fixture
+def _fresh_admin_fails():
+    _main._admin_fail_buckets.clear()
+    yield
+    _main._admin_fail_buckets.clear()
+
+
+def test_wrong_admin_guesses_lock_the_ip_out(monkeypatch, _fresh_admin_fails):
+    monkeypatch.setattr(_main, "ADMIN_TOKEN", "test-admin-token")
+    room = _create(description="lockout")
+    _expire(room["uuid"])
+    path = f"/api/rooms/{room['uuid']}"
+    ip = {"X-Real-IP": "203.0.113.7"}
+    for i in range(_main.ADMIN_FAIL_LIMIT):
+        assert client.get(path, headers={**ip, "X-Roomcomm-Admin": f"guess{i}"}).status_code == 410
+    # One request = one failure, not one per check along the way.
+    assert len(_main._admin_fail_buckets["203.0.113.7"]) == _main.ADMIN_FAIL_LIMIT
+    # Locked out: even the right token no longer works from this IP ...
+    assert client.get(path, headers={**ip, "X-Roomcomm-Admin": "test-admin-token"}).status_code == 410
+    assert client.post("/admin/login", data={"token": "test-admin-token"},
+                       headers=ip, follow_redirects=False).status_code == 404
+    # ... while ordinary traffic from it and admin from elsewhere are fine.
+    assert client.get(path, headers=ip).status_code == 410
+    assert client.get(path, headers={"X-Real-IP": "198.51.100.1",
+                                     "X-Roomcomm-Admin": "test-admin-token"}).status_code == 200
+
+
+def test_agent_keys_are_not_admin_guesses(monkeypatch, _fresh_admin_fails):
+    monkeypatch.setattr(_main, "ADMIN_TOKEN", "test-admin-token")
+    key = client.post("/api/keys", json={"agent_id": "plain"}).json()["key"]
+    room = _create(description="keyed")
+    for _ in range(_main.ADMIN_FAIL_LIMIT + 2):
+        client.get(f"/api/rooms/{room['uuid']}/messages",
+                   headers={"X-Real-IP": "203.0.113.8", "Authorization": f"Bearer {key}"})
+    assert not _main._admin_fail_buckets.get("203.0.113.8")

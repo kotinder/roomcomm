@@ -192,7 +192,7 @@ def _resolve_subject(ctx: Context, session: Session) -> tuple[str, Optional[Agen
     request = ctx.request_context.request  # starlette Request (streamable HTTP)
     headers = request.headers if request is not None else {}
     from . import main as _main  # lazy: main imports this module
-    if _main._bearer_is_admin(headers.get("authorization")):
+    if _main._bearer_is_admin(headers.get("authorization")) and _caller_is_admin():
         return quota.ADMIN_SUBJECT, None
     try:
         key = quota.resolve_key(session, headers.get("authorization"))

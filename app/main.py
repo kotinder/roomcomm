@@ -479,7 +479,7 @@ def _get_room_or_404(session: Session, room_uuid: str) -> Room:
 
 def _resolve_subject(request: Request, session: Session) -> tuple[str, Optional[AgentKey]]:
     """(subject, key) for this request: 'key:<id>' with valid Bearer, else 'ip:<addr>'."""
-    if _bearer_is_admin(request.headers.get("authorization")):
+    if _bearer_is_admin(request.headers.get("authorization")) and _request_is_admin(request):
         return quota.ADMIN_SUBJECT, None
     try:
         key = quota.resolve_key(session, request.headers.get("authorization"))
@@ -2565,6 +2565,49 @@ ADMIN_LOGIN_WINDOW = 3600
 _admin_login_buckets: dict[str, deque] = defaultdict(deque)
 _admin_login_lock = Lock()
 
+# Failed admin-token guesses per IP, across every door (login form, legacy
+# /admin/{token}, Bearer, X-Roomcomm-Admin, cookie). Past the limit the IP is
+# locked out of admin for the rest of the window — even with the right token —
+# so the per-request header check can't be used to brute-force the token.
+# Non-admin traffic from that IP is unaffected.
+ADMIN_FAIL_LIMIT = 10
+ADMIN_FAIL_WINDOW = 3600
+_admin_fail_buckets: dict[str, deque] = defaultdict(deque)
+_admin_fail_lock = Lock()
+
+
+def _admin_locked_out(ip: str) -> bool:
+    now = time.monotonic()
+    with _admin_fail_lock:
+        bucket = _admin_fail_buckets[ip]
+        while bucket and bucket[0] < now - ADMIN_FAIL_WINDOW:
+            bucket.popleft()
+        if not bucket:
+            del _admin_fail_buckets[ip]
+            return False
+        return len(bucket) >= ADMIN_FAIL_LIMIT
+
+
+def _record_admin_fail(ip: str) -> None:
+    with _admin_fail_lock:
+        _admin_fail_buckets[ip].append(time.monotonic())
+    log.warning("admin token mismatch from %s", ip)
+
+
+def _admin_attempt(request: Request, candidates: list) -> bool:
+    """True if one of the presented candidate tokens is the admin token.
+    Nothing presented → False, not a failure. Locked-out IP → always False."""
+    presented = [c for c in candidates if c]
+    if not presented:
+        return False
+    ip = _client_ip(request)
+    if _admin_locked_out(ip):
+        return False
+    if any(_admin_token_ok(c) for c in presented):
+        return True
+    _record_admin_fail(ip)
+    return False
+
 
 def _admin_token_ok(token: Optional[str]) -> bool:
     return bool(ADMIN_TOKEN) and bool(token) and secrets.compare_digest(token, ADMIN_TOKEN)
@@ -2575,23 +2618,32 @@ def _bearer_is_admin(authorization: Optional[str]) -> bool:
     return auth.lower().startswith("bearer ") and _admin_token_ok(auth[7:].strip())
 
 
-def _check_admin(token: str) -> None:
-    if not _admin_token_ok(token):
+def _check_admin(request: Request, token: str) -> None:
+    if not _admin_attempt(request, [token]):
         raise HTTPException(status_code=404, detail="Not found")
 
 
 def _check_admin_request(request: Request) -> None:
     """Admin auth from header (Bearer) or session cookie. 404 on failure —
     same hide-the-door behavior as before."""
-    if _bearer_is_admin(request.headers.get("authorization")):
-        return
-    # Separate header so an agent can keep its own key in Authorization
-    # (authorship, verified-only gates) and still be the admin.
-    if _admin_token_ok(request.headers.get(ADMIN_HEADER)):
-        return
-    if _admin_token_ok(request.cookies.get(ADMIN_COOKIE)):
-        return
-    raise HTTPException(status_code=404, detail="Not found")
+    # Evaluated once per request (middleware + endpoint + MCP share the ASGI
+    # scope), so one request never counts as several failed guesses.
+    ok = request.scope.get("roomcomm.admin")
+    if ok is None:
+        auth = request.headers.get("authorization") or ""
+        bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if bearer.startswith(quota.KEY_PREFIX):
+            bearer = ""  # an agent key, not an admin-token guess
+        ok = _admin_attempt(request, [
+            bearer,
+            # Separate header so an agent can keep its own key in Authorization
+            # (authorship, verified-only gates) and still be the admin.
+            request.headers.get(ADMIN_HEADER),
+            request.cookies.get(ADMIN_COOKIE),
+        ])
+        request.scope["roomcomm.admin"] = ok
+    if not ok:
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _request_is_admin(request: Request) -> bool:
@@ -2756,7 +2808,7 @@ ADMIN_LOGIN_HTML = """<!doctype html>
 def admin_login(request: Request, token: str = Form(default="")):
     _check_bucket_rate(request, _admin_login_buckets, _admin_login_lock,
                        ADMIN_LOGIN_LIMIT, ADMIN_LOGIN_WINDOW, "login attempts")
-    if not _admin_token_ok(token.strip()):
+    if not _admin_attempt(request, [token.strip()]):
         raise HTTPException(status_code=404, detail="Not found")
     return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
 
@@ -2773,7 +2825,7 @@ def admin_logout(request: Request):
 @app.get("/admin/{token}", response_class=HTMLResponse)
 def admin_page_legacy(token: str, request: Request):
     """Old bookmark path — logs in and redirects so the token leaves the URL."""
-    _check_admin(token)
+    _check_admin(request, token)
     return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
 
 
