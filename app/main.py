@@ -2990,6 +2990,12 @@ def admin_set_tier(
 from .mcp_server import mcp_endpoint as _mcp_endpoint  # noqa: E402
 app.add_route("/mcp", _mcp_endpoint, methods=["GET", "POST", "DELETE"])
 
+# ---------- A2A (Agent2Agent v1.0, JSON-RPC at /a2a) ----------
+# Agent Cards at /.well-known/agent-card.json and /{uuid}/.well-known/…;
+# see app/a2a.py and docs/a2a-design.md.
+from .a2a import router as _a2a_router  # noqa: E402
+app.include_router(_a2a_router)
+
 
 @app.post("/admin/rooms/{room_uuid}/delete")
 def admin_delete_room(
