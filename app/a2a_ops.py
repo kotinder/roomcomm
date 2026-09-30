@@ -50,9 +50,11 @@ class Caller:
     key: Optional[AgentKey]
     is_admin: bool = False
     base_url: str = "https://roomcomm.xyz"
-    # The transport's per-IP burst limit on room creation (REST: 30/hour/IP);
-    # raises OpError when tripped.
-    create_rate_check: Optional[Callable[[], None]] = None
+    # The transport's per-IP burst limits, same buckets as REST: called with
+    # "room" (30 rooms/hour/IP) or "file" (file uploads); raises OpError.
+    rate_check: Optional[Callable[[str], None]] = None
+    # ROOMCOMM_FILE_EXCHANGE kill switch, resolved by the transport.
+    files_enabled: bool = True
 
 
 def _ts(v) -> Optional[str]:
@@ -90,6 +92,11 @@ def _count(session: Session, caller: Caller, kind: str) -> None:
         quota.check_and_count(session, caller.subject, kind, caller.key)
     except quota.QuotaExceeded as e:
         raise OpError("quota_exceeded", e.detail, 429, e.retry_after)
+
+
+def _rate(caller: Caller, kind: str) -> None:
+    if caller.rate_check is not None and not caller.is_admin:
+        caller.rate_check(kind)
 
 
 def _msg(m: Message, refs: dict) -> dict:
@@ -148,8 +155,9 @@ def room_info(session: Session, caller: Caller, room: str) -> dict:
 
 def read(session: Session, caller: Caller, room: str,
          since: Optional[int] = None, limit: Optional[int] = None) -> dict:
-    """Messages with id > since. With a key and no ``since``, starts from the
-    key's read watermark, so an A2A agent can just say "read" every tick."""
+    """Messages with id > since, oldest first, like REST/MCP. With a key and
+    no ``since`` it starts from the key's read watermark (REST would start from
+    the beginning), so an A2A agent can just say "read" every tick."""
     room_uuid = parse_room_id(room)
     if session.get(Room, room_uuid) is None:
         _meter_idle(session, caller, "read_404")
@@ -161,15 +169,9 @@ def read(session: Session, caller: Caller, room: str,
     stmt = select(Message).where(Message.room_uuid == room_uuid)
     if since is not None:
         stmt = stmt.where(Message.id > int(since))
-        stmt = stmt.order_by(Message.id.asc()).limit(n + 1)
-        rows = list(session.exec(stmt).all())
-        has_more = len(rows) > n
-        rows = rows[:n]
-    else:
-        # First look without a watermark: the latest n, oldest first.
-        rows = list(session.exec(stmt.order_by(Message.id.desc()).limit(n + 1)).all())
-        has_more = len(rows) > n
-        rows = list(reversed(rows[:n]))
+    rows = list(session.exec(stmt.order_by(Message.id.asc()).limit(n + 1)).all())
+    has_more = len(rows) > n  # same meaning as REST/MCP: newer messages remain
+    rows = rows[:n]
     if not rows:
         _meter_idle(session, caller, "read_empty")
     refs = authorship.refs_for(session, rows)
@@ -237,16 +239,33 @@ def post(session: Session, caller: Caller, room: str, text: str,
 
 def messages_between(session: Session, room_uuid: str, after: Optional[int],
                      before: int, exclude_key_id: Optional[int],
-                     limit: int = 20) -> list[dict]:
+                     limit: int = 20) -> tuple[list[dict], int]:
     """What others said since the caller last looked, up to its own new post —
-    the reply a conversational A2A client gets back for a posted message."""
+    the reply a conversational A2A client gets back for a posted message.
+    Returns (the newest ``limit`` of them, how many older ones were left out):
+    posting moves the watermark past all of them, so the caller must be told
+    when the catch-up is partial."""
     stmt = select(Message).where(Message.room_uuid == room_uuid, Message.id < before)
     if after is not None:
         stmt = stmt.where(Message.id > after)
-    rows = list(session.exec(stmt.order_by(Message.id.desc()).limit(limit)).all())
-    rows = [m for m in reversed(rows) if exclude_key_id is None or m.key_id != exclude_key_id]
+    if exclude_key_id is not None:
+        stmt = stmt.where((Message.key_id == None) | (Message.key_id != exclude_key_id))  # noqa: E711
+    rows = list(session.exec(stmt.order_by(Message.id.desc()).limit(limit + 1)).all())
+    skipped = 0
+    if len(rows) > limit:
+        rows = rows[:limit]
+        if after is not None:
+            cnt = select(func.count()).select_from(Message).where(
+                Message.room_uuid == room_uuid, Message.id > after,
+                Message.id < rows[-1].id)
+            if exclude_key_id is not None:
+                cnt = cnt.where((Message.key_id == None) | (Message.key_id != exclude_key_id))  # noqa: E711
+            skipped = session.exec(cnt).one()
+        else:
+            skipped = -1  # no watermark: older history exists, count irrelevant
+    rows = list(reversed(rows))
     refs = authorship.refs_for(session, rows)
-    return [_msg(m, refs) for m in rows]
+    return [_msg(m, refs) for m in rows], skipped
 
 
 def watermark(session: Session, caller: Caller, room_uuid: str) -> Optional[int]:
@@ -256,75 +275,91 @@ def watermark(session: Session, caller: Caller, room_uuid: str) -> Optional[int]
     return seen.last_seen_msg_id if seen else None
 
 
-async def create_room(session: Session, caller: Caller, description: str = "",
-                      is_public: bool = False, protocol_mode: str = "standard",
-                      ttl_hours: Optional[int] = None) -> dict:
-    """Mirror of MCP create_room / REST POST /api/rooms, gate for gate."""
+def create_room(session: Session, caller: Caller, description: str = "",
+                is_public: bool = False, protocol_mode: str = "standard",
+                ttl_hours: Optional[int] = None, write_policy: str = "open") -> dict:
+    """REST POST /api/rooms, gate for gate and in the same order: per-IP rate →
+    keyed create → public/premium gates → daily quota → arbiter configured →
+    moderation (last, so refused callers never cost an LLM call). Sync, like
+    the REST handler: the transport runs it in the threadpool."""
     description = (description or "").strip()
-    if len(description) > DESCRIPTION_MAX:
-        raise OpError("invalid_params", "description too long (max 500 chars)")
     if protocol_mode not in ("standard", "premium"):
         raise OpError("invalid_params", 'protocol_mode must be "standard" or "premium"')
+    if write_policy not in ("open", "key"):
+        raise OpError("invalid_params", 'write_policy must be "open" or "key"')
     try:
         expires_at = ttl.resolve(ttl_hours=ttl_hours)
     except ttl.TTLRangeError as e:
         raise OpError("invalid_params", str(e))
+    _rate(caller, "room")
     key = caller.key
     if key is None and not caller.is_admin and quota.keyed_create_required():
-        raise OpError("unauthorized", quota.keyed_create_denied_reason(), 401)
+        raise OpError("forbidden", quota.keyed_create_denied_reason(), 403)
     if is_public:
         reason = quota.public_create_denied_reason(key)
         if reason is not None:
             raise OpError("forbidden", reason, 403)
-        if llm.moderation_enabled():
-            # Hand the pooled connection back before a network await
-            # (the 30.09.2026 pool-exhaustion lesson).
-            session.commit()
-            try:
-                allowed, why = await llm.moderate_public_description(description)
-            except llm.LLMUnavailable:
-                raise OpError("unavailable",
-                              "automated moderation for the public listing is unavailable "
-                              "right now — retry shortly, or create the room unlisted.", 503)
-            if not allowed:
-                raise OpError("forbidden",
-                              f"this description was rejected by automated moderation for "
-                              f"the public listing ({why}). Reword it, or create it unlisted.", 403)
     if protocol_mode == "premium":
         reason = quota.premium_create_denied_reason(key)
         if reason is not None:
             raise OpError("forbidden", reason, 403)
-        if not llm.is_configured():
-            raise OpError("unavailable", "premium rooms require the LLM arbiter, which "
-                          "is not configured on this server", 503)
-    if caller.create_rate_check is not None and not caller.is_admin:
-        caller.create_rate_check()
     _count(session, caller, "room")
+    if len(description) > DESCRIPTION_MAX:
+        raise OpError("invalid_params", "description too long (max 500 chars)")
+    if protocol_mode == "premium" and not llm.is_configured():
+        raise OpError("unavailable", "premium rooms require the LLM arbiter, which "
+                      "is not configured on this server", 503)
+    if is_public and llm.moderation_enabled():
+        # Hand the pooled connection back before the network call (the
+        # 30.09.2026 pool-exhaustion lesson); the quota count stays committed,
+        # exactly as REST's does.
+        session.commit()
+        try:
+            allowed, why = llm.moderate_public_description_sync(description)
+        except llm.LLMUnavailable:
+            raise OpError("unavailable",
+                          "automated moderation for the public listing is unavailable "
+                          "right now — retry shortly, or create the room unlisted.", 503)
+        if not allowed:
+            raise OpError("forbidden",
+                          f"this description was rejected by automated moderation for "
+                          f"the public listing ({why}). Reword it, or create it unlisted.", 403)
+    room_write_key: Optional[str] = None
+    if write_policy == "key":
+        room_write_key = quota.generate_room_key()
     room = Room(
         uuid=str(uuid_lib.uuid4()),
         description=description,
         is_public=bool(is_public),
         protocol_mode=protocol_mode,
+        write_policy=write_policy,
+        write_key_hash=quota.hash_key(room_write_key) if room_write_key else None,
         owner_key_id=key.id if key else None,
         expires_at=expires_at,
     )
     session.add(room)
     session.commit()
     session.refresh(room)
-    return {
+    out = {
         "uuid": room.uuid,
         "url": f"{caller.base_url}/{room.uuid}",
         "a2a_url": f"{caller.base_url}/a2a/{room.uuid}",
         "description": room.description or "",
         "is_public": room.is_public,
         "protocol_mode": room.protocol_mode,
+        "write_policy": room.write_policy,
         "created_at": _ts(room.created_at),
         "expires_at": ttl.format_expiry(room),
     }
+    if room_write_key:
+        out["write_key"] = room_write_key  # shown once, like REST
+    return out
 
 
 def list_rooms(session: Session, caller: Caller, sort: str = "active",
                limit: int = 50, offset: int = 0) -> dict:
+    if sort not in ("active", "new"):
+        raise OpError("invalid_params", 'sort must be "active" or "new"')
     limit = min(max(1, int(limit)), 200)
     offset = max(0, int(offset))
     try:
@@ -384,6 +419,8 @@ def check_inbox(session: Session, caller: Caller) -> dict:
 
 
 def _file_key(caller: Caller) -> AgentKey:
+    if not caller.files_enabled:
+        raise OpError("unavailable", "file exchange is disabled on this server", 404)
     _auth(quota.check_file_exchange, caller.key)
     return caller.key  # type: ignore[return-value]
 
@@ -406,10 +443,11 @@ def share_file(session: Session, caller: Caller, room: str, name: str, content: 
     room_uuid = parse_room_id(room)
     r = get_room(session, caller, room_uuid)
     key = _file_key(caller)
-    agent_id = (agent_id or key.agent_id or "").strip()
+    agent_id = (agent_id or key.agent_id or "unknown").strip()  # REST fallback
     if not agent_id or len(agent_id) > AGENT_ID_MAX:
         raise OpError("invalid_params", "agent_id must be 1–100 characters")
     _auth(quota.check_write_policy, r, room_key, key)
+    _rate(caller, "file")
     try:
         rf, deduped = files.store(session, r, key, agent_id=agent_id, name=name,
                                   data=content, description=description or "")

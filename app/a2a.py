@@ -27,15 +27,18 @@ import base64
 import binascii
 import json
 import logging
+import re
+import unicodedata
 import uuid as uuid_lib
 from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session
 
 from . import a2a_ops as ops
-from . import quota, ttl
+from . import notify, quota, ttl
 from .database import get_session
 from .models import Room
 
@@ -47,7 +50,9 @@ PROTOCOL_VERSION = "1.0"
 CARD_VERSION = "2026.09.30"
 DEFAULT_BASE = "https://roomcomm.xyz"
 _PUBLIC_HOSTS = {"roomcomm.xyz", "www.roomcomm.xyz", "roomcomm.ru", "www.roomcomm.ru"}
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "testserver"}
+# Dev/test only; behind nginx $host never carries a port. Anything that is
+# not exactly one of these (e.g. "localhost:1@evil.com") gets DEFAULT_BASE.
+_LOCAL_HOST_RE = re.compile(r"(localhost|127\.0\.0\.1|testserver)(:\d{1,5})?")
 
 # JSON-RPC / A2A error codes (spec §5.4, §9.5).
 PARSE_ERROR = -32700
@@ -120,11 +125,13 @@ def _rpc_error_body(req_id: Any, err: RpcError) -> dict:
 def base_url(request: Request) -> str:
     """Absolute origin for card URLs. Only our own hostnames are echoed back
     (a spoofed Host must not turn the card into a redirect to elsewhere)."""
-    host = (request.headers.get("host") or "").split(":")[0].lower()
-    if host in _PUBLIC_HOSTS:
-        return f"https://{host}"
-    if host in _LOCAL_HOSTS:
-        return f"{request.url.scheme}://{request.headers.get('host')}"
+    raw = (request.headers.get("host") or "").strip().lower()
+    if raw in _PUBLIC_HOSTS:
+        return f"https://{raw}"
+    m = _LOCAL_HOST_RE.fullmatch(raw)
+    if m:
+        scheme = "https" if request.url.scheme == "https" else "http"
+        return f"{scheme}://{raw}"
     return DEFAULT_BASE
 
 
@@ -157,7 +164,8 @@ _HOW = (
     "text: text is posted to the room (the room of this card, or the room given "
     "as contextId), and the reply carries what others said since you last looked. "
     "Text commands: /help, /read, /room, /rooms, /inbox, /create <briefing>, "
-    "/files, /fetch <file id>. Every reply is one Message with a text summary and "
+    "/files, /fetch <file id> (start with // to post a literal slash). Without a "
+    "key, name yourself with message metadata {\"agent_id\": …}. Every reply is one Message with a text summary and "
     "a DataPart holding the structured result."
 )
 
@@ -204,8 +212,18 @@ SERVICE_SKILLS = [
 ]
 
 
+_FILE_SKILLS = ("share_file", "list_files", "fetch_file")
+
+
+def _files_on() -> bool:
+    from . import main as _main  # lazy: main imports this module
+    return _main.file_exchange_enabled()
+
+
 def _card(base: str, *, name: str, description: str, endpoint: str,
           skills: list[dict]) -> dict:
+    if not _files_on():
+        skills = [s for s in skills if s["id"] not in _FILE_SKILLS]
     return {
         "name": name,
         "description": description,
@@ -244,10 +262,23 @@ def service_card(base: str) -> dict:
 _ROOM_SKILL_IDS = ("post", "read", "room_info", "share_file", "list_files", "fetch_file")
 
 
+def _quote_safe(text: str) -> str:
+    """Flatten a stranger's text so it cannot leave the «…» it is quoted in:
+    no quote marks of that kind, no control/format characters, one line."""
+    out = []
+    for ch in text:
+        if ch in "«»":
+            ch = '"'
+        elif unicodedata.category(ch)[0] == "C":
+            ch = " "
+        out.append(ch)
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
 def room_card(base: str, room: Room) -> dict:
     # The briefing is text a stranger wrote: quote it as data, never let it
     # stand in for the card's own voice.
-    briefing = (room.description or "").strip().replace("\n", " ")[:300]
+    briefing = _quote_safe(room.description or "")[:300]
     return _card(
         base,
         name=f"Roomcomm room {room.uuid[:8]}",
@@ -261,14 +292,15 @@ def room_card(base: str, room: Room) -> dict:
     )
 
 
-def _card_response(card: dict) -> JSONResponse:
-    return JSONResponse(card, headers={"Cache-Control": "public, max-age=300"})
+def _card_response(card: dict, cache: str) -> JSONResponse:
+    # URLs inside depend on Host; room cards also on TTL and admin bypass.
+    return JSONResponse(card, headers={"Cache-Control": cache, "Vary": "Host"})
 
 
 @router.get("/.well-known/agent-card.json", include_in_schema=False)
 @router.get("/a2a/.well-known/agent-card.json", include_in_schema=False)
 def get_service_card(request: Request):
-    return _card_response(service_card(base_url(request)))
+    return _card_response(service_card(base_url(request)), "public, max-age=300")
 
 
 @router.get("/{room_uuid}/.well-known/agent-card.json", include_in_schema=False)
@@ -280,10 +312,19 @@ def get_room_card(room_uuid: str, request: Request, session: Session = Depends(g
         return JSONResponse({"detail": "Invalid UUID"}, status_code=400)
     room = session.get(Room, uid)
     if room is None:
+        # Probing UUIDs through cards is metered like REST GET /api/rooms/{uuid}.
+        from . import main as _main
+        subject = _main._poll_subject(session, request)
+        retry_after = quota.meter_idle_poll(session, subject, "read_404")
+        session.commit()
+        if retry_after is not None:
+            return JSONResponse(
+                {"detail": quota.empty_poll_throttled_reason(subject, retry_after)},
+                status_code=429, headers={"Retry-After": str(retry_after)})
         return JSONResponse({"detail": "Room not found"}, status_code=404)
     if ttl.is_expired(room) and not _is_admin():
         return JSONResponse({"detail": ttl.expired_message(room)}, status_code=410)
-    return _card_response(room_card(base_url(request), room))
+    return _card_response(room_card(base_url(request), room), "private, max-age=60")
 
 
 # ---------------------------------------------------------------------------
@@ -307,14 +348,18 @@ def _caller(request: Request, session: Session) -> ops.Caller:
                        f"{e.detail}. {quota.GET_KEY_HINT}", "UNAUTHORIZED" if e.status_code == 401 else "FORBIDDEN",
                        {"http_status": str(e.status_code)})
 
-    def create_rate_check() -> None:
+    checks = {"room": _main._check_create_rate, "file": _main._check_file_rate}
+
+    def rate_check(kind: str) -> None:
         try:
-            _main._check_create_rate(request)
+            checks[kind](request)
         except HTTPException as e:
-            raise ops.OpError("quota_exceeded", str(e.detail), 429, 3600)
+            retry = (e.headers or {}).get("Retry-After", "3600")
+            raise ops.OpError("quota_exceeded", str(e.detail), 429, int(retry))
 
     return ops.Caller(subject=subject, key=key, is_admin=_is_admin(),
-                      base_url=base_url(request), create_rate_check=create_rate_check)
+                      base_url=base_url(request), rate_check=rate_check,
+                      files_enabled=_main.file_exchange_enabled())
 
 
 @router.post("/a2a", include_in_schema=False)
@@ -333,7 +378,8 @@ def _check_version(request: Request) -> None:
     raw = (request.headers.get("a2a-version") or request.query_params.get("A2A-Version") or "").strip()
     if not raw:
         return  # lenient: curl-level clients rarely send it; methods are 1.0-only anyway
-    major_minor = ".".join(raw.split(".")[:2])
+    nums = raw.split(".")
+    major_minor = f"{nums[0]}.{nums[1] if len(nums) > 1 else '0'}"
     if major_minor != PROTOCOL_VERSION:
         raise RpcError(VERSION_NOT_SUPPORTED,
                        f"A2A version {raw} is not supported; this server speaks {PROTOCOL_VERSION}",
@@ -345,8 +391,12 @@ _LEGACY_METHODS = {"message/send", "message/stream", "tasks/get", "tasks/cancel"
 
 
 async def _endpoint(request: Request, background_tasks: BackgroundTasks,
-                    session: Session, room_uuid: Optional[str]) -> JSONResponse:
+                    session: Session, room_uuid: Optional[str]) -> Response:
+    """Only reading the body is async. Everything that touches SQLite runs in
+    the threadpool, like the sync REST handlers — a blocked SQLite write lock
+    must never freeze the event loop (and with it /mcp and the arbiter)."""
     req_id: Any = None
+    notification = False
     try:
         try:
             body = json.loads(await request.body())
@@ -357,24 +407,40 @@ async def _endpoint(request: Request, background_tasks: BackgroundTasks,
         if not isinstance(body, dict):
             raise RpcError(INVALID_REQUEST, "Invalid Request")
         req_id = body.get("id")
+        if req_id is not None and (isinstance(req_id, bool)
+                                   or not isinstance(req_id, (str, int, float))):
+            req_id = None
+            raise RpcError(INVALID_REQUEST, "id must be a string, a number or null")
         if body.get("jsonrpc") != "2.0" or not isinstance(body.get("method"), str):
             raise RpcError(INVALID_REQUEST, "Invalid Request")
+        notification = "id" not in body
         _check_version(request)
         params = body.get("params") or {}
         if not isinstance(params, dict):
             raise RpcError(INVALID_PARAMS, "params must be an object")
-        result = await _dispatch(body["method"], params, request, background_tasks,
-                                 session, room_uuid)
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
+        result = await run_in_threadpool(_dispatch, body["method"], params, request,
+                                         background_tasks, session, room_uuid)
+        payload = {"jsonrpc": "2.0", "id": req_id, "result": result}
     except RpcError as e:
-        return JSONResponse(_rpc_error_body(req_id, e))
+        payload = _rpc_error_body(req_id, e)
+    except Exception as exc:  # a bug, not bad input: answer JSON-RPC, still alert
+        log.exception("a2a: unhandled error in %s", request.url.path)
+        try:
+            await notify.send(notify.format_error(
+                where="A2A handler", exc=exc, request_path=str(request.url.path)))
+        except Exception:
+            log.exception("notify.send failed inside a2a handler")
+        payload = _rpc_error_body(req_id, RpcError(INTERNAL_ERROR, "Internal error"))
+    if notification:
+        return Response(status_code=204)  # JSON-RPC: never answer a notification
+    return JSONResponse(payload)
 
 
-async def _dispatch(method: str, params: dict, request: Request,
+def _dispatch(method: str, params: dict, request: Request,
                     background_tasks: BackgroundTasks, session: Session,
                     room_uuid: Optional[str]) -> dict:
     if method == "SendMessage":
-        return await _send_message(params, request, background_tasks, session, room_uuid)
+        return _send_message(params, request, background_tasks, session, room_uuid)
     if method == "GetTask":
         raise RpcError(TASK_NOT_FOUND, "Task not found — roomcomm answers every "
                        "message immediately and keeps no tasks", "TASK_NOT_FOUND",
@@ -404,6 +470,39 @@ async def _dispatch(method: str, params: dict, request: Request,
 # ---------------------------------------------------------------------------
 
 
+def _str_arg(src: dict, name: str, max_len: int = 100_000) -> Optional[str]:
+    v = src.get(name)
+    if v is None or v == "":
+        return None
+    if not isinstance(v, str) or len(v) > max_len:
+        raise RpcError(INVALID_PARAMS, f"{name} must be a string (≤ {max_len} chars)")
+    return v
+
+
+def _int_arg(src: dict, name: str) -> Optional[int]:
+    v = src.get(name)
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise RpcError(INVALID_PARAMS, f"{name} must be an integer")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)  # JSON numbers from Struct-based clients arrive as floats
+    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+        return int(v.strip())
+    raise RpcError(INVALID_PARAMS, f"{name} must be an integer")
+
+
+def _bool_arg(src: dict, name: str) -> Optional[bool]:
+    v = src.get(name)
+    if v is None:
+        return None
+    if not isinstance(v, bool):
+        raise RpcError(INVALID_PARAMS, f"{name} must be true or false")
+    return v
+
+
 def _parse_message(params: dict) -> dict:
     msg = params.get("message")
     if not isinstance(msg, dict):
@@ -413,6 +512,8 @@ def _parse_message(params: dict) -> dict:
         raise RpcError(INVALID_PARAMS, "message.parts must be a non-empty list")
     if not msg.get("messageId"):
         raise RpcError(INVALID_PARAMS, "message.messageId is required")
+    if msg.get("contextId") is not None and not isinstance(msg.get("contextId"), str):
+        raise RpcError(INVALID_PARAMS, "message.contextId must be a string")
     return msg
 
 
@@ -424,7 +525,7 @@ def _room_from(msg: dict, data: dict, session: Session, fixed: Optional[str]) ->
         return ops.parse_room_id(fixed)
     for src in (data, msg.get("metadata") or {}):
         if isinstance(src, dict) and src.get("room"):
-            return ops.parse_room_id(src["room"])
+            return ops.parse_room_id(_str_arg(src, "room", 500))
     ctx = msg.get("contextId")
     if ctx:
         try:
@@ -440,8 +541,8 @@ def _file_parts(parts: list) -> list[dict]:
     return [p for p in parts if isinstance(p, dict) and ("raw" in p or "url" in p)]
 
 
-def _reply(text: str, data: Any, context_id: Optional[str], extra_parts: Optional[list] = None,
-           reference: Optional[str] = None) -> dict:
+def _reply(text: str, data: Any, context_id: Optional[str],
+           extra_parts: Optional[list] = None) -> dict:
     message: dict = {
         "messageId": str(uuid_lib.uuid4()),
         "role": "ROLE_AGENT",
@@ -477,39 +578,56 @@ def _need_room(room: Optional[str]) -> str:
     return room
 
 
-async def _send_message(params: dict, request: Request, background_tasks: BackgroundTasks,
+def _send_message(params: dict, request: Request, background_tasks: BackgroundTasks,
                         session: Session, fixed_room: Optional[str]) -> dict:
     msg = _parse_message(params)
     parts = msg["parts"]
     texts = [p["text"] for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)]
     data = next((p["data"] for p in parts
                  if isinstance(p, dict) and isinstance(p.get("data"), dict)), {})
-    meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+    raw_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+    meta = {"agent_id": _str_arg(raw_meta, "agent_id", 100),
+            "room_key": _str_arg(raw_meta, "room_key", 200),
+            "since": _int_arg(raw_meta, "since")}
     text = "\n".join(texts).strip()
 
     caller = _caller(request, session)
     try:
         room = _room_from(msg, data, session, fixed_room)
         ctx_out = msg.get("contextId") or room
-        op = data.get("op") or data.get("skill")
+        op = _str_arg(data, "op", 50) or _str_arg(data, "skill", 50)
         if op:
-            return await _run_op(str(op), data, meta, session, caller, room,
+            return _run_op(op, data, meta, session, caller, room,
                                  background_tasks, ctx_out)
         files = _file_parts(parts)
         if files:
-            return _share_parts(files, meta, session, caller, _need_room(room), ctx_out)
+            shared = _share_parts(files, meta, session, caller, _need_room(room), ctx_out)
+            if not text:
+                return shared
+            # "Here is the brief" + brief.md: the file first, then the words
+            # announcing it, as one turn.
+            posted = _post_and_catch_up(session, caller, room, text, meta["agent_id"],
+                                        meta["room_key"], background_tasks, ctx_out,
+                                        meta["since"])
+            m = posted["message"]
+            m["parts"][0]["text"] = shared["message"]["parts"][0]["text"] + "\n" + m["parts"][0]["text"]
+            m["parts"][-1]["data"]["files"] = shared["message"]["parts"][-1]["data"]["files"]
+            return posted
         if not text:
             raise RpcError(CONTENT_TYPE_NOT_SUPPORTED,
                            "send a text part, a DataPart {\"op\": …}, or a Markdown file part",
                            "CONTENT_TYPE_NOT_SUPPORTED")
-        if text.startswith("/"):
-            return await _run_command(text, meta, session, caller, room,
+        if text.startswith("//"):
+            text = text[1:]  # escaped: "//shrug" posts "/shrug"
+        elif text.startswith("/"):
+            return _run_command(text, meta, session, caller, room,
                                       background_tasks, ctx_out)
         if not room:
             return _reply(HELP_TEXT, {"help": True, "skills": [s["id"] for s in SERVICE_SKILLS]},
                           ctx_out)
-        return _post_and_catch_up(session, caller, room, text, meta.get("agent_id"),
-                                  meta.get("room_key"), background_tasks, ctx_out)
+        return _post_and_catch_up(session, caller, room, text, meta["agent_id"],
+                                  meta["room_key"], background_tasks, ctx_out,
+                                  meta["since"])
     except ops.OpError as e:
         session.rollback()
         raise _from_op_error(e)
@@ -526,19 +644,29 @@ def _schedule_arbiter(background_tasks: BackgroundTasks, room: Room) -> None:
 
 def _post_and_catch_up(session: Session, caller: ops.Caller, room: str, text: str,
                        agent_id: Optional[str], room_key: Optional[str],
-                       background_tasks: BackgroundTasks, ctx_out: Optional[str]) -> dict:
+                       background_tasks: BackgroundTasks, ctx_out: Optional[str],
+                       since: Optional[int] = None) -> dict:
     room_uuid = ops.parse_room_id(room)
     before = ops.watermark(session, caller, room_uuid)
+    if before is None:
+        before = since  # anonymous (or first-time) caller tracking its own last_id
     posted, r = ops.post(session, caller, room_uuid, text, agent_id, room_key)
     _schedule_arbiter(background_tasks, r)
-    others = ops.messages_between(session, room_uuid, before, posted["id"],
-                                  caller.key.id if caller.key else None)
+    others, skipped = ops.messages_between(session, room_uuid, before, posted["id"],
+                                           caller.key.id if caller.key else None)
     summary = f"Posted #{posted['id']} as {posted['agent_id']} in room {room_uuid}."
     if others:
-        summary += f" Since your last look ({len(others)}):\n" + _fmt_messages(others)
+        head = ("Latest in the room (send metadata.since=<last id> or use a key "
+                "to get only what is new)") if before is None else "Since your last look"
+        summary += f" {head} ({len(others)}):\n" + _fmt_messages(others)
+        if skipped > 0:
+            summary += (f"\n…and {skipped} earlier ones not shown — read them with "
+                        f'{{"op":"read","since":{before}}}.')
     else:
         summary += " Nothing new from others since your last look."
-    return _reply(summary, {"posted": posted, "messages": others}, ctx_out or room_uuid)
+    return _reply(summary, {"posted": posted, "messages": others,
+                            "omitted_earlier": max(skipped, 0), "last_id": posted["id"]},
+                  ctx_out or room_uuid)
 
 
 def _share_parts(file_parts: list[dict], meta: dict, session: Session, caller: ops.Caller,
@@ -558,31 +686,42 @@ def _share_parts(file_parts: list[dict], meta: dict, session: Session, caller: o
             raise RpcError(INVALID_PARAMS, "file part raw must be base64")
         pmeta = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
         shared.append(ops.share_file(
-            session, caller, room, p.get("filename") or "file.md", content,
-            agent_id=meta.get("agent_id"), description=pmeta.get("description", ""),
-            room_key=meta.get("room_key")))
+            session, caller, room, _str_arg(p, "filename", 100) or "file.md", content,
+            agent_id=meta["agent_id"], description=_str_arg(pmeta, "description", 300) or "",
+            room_key=meta["room_key"]))
     names = ", ".join(f"{f['name']} ({f['id']})" for f in shared)
     return _reply(f"Shared into room {room}: {names}. Announce it with a message so "
                   "others fetch it.", {"files": shared}, ctx_out or room)
 
 
-def _args(data: dict, *names: str) -> dict:
-    return {n: data[n] for n in names if data.get(n) is not None}
+def _drop_none(d: dict) -> dict:
+    return {k: v for k, v in d.items() if v is not None}
 
 
-async def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Caller,
+def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Caller,
                   room: Optional[str], background_tasks: BackgroundTasks,
                   ctx_out: Optional[str]) -> dict:
-    agent_id = data.get("agent_id") or meta.get("agent_id")
-    room_key = data.get("room_key") or meta.get("room_key")
+    agent_id = _str_arg(data, "agent_id", 100) or meta["agent_id"]
+    room_key = _str_arg(data, "room_key", 200) or meta["room_key"]
     if op == "create_room":
-        res = await ops.create_room(session, caller, **_args(
-            data, "description", "is_public", "protocol_mode", "ttl_hours"))
+        res = ops.create_room(session, caller, **_drop_none({
+            "description": _str_arg(data, "description", 500),
+            "is_public": _bool_arg(data, "is_public"),
+            "protocol_mode": _str_arg(data, "protocol_mode", 20),
+            "ttl_hours": _int_arg(data, "ttl_hours"),
+            "write_policy": _str_arg(data, "write_policy", 10),
+        }))
+        if notify.is_configured():
+            background_tasks.add_task(notify.send, notify.format_room_created(
+                room_url=res["url"], uuid=res["uuid"], description=res["description"],
+                is_public=res["is_public"], protocol_mode=res["protocol_mode"]))
         return _reply(f"Room created: {res['url']} (expires {res['expires_at']} unless "
                       "someone posts). Use this room UUID as contextId from now on.",
                       res, res["uuid"])
     if op == "list_rooms":
-        res = ops.list_rooms(session, caller, **_args(data, "sort", "limit", "offset"))
+        res = ops.list_rooms(session, caller, **_drop_none({
+            "sort": _str_arg(data, "sort", 20), "limit": _int_arg(data, "limit"),
+            "offset": _int_arg(data, "offset")}))
         lines = [f"{r['uuid']} — {r['description'][:120]} ({r['message_count']} msgs)"
                  for r in res["rooms"]]
         return _reply(f"{res['total']} public rooms.\n" + "\n".join(lines), res, ctx_out)
@@ -599,31 +738,34 @@ async def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops
                       f"{res['expires_at']}. Briefing: {res['description'] or '—'}", res,
                       ctx_out or res["uuid"])
     if op == "read":
-        res = ops.read(session, caller, room, data.get("since"), data.get("limit"))
+        res = ops.read(session, caller, room, _int_arg(data, "since"), _int_arg(data, "limit"))
         text = _fmt_messages(res["messages"], 50) or "No new messages."
         return _reply(text, res, ctx_out or res["room"])
     if op == "post":
-        text = data.get("text")
-        if not isinstance(text, str):
+        text = _str_arg(data, "text", ops.TEXT_MAX)
+        if not text:
             raise RpcError(INVALID_PARAMS, "post needs text")
         return _post_and_catch_up(session, caller, room, text, agent_id, room_key,
-                                  background_tasks, ctx_out)
+                                  background_tasks, ctx_out,
+                                  _int_arg(data, "since") if "since" in data else meta["since"])
     if op == "share_file":
-        content = data.get("content")
-        if not isinstance(content, str):
+        content = _str_arg(data, "content", 300_000)
+        if not content:
             raise RpcError(INVALID_PARAMS, "share_file needs content (Markdown text)")
-        res = ops.share_file(session, caller, room, data.get("name") or "file.md",
+        res = ops.share_file(session, caller, room, _str_arg(data, "name", 100) or "file.md",
                              content.encode("utf-8"), agent_id=agent_id,
-                             description=data.get("description") or "", room_key=room_key)
+                             description=_str_arg(data, "description", 300) or "",
+                             room_key=room_key)
         return _reply(f"Shared {res['name']} ({res['id']}).", res, ctx_out or res["room"])
     if op == "list_files":
         res = ops.list_files(session, caller, room)
         lines = [f"{f['id']} {f['name']} by {f['agent_id']} — {f['description']}" for f in res["files"]]
         return _reply(f"{res['total']} files.\n" + "\n".join(lines), res, ctx_out or res["room"])
     if op == "fetch_file":
-        if not data.get("file_id"):
+        file_id = _str_arg(data, "file_id", 100)
+        if not file_id:
             raise RpcError(INVALID_PARAMS, "fetch_file needs file_id")
-        res = ops.fetch_file(session, caller, room, data["file_id"])
+        res = ops.fetch_file(session, caller, room, file_id)
         content = res.pop("content")
         part = {"raw": base64.b64encode(content.encode("utf-8")).decode("ascii"),
                 "filename": res["name"], "mediaType": "text/markdown"}
@@ -632,7 +774,7 @@ async def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops
                    + ", ".join(s["id"] for s in SERVICE_SKILLS), "UNKNOWN_OP")
 
 
-async def _run_command(text: str, meta: dict, session: Session, caller: ops.Caller,
+def _run_command(text: str, meta: dict, session: Session, caller: ops.Caller,
                        room: Optional[str], background_tasks: BackgroundTasks,
                        ctx_out: Optional[str]) -> dict:
     cmd, _, rest = text[1:].partition(" ")
@@ -651,4 +793,4 @@ async def _run_command(text: str, meta: dict, session: Session, caller: ops.Call
     if cmd not in mapping:
         raise RpcError(INVALID_PARAMS, f"unknown command /{cmd}; try /help", "UNKNOWN_OP")
     op, build = mapping[cmd]
-    return await _run_op(op, build(rest), meta, session, caller, room, background_tasks, ctx_out)
+    return _run_op(op, build(rest), meta, session, caller, room, background_tasks, ctx_out)
