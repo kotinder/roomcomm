@@ -19,6 +19,7 @@ from typing import Optional
 
 from sqlmodel import Session, select, func
 
+from . import ttl
 from .models import AgentKey, Message, Room, RoomSeen, utcnow
 
 # Substring search for an agent_id shorter than this is all noise ("ai", "gp").
@@ -113,33 +114,91 @@ def build_inbox(session: Session, key: AgentKey) -> dict:
         key=lambda r: (r["new_messages"] > 0, r["last_msg_id"]), reverse=True)
     rooms_out = rooms_out[:ROOMS_LIMIT]
 
-    mentions = []
-    name = (key.agent_id or "").strip().lower()
-    if len(name) >= MENTION_MIN_NAME:
-        cutoff = utcnow() - timedelta(days=MENTION_WINDOW_DAYS)
-        candidates = session.exec(
-            select(Message).where(
-                func.instr(func.lower(Message.text), name) > 0,
-                Message.timestamp >= cutoff,
-            ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)
-        ).all()
-        for m in candidates:
-            if m.key_id == key.id or m.agent_id == key.agent_id:
-                continue  # talking about yourself is not a mention
-            baseline = seen.get(m.room_uuid)
-            if baseline is not None and m.id <= baseline:
-                continue  # already read
-            mentions.append({
-                "room_uuid": m.room_uuid,
-                "msg_id": m.id,
-                "by": m.agent_id,
-                "text": m.text[:SNIPPET_LEN],
-                "at": m.timestamp,
-            })
-            if len(mentions) >= MENTION_LIMIT:
-                break
-
+    mentions = _mentions(session, key, seen, MENTION_LIMIT)
     return {"agent_id": key.agent_id, "rooms": rooms_out, "mentions": mentions}
+
+
+def _mentions(session: Session, key: AgentKey, seen: dict[str, int],
+              limit: int) -> list[dict]:
+    """Unread messages of the last MENTION_WINDOW_DAYS that name the key's
+    agent_id, newest first — the key's own posts and anything behind its
+    watermark excluded."""
+    mentions: list[dict] = []
+    name = (key.agent_id or "").strip().lower()
+    if len(name) < MENTION_MIN_NAME:
+        return mentions
+    cutoff = utcnow() - timedelta(days=MENTION_WINDOW_DAYS)
+    candidates = session.exec(
+        select(Message).where(
+            func.instr(func.lower(Message.text), name) > 0,
+            Message.timestamp >= cutoff,
+        ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)
+    ).all()
+    for m in candidates:
+        if m.key_id == key.id or m.agent_id == key.agent_id:
+            continue  # talking about yourself is not a mention
+        baseline = seen.get(m.room_uuid)
+        if baseline is not None and m.id <= baseline:
+            continue  # already read
+        mentions.append({
+            "room_uuid": m.room_uuid,
+            "msg_id": m.id,
+            "by": m.agent_id,
+            "text": m.text[:SNIPPET_LEN],
+            "at": m.timestamp,
+        })
+        if len(mentions) >= limit:
+            break
+    return mentions
+
+
+AWAITING_LIMIT = 3
+
+
+def awaiting(session: Session, key: AgentKey, exclude_room: Optional[str] = None,
+             now=None) -> dict:
+    """"You are awaited elsewhere" — the cheap digest a transport can attach to
+    EVERY answer (the igrastation pattern: the notice rides on the calls the
+    agent already makes in its loop, so it reaches agents that never learned
+    about check_inbox). Unlike build_inbox it costs a fixed number of queries
+    whatever the key's history: one aggregate over the key's watermarks and
+    one mention scan. Rooms past their TTL are left out — nobody can answer
+    there. Side-effect free, never metered: it rides on a request that
+    already was."""
+    seen = {
+        r.room_uuid: r.last_seen_msg_id
+        for r in session.exec(select(RoomSeen).where(RoomSeen.key_id == key.id)).all()
+    }
+    rows = session.exec(
+        select(Message.room_uuid, func.count(Message.id))
+        .join(RoomSeen, (RoomSeen.room_uuid == Message.room_uuid)
+              & (RoomSeen.key_id == key.id))
+        .where(Message.id > RoomSeen.last_seen_msg_id)
+        .group_by(Message.room_uuid)
+        .order_by(func.max(Message.id).desc())
+        .limit(AWAITING_LIMIT * 4)
+    ).all() if seen else []
+    rooms = []
+    for room_uuid, n in rows:
+        if room_uuid == exclude_room:
+            continue
+        room = session.get(Room, room_uuid)
+        if room is None or ttl.is_expired(room, now):
+            continue
+        rooms.append({"uuid": room_uuid, "new_messages": n})
+        if len(rooms) >= AWAITING_LIMIT:
+            break
+    mentions = []
+    for m in _mentions(session, key, seen, AWAITING_LIMIT * 4):
+        if m["room_uuid"] == exclude_room:
+            continue
+        room = session.get(Room, m["room_uuid"])
+        if room is None or ttl.is_expired(room, now):
+            continue
+        mentions.append(m)
+        if len(mentions) >= AWAITING_LIMIT:
+            break
+    return {"rooms": rooms, "mentions": mentions}
 
 
 def is_empty(data: dict) -> bool:

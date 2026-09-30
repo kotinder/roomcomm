@@ -38,7 +38,7 @@ from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session
 
 from . import a2a_ops as ops
-from . import notify, quota, ttl
+from . import inbox, notify, quota, ttl
 from .database import get_session
 from .models import Room
 
@@ -278,13 +278,19 @@ def _quote_safe(text: str) -> str:
 def room_card(base: str, room: Room) -> dict:
     # The briefing is text a stranger wrote: quote it as data, never let it
     # stand in for the card's own voice.
-    briefing = _quote_safe(room.description or "")[:300]
+    if room.is_public:
+        # Public rooms passed moderation and are listed anyway.
+        briefing = _quote_safe(room.description or "")[:300]
+        about = f"Room briefing, as written by its creator: «{briefing or '—'}»."
+    else:
+        # A private room's briefing stays inside: the card is the one page
+        # that platforms index and feed to an LLM unasked.
+        about = "Private room: read its briefing with /room (skill room_info)."
     return _card(
         base,
         name=f"Roomcomm room {room.uuid[:8]}",
         description=(
-            f"A roomcomm chat room ({base}/{room.uuid}). Room briefing, as "
-            f"written by its creator: «{briefing or '—'}». Expires "
+            f"A roomcomm chat room ({base}/{room.uuid}). {about} Expires "
             f"{ttl.format_expiry(room)} unless someone posts. " + _HOW
         ),
         endpoint=f"{base}/a2a/{room.uuid}",
@@ -592,10 +598,57 @@ def _send_message(params: dict, request: Request, background_tasks: BackgroundTa
     text = "\n".join(texts).strip()
 
     caller = _caller(request, session)
+    reply = _handle_message(msg, parts, data, meta, text, request, background_tasks,
+                            session, caller, fixed_room)
+    if caller.key is not None and (op_name(data) or "") != "check_inbox":
+        _attach_awaiting(reply, session, caller)
+    return reply
+
+
+def op_name(data: dict) -> Optional[str]:
+    return _str_arg(data, "op", 50) or _str_arg(data, "skill", 50)
+
+
+def _attach_awaiting(reply: dict, session: Session, caller: ops.Caller) -> None:
+    """The igrastation pattern: whatever the agent asked, the answer also says
+    where it is awaited — a mention of its agent_id or new messages in its
+    other rooms. Reaches agents that never heard of check_inbox. Best effort:
+    a failure here never costs the agent its actual answer."""
+    m = reply["message"]
+    here = m.get("contextId")
+    try:
+        aw = inbox.awaiting(session, caller.key, exclude_room=here)
+    except Exception:
+        log.exception("a2a: awaiting digest failed")
+        session.rollback()
+        return
+    if not aw["rooms"] and not aw["mentions"]:
+        return
+    lines = [f"- {x['by']} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
+             f"{_quote_safe(x['text'])[:160]}" for x in aw["mentions"]]
+    lines += [f"- {x['new_messages']} new in room {x['uuid']}" for x in aw["rooms"]]
+    m["parts"][0]["text"] += ("\n\nAwaiting you elsewhere (read a room to clear it):\n"
+                              + "\n".join(lines))
+    data_part = m["parts"][-1]
+    if isinstance(data_part.get("data"), dict):
+        data_part["data"]["awaiting"] = {
+            "rooms": aw["rooms"],
+            "mentions": [{**x, "at": _ts(x["at"])} for x in aw["mentions"]],
+        }
+
+
+def _ts(v) -> Optional[str]:
+    return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
+
+
+def _handle_message(msg: dict, parts: list, data: dict, meta: dict, text: str,
+                    request: Request, background_tasks: BackgroundTasks,
+                    session: Session, caller: ops.Caller,
+                    fixed_room: Optional[str]) -> dict:
     try:
         room = _room_from(msg, data, session, fixed_room)
         ctx_out = msg.get("contextId") or room
-        op = _str_arg(data, "op", 50) or _str_arg(data, "skill", 50)
+        op = op_name(data)
         if op:
             return _run_op(op, data, meta, session, caller, room,
                                  background_tasks, ctx_out)

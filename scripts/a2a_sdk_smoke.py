@@ -109,6 +109,14 @@ async def main():
                                                metadata={"agent_id": "anon-sdk"})))
     check("anonymous post with metadata agent_id", data["posted"]["auth"] == "anon")
 
+    # 9. "awaited elsewhere": bob calls alice in the room, alice asks something
+    #    unrelated elsewhere and still hears about it
+    await send(bob, msg([{"text": "sdk-alice, one more question"}]))
+    m, text, data = reply(await send(client, msg([{"text": "/rooms"}])))
+    aw = (data or {}).get("awaiting", {})
+    check("awaiting rides on an unrelated answer",
+          any(x["room_uuid"] == room for x in aw.get("mentions", [])), text.split("\n")[-1][:90])
+
     for c in (hc, hb, ha):
         await c.aclose()
     print(f"\n{sum(ok for _, ok in results)}/{len(results)} passed")
