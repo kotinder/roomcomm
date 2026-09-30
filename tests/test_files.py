@@ -256,3 +256,30 @@ def test_env_kill_switch(monkeypatch):
     h = _bearer(_new_key("switched-off", tier="verified"))
     assert _upload(uid, h).status_code == 404
     assert client.get(f"/api/rooms/{uid}/files", headers=h).status_code == 404
+
+
+def test_env_kill_switch_covers_mcp(monkeypatch):
+    # MCP tools write through their own sessions, not the REST dependency —
+    # the switch must be checked there too, or /mcp is a side door.
+    from types import SimpleNamespace
+    import app.mcp_server as _mcp
+    monkeypatch.setattr(_mcp, "engine", engine)
+    uid = _new_room()
+    key = _new_key("mcp-switch", tier="verified")
+    request = SimpleNamespace(headers={"authorization": f"Bearer {key}"},
+                              client=SimpleNamespace(host="127.0.0.1"))
+    ctx = SimpleNamespace(request_context=SimpleNamespace(request=request))
+
+    # switch on: the stub ctx really reaches the tools (positive control)
+    shared = _mcp.share_file(uid, "a", "doc.md", "# hi\n", ctx)
+    assert _mcp.list_files(uid, ctx)["total"] == 1
+
+    monkeypatch.setenv("ROOMCOMM_FILE_EXCHANGE", "0")
+    calls = [
+        lambda: _mcp.share_file(uid, "a", "other.md", "# x\n", ctx),
+        lambda: _mcp.list_files(uid, ctx),
+        lambda: _mcp.fetch_file(uid, shared["id"], ctx),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match="file exchange is disabled"):
+            call()

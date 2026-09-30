@@ -769,7 +769,12 @@ def check_inbox(ctx: Context) -> InboxResult:
 
 def _file_exchange_key(ctx: Context, session: Session) -> AgentKey:
     """Resolve and gate the caller for any file-exchange tool: valid Bearer
-    key of tier verified/trusted required."""
+    key of tier verified/trusted required. The REST kill switch
+    (ROOMCOMM_FILE_EXCHANGE=0) applies here too — otherwise /mcp would be a
+    side door around it."""
+    from . import main as _main  # lazy: main imports this module
+    if not _main.file_exchange_enabled():
+        raise ValueError("file exchange is disabled on this server")
     _, key = _resolve_subject(ctx, session)
     try:
         quota.check_file_exchange(key)
