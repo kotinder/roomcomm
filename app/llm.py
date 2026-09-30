@@ -40,6 +40,32 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 # ignores it — measured ~7-13k chars of reasoning_content per call), so a single
 # structured extraction takes ~80-110s. Keep a generous ceiling (overridable).
 TIMEOUT_SECONDS = float(os.environ.get("ROOMCOMM_LLM_TIMEOUT", "150"))
+
+# NVIDIA's free tier returns sporadic 503s that clear within seconds; one try
+# then straight to a (possibly unfunded) fallback left the arbiter STUCK on
+# 2026-09-30. Retry transient failures only — never a read timeout, which
+# would cost another TIMEOUT_SECONDS.
+NVIDIA_RETRY_DELAYS = (2.0, 5.0)
+MODERATION_NVIDIA_RETRY_DELAYS = (1.0,)  # a user is waiting on this one
+
+
+def _is_transient(e: Exception) -> bool:
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code
+        return code == 429 or code >= 500
+    return isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError))
+
+
+async def _with_retry(name: str, call, delays: tuple = ()):
+    for delay in delays:
+        try:
+            return await call()
+        except Exception as e:
+            if not _is_transient(e):
+                raise
+            log.info("LLM provider %s transient failure (%r), retrying in %.0fs", name, e, delay)
+            await asyncio.sleep(delay)
+    return await call()
 MAX_CHARS_PER_MESSAGE = 2000
 MAX_THREADS_IN_PROMPT = 60  # cap to keep prompt bounded for large rooms
 
@@ -406,7 +432,10 @@ async def process_message(
     for name, url, key, model, system_prefix in providers:
         try:
             try:
-                raw = await _call_openai_compat(url, key, model, payload, system_prefix)
+                raw = await _with_retry(
+                    name, lambda: _call_openai_compat(url, key, model, payload, system_prefix),
+                    delays=NVIDIA_RETRY_DELAYS if name == "nvidia" else (),
+                )
             except LLMBadOutput as bad:
                 # At temperature 0 the same prompt reproduces the same bad
                 # output, so a plain retry is useless — append a corrective
@@ -529,7 +558,10 @@ async def moderate_public_description(text: str) -> tuple[bool, str]:
     last_err: Optional[Exception] = None
     for name, url, key, model in providers:
         try:
-            raw = await _call_moderation(url, key, model, text)
+            raw = await _with_retry(
+                name, lambda: _call_moderation(url, key, model, text),
+                delays=MODERATION_NVIDIA_RETRY_DELAYS if name == "nvidia" else (),
+            )
             allow = bool(raw.get("allow"))
             reason = str(raw.get("reason") or "")[:100]
             log.info("moderation verdict allow=%s (%s:%s) reason=%r", allow, name, model, reason)
