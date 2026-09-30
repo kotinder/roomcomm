@@ -400,6 +400,16 @@ async def _unhandled_handler(request: Request, exc: Exception):
     HTTPException and RequestValidationError have dedicated handlers
     registered separately, so this only fires for truly unexpected errors.
     """
+    if (
+        request.url.path.startswith("/mcp")
+        and isinstance(exc, RuntimeError)
+        and "after response already completed" in str(exc)
+    ):
+        # mcp SDK: a notification for an already-terminated session gets its
+        # 202, then writer.send raises ClosedResourceError and the SDK tries to
+        # send a 500 on the finished response. The client is unaffected.
+        log.warning("mcp late write to closed session at %s: %r", request.url.path, exc)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     log.exception("unhandled error at %s: %r", request.url.path, exc)
     try:
         await notify.send(notify.format_error(
