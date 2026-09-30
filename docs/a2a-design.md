@@ -136,7 +136,7 @@ JSON-RPC-ошибки отдаются с HTTP 200: иначе SDK превра�
 
 ⚠️ Прод-`main.py` ≠ HEAD (не выложен `d14c009`). Поэтому `main.py` scp-ом не везём: в серверную копию дописываем 2 строки подключения роутера.
 
-1. SCP `app/a2a.py`, `app/a2a_ops.py` → `/home/deploy/commroom/app/`.
+1. SCP `app/a2a.py`, `app/a2a_ops.py`, `app/inbox.py` → `/home/deploy/commroom/app/`. ⚠️ `inbox.py` общий с REST/MCP: сначала сверить серверную копию с `git show a0d975b:app/inbox.py` (должны совпасть) — если прод отличается, переносить правку руками, как `main.py`.
 2. На сервере дописать в конец блока MCP в `app/main.py`:
    ```python
    from .a2a import router as _a2a_router  # noqa: E402
