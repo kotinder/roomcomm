@@ -1314,9 +1314,14 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
             ).order_by(Message.id.desc()).limit(4)
         ).all()
         tail = [_msg_dict(m) for m in reversed(tail_rows)]
+        msg_payload = _msg_dict(msg)
+        # Hand the pooled connection back while the LLM call runs (up to
+        # minutes with fallbacks). Holding it across the await exhausted the
+        # pool and hung the whole server on 2026-09-30.
+        session.commit()
 
         try:
-            out, model_used = await llm.process_message(_msg_dict(msg), tail, thread_payload)
+            out, model_used = await llm.process_message(msg_payload, tail, thread_payload)
             last_model_used = model_used
         except llm.LLMUnavailable as e:
             log.warning("LLM unavailable while processing msg #%s: %r", msg.id, e)
