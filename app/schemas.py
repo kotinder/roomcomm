@@ -25,6 +25,13 @@ class RoomCreate(BaseModel):
     #          (or the creator's Bearer key). 'signed' is reserved for the
     #          ed25519 layer and rejected for now.
     write_policy: str = Field(default="open", pattern="^(open|key)$")
+    # How long the room stays reachable. Give either a duration or a date;
+    # `expires_at` wins if both are present. Omit both for the server default
+    # (ROOMCOMM_ROOM_TTL_HOURS, 72h out of the box). There is no "never":
+    # the ceiling is ROOMCOMM_ROOM_TTL_MAX_HOURS (30 days out of the box), so
+    # "ephemeral" on the tin means ephemeral in the database.
+    ttl_hours: Optional[int] = Field(default=None, ge=1)
+    expires_at: Optional[datetime] = Field(default=None)
 
 
 class RoomCreateOut(BaseModel):
@@ -37,10 +44,12 @@ class RoomCreateOut(BaseModel):
     write_policy: str = "open"
     # Present only when write_policy='key' — shown once, never retrievable.
     write_key: Optional[str] = None
+    # When this room stops answering (NULL only for pre-TTL/admin-pinned rooms).
+    expires_at: Optional[datetime] = None
 
-    @field_serializer("created_at")
-    def _ser(self, v: datetime) -> str:
-        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+    @field_serializer("created_at", "expires_at")
+    def _ser(self, v: Optional[datetime]) -> Optional[str]:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v is not None else None
 
 
 # ----- Agent keys (auth MVP: open join, keyed create) -----
@@ -161,10 +170,14 @@ class RoomInfoOut(BaseModel):
     # the last arbiter failure (None when healthy).
     arbiter_active: bool = False
     last_extraction_error: Optional[str] = None
+    # When this room stops answering, and how long is left. Agents use the
+    # seconds to decide whether a long negotiation still fits in the room.
+    expires_at: Optional[datetime] = None
+    expires_in_seconds: Optional[int] = None
 
-    @field_serializer("created_at")
-    def _ser(self, v: datetime) -> str:
-        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
+    @field_serializer("created_at", "expires_at")
+    def _ser(self, v: Optional[datetime]) -> Optional[str]:
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v is not None else None
 
 
 # ----- Protocol / Claims (ledger model) -----
@@ -396,6 +409,12 @@ class MessageOut(BaseModel):
     pubkey_hex: Optional[str] = None
     signature_hex: Optional[str] = None
     memory_root: Optional[str] = None
+    # Where the message came from — see app/authorship.py. `agent_id` is a
+    # claimed display name and always was; these two say whether anything
+    # stands behind it. "anon" | "key" | "signed", plus the posting key's
+    # stable pseudonym (absent for anonymous posts).
+    auth: str = "anon"
+    key_ref: Optional[str] = None
 
     @field_serializer("timestamp")
     def _ser(self, v: datetime) -> str:

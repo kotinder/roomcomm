@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
+from sqlalchemy import Column, LargeBinary
 from sqlmodel import SQLModel, Field, Index
 
 
@@ -98,6 +99,60 @@ class Room(SQLModel, table=True):
     # so clients can tell whether the premium arbiter is actually working
     # without having to call verify_integrity.
     last_extraction_error: Optional[str] = Field(default=None, max_length=500)
+    # When the room stops being reachable. Set at creation (default TTL, or a
+    # caller-supplied date), enforced on every room-scoped request: past this
+    # moment everyone gets 410 except the admin panel, which keeps full access
+    # so an expired room can still be inspected or revived.
+    #
+    # NULL means "never expires". Two ways to get there: rooms created before
+    # TTL existed (grandfathered by the migration — expiring them retroactively
+    # would kill live conversations), and rooms the admin has explicitly
+    # pinned. New rooms always get a concrete date.
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+
+
+class Anchor(SQLModel, table=True):
+    """One external timestamp anchor: a Merkle root over every room's state,
+    published somewhere the operator does not control.
+
+    This is the piece the README named as missing — the hash chain proves the
+    database was not edited behind the app's back, but not that the whole
+    server wasn't rewritten. A root that a third party already timestamped
+    closes that, because the operator would have to rewrite their copy too.
+
+    `receipt` is whatever the external service handed back (a message URL, a
+    post id). NULL means the root was computed and committed to locally but
+    publication failed — visible rather than hidden, so a silent run of failed
+    publications cannot masquerade as an anchored history.
+    """
+    __tablename__ = "anchors"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    root: str = Field(max_length=64, index=True)
+    leaf_count: int = Field(default=0)
+    # Digest rule this root was computed under; an old proof must never be
+    # checked against a newer rule.
+    digest_version: str = Field(default="", max_length=32)
+    receipt: Optional[str] = Field(default=None, max_length=500)
+    published_via: Optional[str] = Field(default=None, max_length=50)
+    # The leaf set this root was built from, gzipped JSON.
+    #
+    # Stored rather than recomputed for two reasons. Correctness: a proof must
+    # run against the state as it was when the root was published, not against
+    # whatever the rooms look like now. Cost: rebuilding every leaf meant
+    # rereading all messages on the server for a single proof — measured at
+    # 2.4 s over 4387 rooms on production data, on an endpoint anyone can call.
+    leaves_gz: Optional[bytes] = Field(default=None, sa_column=Column(LargeBinary))
+    # RFC 3161 timestamp token over `root`, as returned by a public timestamp
+    # authority. This is the part an operator cannot forge: the TSA signs the
+    # time with its own key. Served verbatim from /api/anchors/{id}/tsa so
+    # anyone can run `openssl ts -verify` without trusting this server.
+    tsa_token: Optional[bytes] = Field(default=None, sa_column=Column("tsa_token", LargeBinary))
+    tsa_url: Optional[str] = Field(default=None, max_length=200)
+    # Time the TSA signed, as reported in the token. Informational; the token
+    # is the evidence.
+    tsa_time: Optional[str] = Field(default=None, max_length=40)
 
 
 class Message(SQLModel, table=True):

@@ -7,6 +7,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY static ./static
+# Scheduled jobs run inside the container (docker exec … python -m scripts.x).
+# The anchor publisher needs the same DB and arbiter key the app uses, so it
+# ships with the image rather than living on the host.
+COPY scripts ./scripts
 RUN mkdir -p /app/data
 EXPOSE 8000
 VOLUME ["/app/data"]

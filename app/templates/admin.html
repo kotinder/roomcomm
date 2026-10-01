@@ -118,6 +118,7 @@
           <th class="sortable" data-type="text">Description <span class="arrow">↕</span></th>
           <th class="sortable" data-type="text">Created <span class="arrow">↕</span></th>
           <th class="sortable" data-type="text">Last activity <span class="arrow">↕</span></th>
+          <th class="sortable" data-type="text">Expires <span class="arrow">↕</span></th>
           <th class="sortable num" data-type="num">Msgs <span class="arrow">↕</span></th>
           <th></th>
         </tr>
@@ -130,8 +131,17 @@
           <td data-sort="{{ (r.description or '')|lower }}">{% if r.arena_code %}<a href="{{ r.arena_url }}" target="_blank" rel="noopener" class="mono">{{ r.arena_code }}</a> {% endif %}{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
           <td class="mono small" data-sort="{{ r.created_at.strftime('%Y-%m-%dT%H:%M:%S') }}">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
           <td class="mono small" data-sort="{{ r.last_at.strftime('%Y-%m-%dT%H:%M:%S') if r.last_at else '' }}">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
+          <td class="mono small" data-sort="{{ r.expires_at.strftime('%Y-%m-%dT%H:%M:%S') if r.expires_at else '9999' }}">
+            {% if r.expires_at is none %}<span class="badge" title="pinned open — never expires">📌 never</span>
+            {% elif r.expired %}<span class="badge badge-private" title="expired at {{ r.expires_at.strftime('%Y-%m-%d %H:%M') }} UTC">⌛ expired</span>
+            {% else %}{{ r.expires_at.strftime('%Y-%m-%d %H:%M') }} <span class="muted">({{ r.expires_in_hours }}h)</span>{% endif %}
+          </td>
           <td class="num" data-sort="{{ r.msg_count }}">{{ r.msg_count }}</td>
           <td>
+            <form method="post" action="/admin/rooms/{{ r.uuid }}/ttl" class="ttl-form">
+              <input type="text" name="ttl_hours" value="72" size="4" title="hours from now, or 'never' to pin, or 'now' to expire">
+              <button type="submit" class="small">Set TTL</button>
+            </form>
             <form method="post" action="/admin/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
               <button type="submit" class="btn-danger">Delete</button>
             </form>
