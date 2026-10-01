@@ -278,6 +278,7 @@ def test_room_info_and_list_and_inbox():
     _, _, rooms = _ok(_send([{"data": {"op": "list_rooms"}}]))
     assert "rooms" in rooms
     _err(_send([{"text": "/inbox"}]), -32040)  # per-key
+    _ok(_send([{"text": "hi"}], f"/a2a/{uid}", _bearer(key)))  # frank joins
     _rest_post(uid, "bob", "frank, are you there?")
     _, _, inbox = _ok(_send([{"text": "/inbox"}], headers=_bearer(key)))
     assert any(mn["room_uuid"] == uid for mn in inbox["mentions"])
@@ -625,6 +626,7 @@ def test_awaiting_rides_on_any_answer():
     here, there, quiet = (_new_room(headers=host)["uuid"] for _ in range(3))
     _ok(_send([{"text": "hello"}], f"/a2a/{there}", _bearer(key)))   # zoe joins "there"
     _ok(_send([{"text": "hi"}], f"/a2a/{quiet}", _bearer(key)))
+    _ok(_send([{"text": "here"}], f"/a2a/{here}", _bearer(key)))     # and "here"
     _rest_post(there, "bob", "news for everyone")
     _rest_post(here, "carl", "zoe-a2a, can you confirm the price?")
     # zoe does something unrelated in a fourth room — and still learns both
@@ -632,13 +634,28 @@ def test_awaiting_rides_on_any_answer():
     m, text, data = _ok(_send([{"text": "/room"}], f"/a2a/{other}", _bearer(key)))
     assert "Awaiting you elsewhere" in text and "carl mentioned you" in text
     aw = data["awaiting"]
-    assert [x["uuid"] for x in aw["rooms"]] == [there]
-    assert aw["rooms"][0]["new_messages"] == 1
+    assert [x["uuid"] for x in aw["rooms"]] == [here, there]
+    assert [x["new_messages"] for x in aw["rooms"]] == [1, 1]
     assert [x["room_uuid"] for x in aw["mentions"]] == [here]
     # reading the rooms clears them; the room you are in is never listed
     _ok(_send([{"text": "/read"}], f"/a2a/{here}", _bearer(key)))
     m, text, data = _ok(_send([{"text": "/read"}], f"/a2a/{there}", _bearer(key)))
     assert "awaiting" not in data and "Awaiting" not in text
+
+
+def test_awaiting_never_shows_a_room_the_key_never_joined():
+    # The key is the boundary, not the name (01.10.2026).
+    key = _new_key("vera-a2a")
+    stranger = _new_key("vera-a2a")
+    host = _bearer(_new_key("host"))
+    mine, private = (_new_room(headers=host)["uuid"] for _ in range(2))
+    _ok(_send([{"text": "hi"}], f"/a2a/{mine}", _bearer(key)))
+    _rest_post(private, "carl", "vera-a2a, the vault code is 1234")
+    for k in (key, stranger):
+        _, text, data = _ok(_send([{"text": "/rooms"}], headers=_bearer(k)))
+        assert private not in text and private not in str(data)
+        _, text, data = _ok(_send([{"text": "/inbox"}], headers=_bearer(k)))
+        assert private not in text and private not in str(data)
 
 
 def test_awaiting_skips_expired_rooms_and_anonymous_callers():

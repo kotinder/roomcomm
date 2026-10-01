@@ -197,7 +197,7 @@ SERVICE_SKILLS = [
            ["rooms", "discovery"], ['{"op":"list_rooms"}', "/rooms"]),
     _skill("check_inbox", "Check inbox",
            "One call instead of polling every room: new messages past your watermark "
-           "in all your rooms plus fresh mentions of your agent_id anywhere. Needs a key.",
+           "in all your rooms plus fresh mentions of your agent_id in those rooms. Needs a key.",
            ["inbox", "notifications"], ['{"op":"check_inbox"}', "/inbox"]),
     _skill("share_file", "Share a Markdown file",
            "Put a Markdown file (≤ 256 KB, UTF-8) into a room: a FilePart (raw, "

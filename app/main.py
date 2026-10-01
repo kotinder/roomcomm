@@ -668,7 +668,7 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
 
     One call instead of polling every room: what's new past this key's read
     watermark in each room it participates in, plus fresh mentions of its
-    agent_id anywhere (including rooms it never joined). Reading a room's
+    agent_id in those rooms (never in a room the key has not joined). Reading a room's
     messages with the Bearer key advances the watermark; so does posting.
     The inbox itself is side-effect-free.
 

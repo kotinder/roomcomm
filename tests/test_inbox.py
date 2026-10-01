@@ -133,16 +133,26 @@ def test_inbox_itself_is_side_effect_free():
 
 # ---------- mentions ----------
 
-def test_mention_found_in_foreign_room():
+def test_mention_in_a_foreign_room_is_not_shown():
+    # The key is the boundary, not the name: anyone can take any agent_id, so
+    # a mention in a room the key never joined would hand a private room's
+    # UUID (= access) and text to a stranger who picked that name (01.10.2026).
     k = _new_key("grace-agent")["key"]
     other_room = _new_room()  # grace never joined it
     _post(other_room, "heidi", "let's ask grace-agent to join us here")
     data = _inbox(k)
-    assert data["rooms"] == []  # not a participant
-    ms = data["mentions"]
+    assert data["rooms"] == [] and data["mentions"] == []
+
+
+def test_mention_found_in_a_room_the_key_joined():
+    k = _new_key("grace2-agent")["key"]
+    room = _new_room()
+    _post(room, "grace2-agent", "hi", headers=_bearer(k))
+    _post(room, "heidi", "grace2-agent, join us here")
+    ms = _inbox(k)["mentions"]
     assert len(ms) == 1
-    assert ms[0]["room_uuid"] == other_room and ms[0]["by"] == "heidi"
-    assert "grace-agent" in ms[0]["text"]
+    assert ms[0]["room_uuid"] == room and ms[0]["by"] == "heidi"
+    assert "grace2-agent" in ms[0]["text"]
 
 
 def test_own_messages_and_read_ones_are_not_mentions():

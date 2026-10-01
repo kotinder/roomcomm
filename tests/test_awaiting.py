@@ -75,12 +75,13 @@ def _post(room, agent_id, text, h=None):
 
 
 def _scene(name):
-    """`name` posted in `mine`; then bob posts there and carl calls `name` in
-    `called` (a room `name` never joined); `quiet` is where `name` polls."""
+    """`name` posted in `mine` and `called`; then bob posts in `mine` and carl
+    calls `name` in `called`; `quiet` is where `name` polls."""
     h = _key(name)
     host = _key("host-" + name)
     mine, called, quiet = _room(host), _room(host), _room(host)
     _post(mine, name, "hello", h)
+    _post(called, name, "here too", h)
     _post(quiet, name, "watching", h)
     _post(mine, "bob", "news")
     _post(called, "carl", f"{name}, are you there?")
@@ -94,9 +95,24 @@ def test_rest_empty_poll_carries_awaiting():
     r = client.get(f"/api/rooms/{quiet}/messages?since=999999", headers=h)
     assert r.status_code == 200 and r.json()["messages"] == []
     aw = r.json()["awaiting"]
-    assert aw["rooms"] == [{"uuid": mine, "new_messages": 1}]
+    assert aw["rooms"] == [{"uuid": called, "new_messages": 1},
+                           {"uuid": mine, "new_messages": 1}]
     assert [m["room_uuid"] for m in aw["mentions"]] == [called]
     assert "inbox" in aw["hint"]
+
+
+def test_rest_mention_in_a_room_the_key_never_joined_stays_hidden():
+    # Anyone may take any agent_id; only the key opens a room (01.10.2026).
+    h, mine, called, quiet = _scene("hal-rest")
+    stranger = _key("hal-rest")           # same name, different key
+    r = client.get("/api/keys/me", headers=stranger).json()
+    assert "awaiting" not in r
+    host = _key("host-x")
+    private = _room(host)
+    _post(private, "carl", "hal-rest, the vault code is 1234")
+    for hh in (h, stranger):
+        aw = client.get("/api/keys/me", headers=hh).json().get("awaiting") or {}
+        assert private not in str(aw)
 
 
 def test_rest_reading_a_room_clears_it_at_once():
@@ -112,7 +128,7 @@ def test_rest_post_and_keys_me_carry_it_and_anon_never_does():
     h, mine, called, quiet = _scene("cid-rest")
     posted = client.post(f"/api/rooms/{quiet}/messages",
                          json={"agent_id": "cid-rest", "text": "x"}, headers=h).json()
-    assert posted["awaiting"]["rooms"][0]["uuid"] == mine
+    assert {x["uuid"] for x in posted["awaiting"]["rooms"]} == {mine, called}
     assert client.get("/api/keys/me", headers=h).json()["awaiting"]["mentions"]
     anon = client.get(f"/api/rooms/{quiet}/messages").json()
     assert "awaiting" not in anon
@@ -145,13 +161,13 @@ def test_mcp_tools_carry_awaiting_and_validate():
     h, mine, called, quiet = _scene("eve-mcp")
     ctx = _ctx(h)
     res = _checked("read_messages", mcp_server.read_messages(quiet, ctx, since=999999))
-    assert res["awaiting"]["rooms"] == [{"uuid": mine, "new_messages": 1}]
+    assert {x["uuid"] for x in res["awaiting"]["rooms"]} == {mine, called}
     assert res["awaiting"]["mentions"][0]["room_uuid"] == called
     assert isinstance(res["awaiting"]["mentions"][0]["at"], str)
     res = _checked("get_room", mcp_server.get_room(quiet, ctx))
     assert res["awaiting"]["mentions"]
     res = _checked("send_message", mcp_server.send_message(quiet, "eve-mcp", "hi", ctx))
-    assert res["awaiting"]["rooms"][0]["uuid"] == mine
+    assert {x["uuid"] for x in res["awaiting"]["rooms"]} == {mine, called}
 
 
 def test_mcp_quiet_results_still_validate():
@@ -178,4 +194,4 @@ def test_awaiting_cache_never_serves_stale_news():
         assert again is not first and again["rooms"][0]["new_messages"] == 2
         inbox.advance_seen(s, key.id, mine, 10**9)       # watermark moves: dropped
         s.commit()
-        assert inbox.awaiting(s, key, quiet)["rooms"] == []
+        assert [x["uuid"] for x in inbox.awaiting(s, key, quiet)["rooms"]] == [called]

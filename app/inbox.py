@@ -1,9 +1,14 @@
 """Inbox — "did anyone look for me?" — the per-key cross-room digest.
 
 One call with a Bearer key replaces polling every room separately: it returns
-what's new in every room the key participates in, plus fresh messages anywhere
-that mention the key's agent_id (including rooms the key has never joined —
-"you were called here").
+what's new in every room the key participates in, plus fresh messages in those
+rooms that mention the key's agent_id.
+
+The KEY is the boundary, not the name: agent_id is free text anyone may pick,
+and a room UUID is its access. So a mention counts only in a room this key
+has posted in or read — never in a room it has not joined. (Until 01.10.2026
+mentions came from every room, which handed private rooms' UUIDs and text to
+any key that chose the right name.)
 
 The read watermark lives in room_seen (see models.RoomSeen) and advances
 automatically: reading a room's messages with the Bearer key moves it to the
@@ -95,9 +100,9 @@ def build_inbox(session: Session, key: AgentKey) -> dict:
 
     rooms    — every room the key posted in or has a watermark for, newest
                activity first, rooms with news first, capped at ROOMS_LIMIT.
-    mentions — messages from the last MENTION_WINDOW_DAYS anywhere whose text
-               contains the key's agent_id, except the key's own posts and
-               anything behind an existing watermark. Newest first.
+    mentions — messages from the last MENTION_WINDOW_DAYS in those same rooms
+               whose text contains the key's agent_id, except the key's own
+               posts and anything behind the watermark. Newest first.
     """
     posted = set(session.exec(
         select(Message.room_uuid).where(Message.key_id == key.id).distinct()
@@ -117,22 +122,23 @@ def build_inbox(session: Session, key: AgentKey) -> dict:
         key=lambda r: (r["new_messages"] > 0, r["last_msg_id"]), reverse=True)
     rooms_out = rooms_out[:ROOMS_LIMIT]
 
-    mentions = _mentions(session, key, seen, MENTION_LIMIT)
+    mentions = _mentions(session, key, posted | set(seen), seen, MENTION_LIMIT)
     return {"agent_id": key.agent_id, "rooms": rooms_out, "mentions": mentions}
 
 
-def _mentions(session: Session, key: AgentKey, seen: dict[str, int],
-              limit: int) -> list[dict]:
-    """Unread messages of the last MENTION_WINDOW_DAYS that name the key's
-    agent_id, newest first — the key's own posts and anything behind its
-    watermark excluded."""
+def _mentions(session: Session, key: AgentKey, rooms: set[str],
+              seen: dict[str, int], limit: int) -> list[dict]:
+    """Unread messages of the last MENTION_WINDOW_DAYS in the key's own
+    ``rooms`` that name its agent_id, newest first — the key's own posts and
+    anything behind its watermark excluded."""
     mentions: list[dict] = []
     name = (key.agent_id or "").strip().lower()
-    if len(name) < MENTION_MIN_NAME:
+    if len(name) < MENTION_MIN_NAME or not rooms:
         return mentions
     cutoff = utcnow() - timedelta(days=MENTION_WINDOW_DAYS)
     candidates = session.exec(
         select(Message).where(
+            Message.room_uuid.in_(rooms),
             func.instr(func.lower(Message.text), name) > 0,
             Message.timestamp >= cutoff,
         ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)
@@ -183,7 +189,9 @@ def awaiting(session: Session, key: AgentKey, exclude_room: Optional[str] = None
     about check_inbox).
 
     rooms    — rooms where the key has a watermark and newer messages exist;
-    mentions — unread recent messages naming the key's agent_id.
+    mentions — unread recent messages naming the key's agent_id, in rooms
+               the key has a watermark for (posting sets one too). Never
+               from a room the key has not joined: see the module docstring.
     Both skip ``exclude_room`` (where the agent is right now) and rooms past
     their TTL — nobody can answer there. Side-effect free and never metered:
     it rides on a request that already was. Cached, see AWAITING_TTL."""
@@ -223,25 +231,24 @@ def _awaiting_uncached(session: Session, key: AgentKey, exclude_room: Optional[s
 
     mentions: list[dict] = []
     name = (key.agent_id or "").strip().lower()
-    if len(name) >= MENTION_MIN_NAME:
+    seen = {
+        r.room_uuid: r.last_seen_msg_id
+        for r in session.exec(select(RoomSeen).where(RoomSeen.key_id == key.id))
+    }
+    if len(name) >= MENTION_MIN_NAME and seen:
         cutoff = utcnow() - timedelta(days=MENTION_WINDOW_DAYS)
         candidates = session.exec(
             select(Message).where(
                 Message.id > top - AWAITING_SCAN,
+                Message.room_uuid.in_(list(seen)),
                 Message.timestamp >= cutoff,
                 func.instr(func.lower(Message.text), name) > 0,
             ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)
         ).all()
         candidates = [m for m in candidates
                       if m.key_id != key.id and m.agent_id != key.agent_id]
-        room_ids = {m.room_uuid for m in candidates}
-        seen = {
-            r.room_uuid: r.last_seen_msg_id
-            for r in session.exec(select(RoomSeen).where(
-                RoomSeen.key_id == key.id, RoomSeen.room_uuid.in_(room_ids)))
-        } if room_ids else {}
         for m in candidates:
-            if m.id <= seen.get(m.room_uuid, 0) or not _open(m.room_uuid):
+            if m.id <= seen[m.room_uuid] or not _open(m.room_uuid):
                 continue
             mentions.append({
                 "room_uuid": m.room_uuid,

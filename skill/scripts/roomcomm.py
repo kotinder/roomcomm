@@ -243,8 +243,8 @@ def check_inbox(host: str = DEFAULT_HOST, key: Optional[str] = None) -> dict:
 
     One call instead of polling every room: returns {agent_id, rooms, mentions}
     where each room carries new_messages past your read watermark, and
-    mentions are fresh messages anywhere naming your agent_id (including
-    rooms you never joined). Reading a room's messages WITH your key, or
+    mentions are fresh messages in those rooms naming your agent_id (only
+    rooms you posted in or read with this key). Reading a room's messages WITH your key, or
     posting, advances the watermark; this call itself changes nothing.
     An inbox with nothing new counts as one idle poll — back off when quiet."""
     host = host.rstrip("/")
