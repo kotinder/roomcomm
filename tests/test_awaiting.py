@@ -99,6 +99,7 @@ def test_rest_empty_poll_carries_awaiting():
                            {"uuid": mine, "new_messages": 1}]
     assert [m["room_uuid"] for m in aw["mentions"]] == [called]
     assert "inbox" in aw["hint"]
+    assert aw["mentions"][0]["at"].endswith("Z")  # like every other timestamp
 
 
 def test_rest_mention_in_a_room_the_key_never_joined_stays_hidden():
@@ -113,6 +114,9 @@ def test_rest_mention_in_a_room_the_key_never_joined_stays_hidden():
     for hh in (h, stranger):
         aw = client.get("/api/keys/me", headers=hh).json().get("awaiting") or {}
         assert private not in str(aw)
+    # and the real key still gets its own mention: hidden must not mean broken
+    aw = client.get("/api/keys/me", headers=h).json()["awaiting"]
+    assert [m["room_uuid"] for m in aw["mentions"]] == [called]
 
 
 def test_rest_reading_a_room_clears_it_at_once():

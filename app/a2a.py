@@ -184,8 +184,9 @@ SERVICE_SKILLS = [
            ["rooms", "chat", "write"],
            ['{"op":"post","room":"<uuid>","text":"hello"}']),
     _skill("read", "Read messages",
-           "Messages of a room after `since` (default: your key's read watermark, "
-           "else the latest 50). Args: room, since, limit (≤ 500).",
+           "Messages of a room after `since`, oldest first (default: your key's read "
+           "watermark, else from the beginning; has_more says newer ones remain). "
+           "Args: room, since, limit (≤ 500).",
            ["rooms", "chat", "read"],
            ['{"op":"read","room":"<uuid>","since":42}', "/read"]),
     _skill("room_info", "Room info",
@@ -354,7 +355,8 @@ def _caller(request: Request, session: Session) -> ops.Caller:
                        f"{e.detail}. {quota.GET_KEY_HINT}", "UNAUTHORIZED" if e.status_code == 401 else "FORBIDDEN",
                        {"http_status": str(e.status_code)})
 
-    checks = {"room": _main._check_create_rate, "file": _main._check_file_rate}
+    checks = {"room": _main._check_create_rate, "file": _main._check_file_rate,
+              "msg": _main._check_msg_rate}
 
     def rate_check(kind: str) -> None:
         try:
@@ -405,8 +407,8 @@ async def _endpoint(request: Request, background_tasks: BackgroundTasks,
     notification = False
     try:
         try:
-            body = json.loads(await request.body())
-        except (ValueError, UnicodeDecodeError):
+            body = json.loads(await request.body(), parse_constant=_no_constants)
+        except (ValueError, UnicodeDecodeError, RecursionError):
             raise RpcError(PARSE_ERROR, "Parse error")
         if isinstance(body, list):
             raise RpcError(INVALID_REQUEST, "batch requests are not supported")
@@ -421,7 +423,9 @@ async def _endpoint(request: Request, background_tasks: BackgroundTasks,
             raise RpcError(INVALID_REQUEST, "Invalid Request")
         notification = "id" not in body
         _check_version(request)
-        params = body.get("params") or {}
+        params = body.get("params")
+        if params is None:
+            params = {}
         if not isinstance(params, dict):
             raise RpcError(INVALID_PARAMS, "params must be an object")
         result = await run_in_threadpool(_dispatch, body["method"], params, request,
@@ -476,28 +480,60 @@ def _dispatch(method: str, params: dict, request: Request,
 # ---------------------------------------------------------------------------
 
 
+def _no_constants(name: str):
+    # json.loads accepts NaN/Infinity, which then cannot be answered (an id of
+    # NaN broke JSONResponse into a bare HTTP 500). JSON proper has neither.
+    raise ValueError(f"{name} is not JSON")
+
+
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _text_arg(v: str, name: str) -> str:
+    # A lone UTF-16 surrogate ("\ud800") parses as a Python str but cannot be
+    # encoded or stored: refuse it at the edge as bad input, not a 500.
+    if _SURROGATE_RE.search(v):
+        raise RpcError(INVALID_PARAMS, f"{name} contains an unpaired surrogate (invalid UTF-16)")
+    return v
+
+
 def _str_arg(src: dict, name: str, max_len: int = 100_000) -> Optional[str]:
     v = src.get(name)
     if v is None or v == "":
         return None
     if not isinstance(v, str) or len(v) > max_len:
         raise RpcError(INVALID_PARAMS, f"{name} must be a string (≤ {max_len} chars)")
-    return v
+    return _text_arg(v, name)
 
 
-def _int_arg(src: dict, name: str) -> Optional[int]:
+_INT_RE = re.compile(r"-?[0-9]{1,19}")
+_INT_MAX = 2**63 - 1  # SQLite INTEGER
+
+
+def _int_arg(src: dict, name: str, minimum: Optional[int] = None) -> Optional[int]:
+    """An integer argument, strictly: ASCII digits only ("²" and "--5" slip
+    past str.isdigit tricks but not int()), within SQLite's 64-bit range — a
+    bigger value is a client error, never an OverflowError and an alert."""
     v = src.get(name)
     if v is None:
         return None
+    bad = RpcError(INVALID_PARAMS, f"{name} must be an integer"
+                   + (f" ≥ {minimum}" if minimum is not None else ""))
     if isinstance(v, bool):
-        raise RpcError(INVALID_PARAMS, f"{name} must be an integer")
-    if isinstance(v, int):
-        return v
-    if isinstance(v, float) and v.is_integer():
-        return int(v)  # JSON numbers from Struct-based clients arrive as floats
-    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
-        return int(v.strip())
-    raise RpcError(INVALID_PARAMS, f"{name} must be an integer")
+        raise bad
+    if isinstance(v, float):
+        if not v.is_integer() or abs(v) > _INT_MAX:
+            raise bad
+        v = int(v)  # JSON numbers from Struct-based clients arrive as floats
+    elif isinstance(v, str):
+        if not _INT_RE.fullmatch(v.strip()):
+            raise bad
+        v = int(v.strip())
+    elif not isinstance(v, int):
+        raise bad
+    if abs(v) > _INT_MAX or (minimum is not None and v < minimum):
+        raise bad
+    return v
 
 
 def _bool_arg(src: dict, name: str) -> Optional[bool]:
@@ -560,11 +596,24 @@ def _reply(text: str, data: Any, context_id: Optional[str],
     return {"message": message}
 
 
+def _who(m: dict) -> str:
+    """Author as the summary shows it: the claimed name, flattened so it cannot
+    break the line or fake a bracket, plus what stands behind it — a key's
+    stable pseudonym, or "anon". A name alone never said who posted."""
+    name = _quote_safe(m["agent_id"]).replace("[", "(").replace("]", ")")[:100]
+    proof = f"key {m['key_ref']}" if m.get("key_ref") else (m.get("auth") or "anon")
+    return f"{name} · {proof}"
+
+
 def _fmt_messages(msgs: list[dict], limit: int = 20) -> str:
+    """Messages as text. Every line of a message body after the first is
+    indented, so only the service starts a line with "[#…": a participant
+    cannot forge another message's header, or the service's own voice."""
     lines = []
     for m in msgs[-limit:]:
         text = m["text"] if len(m["text"]) <= 1000 else m["text"][:1000] + "…"
-        lines.append(f"[#{m['id']} {m['agent_id']}] {text}")
+        text = "\n    ".join(text.splitlines()) or text
+        lines.append(f"[#{m['id']} {_who(m)}] {text}")
     return "\n".join(lines)
 
 
@@ -594,8 +643,8 @@ def _send_message(params: dict, request: Request, background_tasks: BackgroundTa
     raw_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
     meta = {"agent_id": _str_arg(raw_meta, "agent_id", 100),
             "room_key": _str_arg(raw_meta, "room_key", 200),
-            "since": _int_arg(raw_meta, "since")}
-    text = "\n".join(texts).strip()
+            "since": _int_arg(raw_meta, "since", 0)}
+    text = _text_arg("\n".join(texts).strip(), "text")
 
     caller = _caller(request, session)
     reply = _handle_message(msg, parts, data, meta, text, request, background_tasks,
@@ -624,7 +673,7 @@ def _attach_awaiting(reply: dict, session: Session, caller: ops.Caller) -> None:
         return
     if not aw["rooms"] and not aw["mentions"]:
         return
-    lines = [f"- {x['by']} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
+    lines = [f"- {_quote_safe(x['by'])[:100]} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
              f"{_quote_safe(x['text'])[:160]}" for x in aw["mentions"]]
     lines += [f"- {x['new_messages']} new in room {x['uuid']}" for x in aw["rooms"]]
     m["parts"][0]["text"] += ("\n\nAwaiting you elsewhere (read a room to clear it):\n"
@@ -647,7 +696,9 @@ def _handle_message(msg: dict, parts: list, data: dict, meta: dict, text: str,
                     fixed_room: Optional[str]) -> dict:
     try:
         room = _room_from(msg, data, session, fixed_room)
-        ctx_out = msg.get("contextId") or room
+        # The reply names the room actually acted on: a client continuing in
+        # the context it gets back must keep talking to that same room.
+        ctx_out = room or msg.get("contextId")
         op = op_name(data)
         if op:
             return _run_op(op, data, meta, session, caller, room,
@@ -729,7 +780,10 @@ def _share_parts(file_parts: list[dict], meta: dict, session: Session, caller: o
         if "url" in p:
             raise RpcError(CONTENT_TYPE_NOT_SUPPORTED, "file parts by URL are not fetched; "
                            "send the Markdown inline (raw, base64)", "CONTENT_TYPE_NOT_SUPPORTED")
-        media = (p.get("mediaType") or "text/markdown").split(";")[0].strip().lower()
+        media_raw = p.get("mediaType") or "text/markdown"
+        if not isinstance(media_raw, str) or not isinstance(p.get("raw") or "", str):
+            raise RpcError(INVALID_PARAMS, "file part: raw and mediaType must be strings")
+        media = media_raw.split(";")[0].strip().lower()
         if media not in ("text/markdown", "text/x-markdown", "text/plain"):
             raise RpcError(CONTENT_TYPE_NOT_SUPPORTED, f"only Markdown files are accepted, got {media}",
                            "CONTENT_TYPE_NOT_SUPPORTED")
@@ -761,7 +815,7 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
             "description": _str_arg(data, "description", 500),
             "is_public": _bool_arg(data, "is_public"),
             "protocol_mode": _str_arg(data, "protocol_mode", 20),
-            "ttl_hours": _int_arg(data, "ttl_hours"),
+            "ttl_hours": _int_arg(data, "ttl_hours", 1),
             "write_policy": _str_arg(data, "write_policy", 10),
         }))
         if notify.is_configured():
@@ -773,15 +827,16 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
                       res, res["uuid"])
     if op == "list_rooms":
         res = ops.list_rooms(session, caller, **_drop_none({
-            "sort": _str_arg(data, "sort", 20), "limit": _int_arg(data, "limit"),
-            "offset": _int_arg(data, "offset")}))
+            "sort": _str_arg(data, "sort", 20), "limit": _int_arg(data, "limit", 1),
+            "offset": _int_arg(data, "offset", 0)}))
         lines = [f"{r['uuid']} — {r['description'][:120]} ({r['message_count']} msgs)"
                  for r in res["rooms"]]
         return _reply(f"{res['total']} public rooms.\n" + "\n".join(lines), res, ctx_out)
     if op == "check_inbox":
         res = ops.check_inbox(session, caller)
         lines = [f"{r['uuid']}: {r['new_messages']} new" for r in res["rooms"] if r["new_messages"]]
-        lines += [f"mention in {m['room_uuid']} #{m['msg_id']} by {m['by']}: {m['text']}"
+        lines += [f"mention in {m['room_uuid']} #{m['msg_id']} by "
+                  f"{_quote_safe(m['by'])[:100]}: {_quote_safe(m['text'])}"
                   for m in res["mentions"]]
         return _reply("Inbox: " + ("\n".join(lines) if lines else "nothing new."), res, ctx_out)
     room = _need_room(room)
@@ -791,7 +846,8 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
                       f"{res['expires_at']}. Briefing: {res['description'] or '—'}", res,
                       ctx_out or res["uuid"])
     if op == "read":
-        res = ops.read(session, caller, room, _int_arg(data, "since"), _int_arg(data, "limit"))
+        res = ops.read(session, caller, room, _int_arg(data, "since", 0),
+                       _int_arg(data, "limit", 1))
         text = _fmt_messages(res["messages"], 50) or "No new messages."
         return _reply(text, res, ctx_out or res["room"])
     if op == "post":
@@ -800,7 +856,7 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
             raise RpcError(INVALID_PARAMS, "post needs text")
         return _post_and_catch_up(session, caller, room, text, agent_id, room_key,
                                   background_tasks, ctx_out,
-                                  _int_arg(data, "since") if "since" in data else meta["since"])
+                                  _int_arg(data, "since", 0) if "since" in data else meta["since"])
     if op == "share_file":
         content = _str_arg(data, "content", 300_000)
         if not content:
@@ -835,7 +891,7 @@ def _run_command(text: str, meta: dict, session: Session, caller: ops.Caller,
     if cmd in ("help", "start", ""):
         return _reply(HELP_TEXT, {"help": True, "skills": [s["id"] for s in SERVICE_SKILLS]}, ctx_out)
     mapping: dict[str, tuple[str, Callable[[str], dict]]] = {
-        "read": ("read", lambda r: {"since": int(r)} if r.isdigit() else {}),
+        "read": ("read", lambda r: {"since": r} if _INT_RE.fullmatch(r) else {}),
         "room": ("room_info", lambda r: {}),
         "rooms": ("list_rooms", lambda r: {}),
         "inbox": ("check_inbox", lambda r: {}),

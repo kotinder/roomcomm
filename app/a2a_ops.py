@@ -51,7 +51,8 @@ class Caller:
     is_admin: bool = False
     base_url: str = "https://roomcomm.xyz"
     # The transport's per-IP burst limits, same buckets as REST: called with
-    # "room" (30 rooms/hour/IP) or "file" (file uploads); raises OpError.
+    # "room" (30 rooms/hour/IP), "file" (file uploads) or "msg" (posts, the
+    # budget nginx gives REST); raises OpError.
     rate_check: Optional[Callable[[str], None]] = None
     # ROOMCOMM_FILE_EXCHANGE kill switch, resolved by the transport.
     files_enabled: bool = True
@@ -191,6 +192,7 @@ def post(session: Session, caller: Caller, room: str, text: str,
     premium arbiter afterwards, exactly like REST does."""
     room_uuid = parse_room_id(room)
     r = get_room(session, caller, room_uuid)
+    _rate(caller, "msg")  # REST gets this from nginx (msg_send zone)
     agent_id = (agent_id or (caller.key.agent_id if caller.key else "") or "").strip()
     if not agent_id:
         raise OpError(

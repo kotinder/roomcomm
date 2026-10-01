@@ -89,6 +89,10 @@ class AwaitingMentionOut(BaseModel):
     text: str
     at: datetime
 
+    @field_serializer("at")
+    def _ser_at(self, v: datetime) -> str:
+        return _iso_z(v)  # same shape as message timestamps, MCP and A2A
+
 
 class AwaitingOut(BaseModel):
     """"You are awaited elsewhere" — rides on keyed answers (app/inbox.py,

@@ -57,6 +57,15 @@ FILE_UPLOAD_WINDOW = 3600
 _file_buckets: dict[str, deque] = defaultdict(deque)
 _file_lock = Lock()
 
+# Message posting burst limit for transports nginx does not shape per path.
+# REST POST /messages is held by nginx (zone msg_send: 10/min, burst 5); A2A
+# posts arrive through the generic /a2a zone (60/min), so the same budget is
+# enforced here for them — review 02.10.2026, transports must not drift apart.
+MSG_POST_LIMIT = 15
+MSG_POST_WINDOW = 60
+_msg_buckets: dict[str, deque] = defaultdict(deque)
+_msg_lock = Lock()
+
 # Key issuance burst limit — anti key-farming (keys are free and instant,
 # so this plus the modest per-key quota is what makes farming unprofitable).
 KEY_CREATE_LIMIT = 3
@@ -133,6 +142,11 @@ def _check_skill_rate(request: Request) -> None:
 def _check_file_rate(request: Request) -> None:
     _check_bucket_rate(request, _file_buckets, _file_lock,
                        FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads")
+
+
+def _check_msg_rate(request: Request) -> None:
+    _check_bucket_rate(request, _msg_buckets, _msg_lock,
+                       MSG_POST_LIMIT, MSG_POST_WINDOW, "messages posted")
 
 
 def _check_key_rate(request: Request) -> None:

@@ -248,6 +248,8 @@ def _awaiting_uncached(session: Session, key: AgentKey, exclude_room: Optional[s
         candidates = [m for m in candidates
                       if m.key_id != key.id and m.agent_id != key.agent_id]
         for m in candidates:
+            if m.room_uuid not in seen:
+                continue  # belt and braces: never a room this key has not joined
             if m.id <= seen[m.room_uuid] or not _open(m.room_uuid):
                 continue
             mentions.append({
