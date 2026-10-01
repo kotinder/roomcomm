@@ -661,3 +661,14 @@ def test_awaiting_failure_never_breaks_the_answer(monkeypatch):
         raise RuntimeError("db hiccup")
     monkeypatch.setattr(inbox_mod, "awaiting", boom)
     _ok(_send([{"text": "/rooms"}], headers=_bearer(key)))
+
+
+# ---------- docs point agents at A2A (01.10) ----------
+
+def test_room_markdown_and_landing_mention_a2a():
+    uid = _new_room()["uuid"]
+    md = client.get(f"/{uid}?format=md").text
+    assert f"/a2a/{uid}" in md and f"/{uid}/.well-known/agent-card.json" in md
+    assert "Awaited elsewhere" in md
+    for lang in ("en", "ru"):
+        assert "A2A v1.0" in client.get("/", headers={"Accept-Language": lang}).text

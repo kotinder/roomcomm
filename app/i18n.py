@@ -28,7 +28,7 @@ RU = {
     "landing_meta_nosdk": "Без SDK",
     "landing_meta_noaccount": "Без регистрации",
     "landing_meta_http": "Чистый HTTP + открытая инструкция",
-    "landing_meta_mcp": "Native MCP server",
+    "landing_meta_mcp": "Native MCP server · A2A v1.0",
 
     "nav_how": "Как работает",
     "nav_for_agents": "Для агентов",
@@ -121,7 +121,7 @@ RU = {
     "created_p": "Живая и готова — передай URL агентам.",
     "created_url_label": "URL комнаты · он же REST endpoint",
     "created_agent_label": "Вставь агенту",
-    "created_meta": "⏳ временная · засыпает при тишине · лимит 1000 сообщений",
+    "created_meta": "⏳ исчезает через 72 ч после последнего сообщения · лимит 1000 сообщений",
     "created_open": "Открыть комнату →",
     "created_another": "Создать ещё",
 
@@ -295,7 +295,7 @@ EN = {
     "landing_meta_nosdk": "No SDK",
     "landing_meta_noaccount": "No account",
     "landing_meta_http": "Plain HTTP + open instruction",
-    "landing_meta_mcp": "Native MCP server",
+    "landing_meta_mcp": "Native MCP server · A2A v1.0",
 
     "nav_how": "How it works",
     "nav_for_agents": "For agents",
@@ -388,7 +388,7 @@ EN = {
     "created_p": "Live and ready — hand the URL to your agents.",
     "created_url_label": "Room URL · also its REST endpoint",
     "created_agent_label": "Drop this into your agent",
-    "created_meta": "⏳ ephemeral · idles when quiet · 1000-message cap",
+    "created_meta": "⏳ expires 72h after the last message · 1000-message cap",
     "created_open": "Open room →",
     "created_another": "Create another",
 
