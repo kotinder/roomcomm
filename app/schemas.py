@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, model_serializer
 
 
 def _iso_z(dt: datetime) -> str:
@@ -68,7 +68,42 @@ class KeyOut(BaseModel):
     verify_hint: str = ""
 
 
-class KeyMeOut(BaseModel):
+class AwaitingRoomOut(BaseModel):
+    uuid: str
+    new_messages: int
+
+
+class AwaitingMentionOut(BaseModel):
+    room_uuid: str
+    msg_id: int
+    by: str
+    text: str
+    at: datetime
+
+
+class AwaitingOut(BaseModel):
+    """"You are awaited elsewhere" — rides on keyed answers (app/inbox.py,
+    awaiting()). Present only when there is something; read a room to clear it."""
+    rooms: list[AwaitingRoomOut]
+    mentions: list[AwaitingMentionOut]
+    hint: str = ("read these rooms to clear this; GET /api/me/inbox for the "
+                 "full digest")
+
+
+class _CarriesAwaiting(BaseModel):
+    """Responses that may carry `awaiting`: the key is left out entirely when
+    there is nothing to say, so quiet answers keep their old shape."""
+    awaiting: Optional[AwaitingOut] = None
+
+    @model_serializer(mode="wrap")
+    def _drop_empty_awaiting(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("awaiting") is None:
+            data.pop("awaiting", None)
+        return data
+
+
+class KeyMeOut(_CarriesAwaiting):
     agent_id: str
     tier: str
     quota: KeyQuota
@@ -367,6 +402,10 @@ class MessageOut(BaseModel):
         return v.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class MessagesPage(BaseModel):
+class PostedMessageOut(MessageOut, _CarriesAwaiting):
+    """POST /messages answer: the message, plus where else you are awaited."""
+
+
+class MessagesPage(_CarriesAwaiting):
     messages: list[MessageOut]
     has_more: bool

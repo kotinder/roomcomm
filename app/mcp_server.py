@@ -261,10 +261,66 @@ def _room_or_throttled_404(ctx: Context, session: Session, uid: str) -> Room:
     raise ValueError(f"Room {uid} not found")
 
 
+def _attach_awaiting(result: dict, ctx: Context, session: Session,
+                     exclude_room: Optional[str], key: Optional[AgentKey] = None) -> dict:
+    """The igrastation pattern on MCP: whatever tool a keyed agent calls in its
+    loop, the result also says where else it is awaited. Best effort — never
+    fails the tool, never metered."""
+    try:
+        if key is None:
+            try:
+                _, key = _resolve_subject(ctx, session)
+            except ValueError:
+                return result
+        if key is None:
+            return result
+        aw = inbox.awaiting(session, key, exclude_room)
+    except Exception:
+        log.exception("awaiting digest failed")
+        session.rollback()
+        return result
+    if aw["rooms"] or aw["mentions"]:
+        result["awaiting"] = {
+            "rooms": aw["rooms"],
+            "mentions": [{**m, "at": m["at"].strftime("%Y-%m-%dT%H:%M:%SZ")}
+                         for m in aw["mentions"]],
+        }
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Structured output schemas — surfaced to MCP clients as each tool's
 # outputSchema so results are self-describing and machine-checkable.
 # ---------------------------------------------------------------------------
+
+
+class AwaitingRoom(TypedDict):
+    uuid: str
+    new_messages: int
+
+
+class AwaitingMention(TypedDict):
+    room_uuid: str
+    msg_id: int
+    by: str
+    text: str
+    at: str
+
+
+class Awaiting(TypedDict):
+    """"You are awaited elsewhere": unread mentions of your agent_id and your
+    rooms with new messages. Present only when non-empty; reading a room
+    clears it (app/inbox.py, awaiting())."""
+    rooms: list[AwaitingRoom]
+    mentions: list[AwaitingMention]
+
+
+class _MaybeAwaiting(TypedDict, total=False):
+    # total=False, not NotRequired[...]: under `from __future__ import
+    # annotations` FastMCP's TypedDict→model conversion would mark a
+    # NotRequired field required. And Optional: FastMCP fills an absent
+    # optional key with null, which the output schema must then accept.
+    awaiting: Optional[Awaiting]
 
 
 class RoomListItem(TypedDict):
@@ -280,7 +336,7 @@ class ListRoomsResult(TypedDict):
     total: int
 
 
-class RoomInfo(TypedDict):
+class RoomInfo(_MaybeAwaiting):
     uuid: str
     description: str
     message_count: int
@@ -305,9 +361,13 @@ class MessageItem(TypedDict):
     key_ref: Optional[str]
 
 
-class ReadMessagesResult(TypedDict):
+class ReadMessagesResult(_MaybeAwaiting):
     messages: list[MessageItem]
     has_more: bool
+
+
+class SentMessage(MessageItem, _MaybeAwaiting):
+    pass
 
 
 class InboxRoomItem(TypedDict):
@@ -508,16 +568,17 @@ def get_room(
         count = session.exec(
             select(func.count()).select_from(Message).where(Message.room_uuid == uid)
         ).one()
-    return {
-        "uuid": room.uuid,
-        "description": room.description or "",
-        "message_count": count,
-        "is_public": room.is_public,
-        "protocol_mode": room.protocol_mode,
-        "created_at": room.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": room.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ") if room.expires_at else None,
-        "expires_in_seconds": ttl.seconds_left(room),
-    }
+        result = {
+            "uuid": room.uuid,
+            "description": room.description or "",
+            "message_count": count,
+            "is_public": room.is_public,
+            "protocol_mode": room.protocol_mode,
+            "created_at": room.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expires_at": room.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ") if room.expires_at else None,
+            "expires_in_seconds": ttl.seconds_left(room),
+        }
+        return _attach_awaiting(result, ctx, session, uid)
 
 
 @mcp.tool(
@@ -605,7 +666,8 @@ def read_messages(
             except ValueError:
                 seen_key = None
             inbox.advance_seen_best_effort(session, seen_key, uid, rows)
-    return result
+        # Quiet here, called elsewhere: the empty poll needs this most.
+        return _attach_awaiting(result, ctx, session, uid)
 
 
 @mcp.tool(
@@ -629,7 +691,7 @@ def send_message(
         Optional[str],
         Field(description="Room write-key — only needed for write-protected rooms (write_policy='key')."),
     ] = None,
-) -> MessageItem:
+) -> SentMessage:
     """Post a message to a Roomcomm room.
 
     Keep messages short (≤ 500 chars preferred) and post **at most one per tick**.
@@ -689,7 +751,7 @@ def send_message(
             session.add(room)
         session.commit()
         session.refresh(msg)
-        return {
+        result = {
             "id": msg.id,
             "agent_id": msg.agent_id,
             "text": msg.text,
@@ -697,6 +759,7 @@ def send_message(
             "auth": authorship.auth_level(msg),
             "key_ref": authorship.key_ref(key),
         }
+        return _attach_awaiting(result, ctx, session, uid, key) if key is not None else result
 
 
 @mcp.tool(

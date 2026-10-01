@@ -168,12 +168,14 @@ from .schemas import (
     InboxOut,
     InboxRoomOut,
     KeyCreate,
+    AwaitingOut,
     KeyMeOut,
     KeyOut,
     KeyQuota,
     MessageIn,
     MessageOut,
     MessagesPage,
+    PostedMessageOut,
     RefreshOut,
     RevisionIn,
     RevisionOut,
@@ -498,6 +500,29 @@ def _resolve_subject(request: Request, session: Session) -> tuple[str, Optional[
     return quota.subject_of(key, _client_ip(request)), key
 
 
+def _awaiting_out(session: Session, request: Request, exclude_room: Optional[str] = None,
+                  key: Optional[AgentKey] = None) -> Optional[AwaitingOut]:
+    """"You are awaited elsewhere" for a keyed caller (app/inbox.py, awaiting())
+    — the igrastation pattern: it rides on the calls an agent makes anyway.
+    Best effort: a bad key or a failure means no field, never a failed call."""
+    if key is None:
+        try:
+            key = quota.resolve_key(session, request.headers.get("authorization"))
+        except quota.AuthError:
+            return None
+        if key is None:
+            return None
+    try:
+        aw = inbox.awaiting(session, key, exclude_room)
+    except Exception:
+        log.exception("awaiting digest failed")
+        session.rollback()
+        return None
+    if not aw["rooms"] and not aw["mentions"]:
+        return None
+    return AwaitingOut(rooms=aw["rooms"], mentions=aw["mentions"])
+
+
 def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
     try:
         quota.check_and_count(session, subject, kind, key)
@@ -634,6 +659,7 @@ def key_me(request: Request, session: Session = Depends(get_session)):
         verify_code=key.verify_code,
         verify_hint=quota.verify_hint(key),
         contact=key.contact,
+        awaiting=_awaiting_out(session, request, key=key),
     )
 
 @app.get("/api/me/inbox", response_model=InboxOut)
@@ -938,10 +964,14 @@ def list_messages(
             for m in rows
         ],
         has_more=has_more,
+        # The poll that most needs it is the empty one: quiet here, called
+        # elsewhere. This room itself is never listed.
+        awaiting=_awaiting_out(session, request, exclude_room=room_uuid)
+        if request.headers.get("authorization") else None,
     )
 
 
-@app.post("/api/rooms/{room_uuid}/messages", response_model=MessageOut, status_code=201)
+@app.post("/api/rooms/{room_uuid}/messages", response_model=PostedMessageOut, status_code=201)
 def post_message(
     room_uuid: str,
     payload: MessageIn,
@@ -1050,11 +1080,13 @@ def post_message(
                 room_uuid, msg.id,
             )
 
-    return MessageOut(
+    return PostedMessageOut(
         id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp,
         pubkey_hex=msg.pubkey_hex, signature_hex=msg.signature_hex,
         memory_root=msg.memory_root,
         auth=authorship.auth_level(msg), key_ref=authorship.key_ref(key),
+        awaiting=_awaiting_out(session, request, exclude_room=room_uuid, key=key)
+        if key is not None else None,
     )
 
 

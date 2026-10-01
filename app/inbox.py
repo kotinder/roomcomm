@@ -14,7 +14,9 @@ side effects so agents can poll it safely.
 Shared by BOTH transports (REST handlers in main.py, MCP tools in
 mcp_server.py) — like quota.py, this module must import neither.
 """
+import time
 from datetime import timedelta
+from threading import Lock
 from typing import Optional
 
 from sqlmodel import Session, select, func
@@ -37,6 +39,7 @@ def advance_seen(session: Session, key_id: int, room_uuid: str,
     backward. Rides the caller's transaction; the caller commits."""
     if not up_to:
         return
+    invalidate_awaiting(key_id)  # what you just read no longer awaits you
     row = session.get(RoomSeen, (key_id, room_uuid))
     if row is None:
         session.add(RoomSeen(key_id=key_id, room_uuid=room_uuid,
@@ -153,6 +156,23 @@ def _mentions(session: Session, key: AgentKey, seen: dict[str, int],
 
 
 AWAITING_LIMIT = 3
+# "Awaiting you" rides on every keyed read, and agents poll: it must stay
+# cheap whatever the key's history. Mentions are looked for among the newest
+# AWAITING_SCAN messages only (a primary-key range, not a table scan). The
+# digest is cached per key AND per newest message id on the server: any new
+# message anywhere refreshes it (a fresh mention is never late), a moved
+# watermark drops it (a room you just read never lingers), and an agent
+# polling a quiet server pays one primary-key lookup.
+AWAITING_SCAN = 5000
+AWAITING_TTL = 30.0
+_await_cache: dict[tuple[int, str, Optional[str], int], tuple[float, dict]] = {}
+_await_lock = Lock()
+
+
+def invalidate_awaiting(key_id: int) -> None:
+    with _await_lock:
+        for k in [k for k in _await_cache if k[0] == key_id]:
+            del _await_cache[k]
 
 
 def awaiting(session: Session, key: AgentKey, exclude_room: Optional[str] = None,
@@ -160,15 +180,36 @@ def awaiting(session: Session, key: AgentKey, exclude_room: Optional[str] = None
     """"You are awaited elsewhere" — the cheap digest a transport can attach to
     EVERY answer (the igrastation pattern: the notice rides on the calls the
     agent already makes in its loop, so it reaches agents that never learned
-    about check_inbox). Unlike build_inbox it costs a fixed number of queries
-    whatever the key's history: one aggregate over the key's watermarks and
-    one mention scan. Rooms past their TTL are left out — nobody can answer
-    there. Side-effect free, never metered: it rides on a request that
-    already was."""
-    seen = {
-        r.room_uuid: r.last_seen_msg_id
-        for r in session.exec(select(RoomSeen).where(RoomSeen.key_id == key.id)).all()
-    }
+    about check_inbox).
+
+    rooms    — rooms where the key has a watermark and newer messages exist;
+    mentions — unread recent messages naming the key's agent_id.
+    Both skip ``exclude_room`` (where the agent is right now) and rooms past
+    their TTL — nobody can answer there. Side-effect free and never metered:
+    it rides on a request that already was. Cached, see AWAITING_TTL."""
+    top = session.exec(select(func.max(Message.id))).one() or 0
+    ck = (key.id, (key.key_hash or "")[:16], exclude_room, top)
+    t = time.monotonic()
+    with _await_lock:
+        hit = _await_cache.get(ck)
+        if hit is not None and t - hit[0] < AWAITING_TTL:
+            return hit[1]
+    data = _awaiting_uncached(session, key, exclude_room, now, top)
+    with _await_lock:
+        if len(_await_cache) > 5000:  # bounded: drop everything, rebuild lazily
+            _await_cache.clear()
+        _await_cache[ck] = (t, data)
+    return data
+
+
+def _awaiting_uncached(session: Session, key: AgentKey, exclude_room: Optional[str],
+                       now=None, top: int = 0) -> dict:
+    def _open(room_uuid: str) -> bool:
+        if room_uuid == exclude_room:
+            return False
+        room = session.get(Room, room_uuid)
+        return room is not None and not ttl.is_expired(room, now)
+
     rows = session.exec(
         select(Message.room_uuid, func.count(Message.id))
         .join(RoomSeen, (RoomSeen.room_uuid == Message.room_uuid)
@@ -177,27 +218,40 @@ def awaiting(session: Session, key: AgentKey, exclude_room: Optional[str] = None
         .group_by(Message.room_uuid)
         .order_by(func.max(Message.id).desc())
         .limit(AWAITING_LIMIT * 4)
-    ).all() if seen else []
-    rooms = []
-    for room_uuid, n in rows:
-        if room_uuid == exclude_room:
-            continue
-        room = session.get(Room, room_uuid)
-        if room is None or ttl.is_expired(room, now):
-            continue
-        rooms.append({"uuid": room_uuid, "new_messages": n})
-        if len(rooms) >= AWAITING_LIMIT:
-            break
-    mentions = []
-    for m in _mentions(session, key, seen, AWAITING_LIMIT * 4):
-        if m["room_uuid"] == exclude_room:
-            continue
-        room = session.get(Room, m["room_uuid"])
-        if room is None or ttl.is_expired(room, now):
-            continue
-        mentions.append(m)
-        if len(mentions) >= AWAITING_LIMIT:
-            break
+    ).all()
+    rooms = [{"uuid": r, "new_messages": n} for r, n in rows if _open(r)][:AWAITING_LIMIT]
+
+    mentions: list[dict] = []
+    name = (key.agent_id or "").strip().lower()
+    if len(name) >= MENTION_MIN_NAME:
+        cutoff = utcnow() - timedelta(days=MENTION_WINDOW_DAYS)
+        candidates = session.exec(
+            select(Message).where(
+                Message.id > top - AWAITING_SCAN,
+                Message.timestamp >= cutoff,
+                func.instr(func.lower(Message.text), name) > 0,
+            ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)
+        ).all()
+        candidates = [m for m in candidates
+                      if m.key_id != key.id and m.agent_id != key.agent_id]
+        room_ids = {m.room_uuid for m in candidates}
+        seen = {
+            r.room_uuid: r.last_seen_msg_id
+            for r in session.exec(select(RoomSeen).where(
+                RoomSeen.key_id == key.id, RoomSeen.room_uuid.in_(room_ids)))
+        } if room_ids else {}
+        for m in candidates:
+            if m.id <= seen.get(m.room_uuid, 0) or not _open(m.room_uuid):
+                continue
+            mentions.append({
+                "room_uuid": m.room_uuid,
+                "msg_id": m.id,
+                "by": m.agent_id,
+                "text": m.text[:SNIPPET_LEN],
+                "at": m.timestamp,
+            })
+            if len(mentions) >= AWAITING_LIMIT:
+                break
     return {"rooms": rooms, "mentions": mentions}
 
 
