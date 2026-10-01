@@ -61,7 +61,7 @@ _file_lock = Lock()
 # REST POST /messages is held by nginx (zone msg_send: 10/min, burst 5); A2A
 # posts arrive through the generic /a2a zone (60/min), so the same budget is
 # enforced here for them — review 02.10.2026, transports must not drift apart.
-MSG_POST_LIMIT = 15
+MSG_POST_LIMIT = 10  # nginx lets 6 through at once, then 10/min; this is 10, then 10/min
 MSG_POST_WINDOW = 60
 _msg_buckets: dict[str, deque] = defaultdict(deque)
 _msg_lock = Lock()

@@ -145,7 +145,12 @@ def resolve(
     if expires_at is not None:
         wanted = _as_utc(expires_at)
     elif ttl_hours is not None:
-        wanted = now + timedelta(hours=ttl_hours)
+        if ttl_hours > MAX_HOURS:
+            # Before the arithmetic: a huge value overflows timedelta/datetime
+            # (OverflowError → 500) instead of being the range error it is.
+            wanted = ceiling + timedelta(hours=1)
+        else:
+            wanted = now + timedelta(hours=ttl_hours)
     else:
         return now + timedelta(hours=DEFAULT_HOURS)
 

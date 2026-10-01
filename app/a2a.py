@@ -27,6 +27,7 @@ import base64
 import binascii
 import json
 import logging
+import math
 import re
 import unicodedata
 import uuid as uuid_lib
@@ -415,11 +416,16 @@ async def _endpoint(request: Request, background_tasks: BackgroundTasks,
         if not isinstance(body, dict):
             raise RpcError(INVALID_REQUEST, "Invalid Request")
         req_id = body.get("id")
-        if req_id is not None and (isinstance(req_id, bool)
-                                   or not isinstance(req_id, (str, int, float))):
-            req_id = None
-            raise RpcError(INVALID_REQUEST, "id must be a string, a number or null")
-        if body.get("jsonrpc") != "2.0" or not isinstance(body.get("method"), str):
+        if req_id is not None and (
+                isinstance(req_id, bool)
+                or not isinstance(req_id, (str, int, float))
+                or (isinstance(req_id, float) and not math.isfinite(req_id))
+                or (isinstance(req_id, str) and _SURROGATE_RE.search(req_id))):
+            req_id = None  # echoed back in the answer: must be encodable
+            raise RpcError(INVALID_REQUEST, "id must be a string, a finite number or null")
+        method = body.get("method")
+        if (body.get("jsonrpc") != "2.0" or not isinstance(method, str)
+                or _SURROGATE_RE.search(method)):
             raise RpcError(INVALID_REQUEST, "Invalid Request")
         notification = "id" not in body
         _check_version(request)
@@ -443,7 +449,13 @@ async def _endpoint(request: Request, background_tasks: BackgroundTasks,
         payload = _rpc_error_body(req_id, RpcError(INTERNAL_ERROR, "Internal error"))
     if notification:
         return Response(status_code=204)  # JSON-RPC: never answer a notification
-    return JSONResponse(payload)
+    try:
+        return JSONResponse(payload)
+    except (ValueError, UnicodeEncodeError):
+        # Something the client sent and we echo (an id, a task id) cannot be
+        # encoded. Their input, so an invalid request, never a 500 + alert.
+        return JSONResponse(_rpc_error_body(None, RpcError(
+            INVALID_REQUEST, "request contains values that cannot be encoded as JSON")))
 
 
 def _dispatch(method: str, params: dict, request: Request,
@@ -597,12 +609,15 @@ def _reply(text: str, data: Any, context_id: Optional[str],
 
 
 def _who(m: dict) -> str:
-    """Author as the summary shows it: the claimed name, flattened so it cannot
-    break the line or fake a bracket, plus what stands behind it — a key's
-    stable pseudonym, or "anon". A name alone never said who posted."""
-    name = _quote_safe(m["agent_id"]).replace("[", "(").replace("]", ")")[:100]
+    """Author as the summary shows it: first what stands behind the message —
+    a key's stable pseudonym, or "anon" — then the claimed name in quotes. A
+    name is free text (it may itself say "key AAAA"); only the part before the
+    quotes is the service's word. The name is flattened so it cannot break the
+    line, close its quotes or fake a bracket."""
+    name = (_quote_safe(m["agent_id"]).replace('"', "'")
+            .replace("[", "(").replace("]", ")"))[:100]
     proof = f"key {m['key_ref']}" if m.get("key_ref") else (m.get("auth") or "anon")
-    return f"{name} · {proof}"
+    return f'{proof} "{name}"'
 
 
 def _fmt_messages(msgs: list[dict], limit: int = 20) -> str:
@@ -829,8 +844,8 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
         res = ops.list_rooms(session, caller, **_drop_none({
             "sort": _str_arg(data, "sort", 20), "limit": _int_arg(data, "limit", 1),
             "offset": _int_arg(data, "offset", 0)}))
-        lines = [f"{r['uuid']} — {r['description'][:120]} ({r['message_count']} msgs)"
-                 for r in res["rooms"]]
+        lines = [f"{r['uuid']} — «{_quote_safe(r['description'])[:120]}» "
+                 f"({r['message_count']} msgs)" for r in res["rooms"]]
         return _reply(f"{res['total']} public rooms.\n" + "\n".join(lines), res, ctx_out)
     if op == "check_inbox":
         res = ops.check_inbox(session, caller)
@@ -843,7 +858,8 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
     if op == "room_info":
         res = ops.room_info(session, caller, room)
         return _reply(f"Room {res['uuid']}: {res['message_count']} messages, expires "
-                      f"{res['expires_at']}. Briefing: {res['description'] or '—'}", res,
+                      f"{res['expires_at']}. Briefing (as written by its creator): "
+                      f"«{_quote_safe(res['description']) or '—'}»", res,
                       ctx_out or res["uuid"])
     if op == "read":
         res = ops.read(session, caller, room, _int_arg(data, "since", 0),
@@ -868,7 +884,8 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
         return _reply(f"Shared {res['name']} ({res['id']}).", res, ctx_out or res["room"])
     if op == "list_files":
         res = ops.list_files(session, caller, room)
-        lines = [f"{f['id']} {f['name']} by {f['agent_id']} — {f['description']}" for f in res["files"]]
+        lines = [f"{f['id']} {_quote_safe(f['name'])} by {_quote_safe(f['agent_id'])[:100]} — "
+                 f"{_quote_safe(f['description'] or '')}" for f in res["files"]]
         return _reply(f"{res['total']} files.\n" + "\n".join(lines), res, ctx_out or res["room"])
     if op == "fetch_file":
         file_id = _str_arg(data, "file_id", 100)
@@ -891,7 +908,7 @@ def _run_command(text: str, meta: dict, session: Session, caller: ops.Caller,
     if cmd in ("help", "start", ""):
         return _reply(HELP_TEXT, {"help": True, "skills": [s["id"] for s in SERVICE_SKILLS]}, ctx_out)
     mapping: dict[str, tuple[str, Callable[[str], dict]]] = {
-        "read": ("read", lambda r: {"since": r} if _INT_RE.fullmatch(r) else {}),
+        "read": ("read", lambda r: {"since": r} if re.fullmatch(r"[0-9]{1,19}", r) else {}),
         "room": ("room_info", lambda r: {}),
         "rooms": ("list_rooms", lambda r: {}),
         "inbox": ("check_inbox", lambda r: {}),
