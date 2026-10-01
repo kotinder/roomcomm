@@ -451,9 +451,18 @@ async def _endpoint(request: Request, background_tasks: BackgroundTasks,
         return Response(status_code=204)  # JSON-RPC: never answer a notification
     try:
         return JSONResponse(payload)
-    except (ValueError, UnicodeEncodeError):
-        # Something the client sent and we echo (an id, a task id) cannot be
-        # encoded. Their input, so an invalid request, never a 500 + alert.
+    except (ValueError, UnicodeEncodeError) as exc:
+        if "result" in payload:
+            # Our own result failed to encode: a server bug — say so, alert.
+            log.exception("a2a: result not encodable in %s", request.url.path)
+            try:
+                await notify.send(notify.format_error(
+                    where="A2A encode", exc=exc, request_path=str(request.url.path)))
+            except Exception:
+                log.exception("notify.send failed inside a2a handler")
+            return JSONResponse(_rpc_error_body(None, RpcError(INTERNAL_ERROR, "Internal error")))
+        # An error answer echoing what the client sent (an id, a task id) that
+        # cannot be encoded: their input, an invalid request — no 500, no alert.
         return JSONResponse(_rpc_error_body(None, RpcError(
             INVALID_REQUEST, "request contains values that cannot be encoded as JSON")))
 
@@ -566,8 +575,10 @@ def _parse_message(params: dict) -> dict:
         raise RpcError(INVALID_PARAMS, "message.parts must be a non-empty list")
     if not msg.get("messageId"):
         raise RpcError(INVALID_PARAMS, "message.messageId is required")
-    if msg.get("contextId") is not None and not isinstance(msg.get("contextId"), str):
-        raise RpcError(INVALID_PARAMS, "message.contextId must be a string")
+    if msg.get("contextId") is not None:
+        if not isinstance(msg.get("contextId"), str):
+            raise RpcError(INVALID_PARAMS, "message.contextId must be a string")
+        _text_arg(msg["contextId"], "message.contextId")  # echoed back: must encode
     return msg
 
 
@@ -614,10 +625,17 @@ def _who(m: dict) -> str:
     name is free text (it may itself say "key AAAA"); only the part before the
     quotes is the service's word. The name is flattened so it cannot break the
     line, close its quotes or fake a bracket."""
-    name = (_quote_safe(m["agent_id"]).replace('"', "'")
-            .replace("[", "(").replace("]", ")"))[:100]
     proof = f"key {m['key_ref']}" if m.get("key_ref") else (m.get("auth") or "anon")
-    return f'{proof} "{name}"'
+    return f"{proof} {_claimed(m['agent_id'])}"
+
+
+def _claimed(name: str) -> str:
+    """A claimed agent_id inside text the service writes: one line, in double
+    quotes it cannot close, no brackets — always visibly a name, never the
+    service's voice (it may say "roomcomm service · key ADMIN")."""
+    flat = (_quote_safe(name or "").replace('"', "'")
+            .replace("[", "(").replace("]", ")"))[:100]
+    return f'"{flat}"'
 
 
 def _fmt_messages(msgs: list[dict], limit: int = 20) -> str:
@@ -688,7 +706,7 @@ def _attach_awaiting(reply: dict, session: Session, caller: ops.Caller) -> None:
         return
     if not aw["rooms"] and not aw["mentions"]:
         return
-    lines = [f"- {_quote_safe(x['by'])[:100]} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
+    lines = [f"- {_claimed(x['by'])} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
              f"{_quote_safe(x['text'])[:160]}" for x in aw["mentions"]]
     lines += [f"- {x['new_messages']} new in room {x['uuid']}" for x in aw["rooms"]]
     m["parts"][0]["text"] += ("\n\nAwaiting you elsewhere (read a room to clear it):\n"
@@ -851,7 +869,7 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
         res = ops.check_inbox(session, caller)
         lines = [f"{r['uuid']}: {r['new_messages']} new" for r in res["rooms"] if r["new_messages"]]
         lines += [f"mention in {m['room_uuid']} #{m['msg_id']} by "
-                  f"{_quote_safe(m['by'])[:100]}: {_quote_safe(m['text'])}"
+                  f"{_claimed(m['by'])}: {_quote_safe(m['text'])}"
                   for m in res["mentions"]]
         return _reply("Inbox: " + ("\n".join(lines) if lines else "nothing new."), res, ctx_out)
     room = _need_room(room)
