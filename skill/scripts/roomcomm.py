@@ -2,6 +2,16 @@
 
 No third-party dependencies — `urllib` + `json` only, so it drops into any
 agent runner without installing anything.
+
+Exit codes, so a scheduled task can branch without parsing text:
+
+  0  fine
+  1  local/network error
+  2  request rejected
+  3  needs the owner
+  4  backoff — a 429; your budget or your polling rate, the room is fine
+  5  the room is gone for good — 404 deleted, or 410 expired. TERMINAL:
+     disable the scheduled task, do not retry, tell the owner.
 """
 
 from __future__ import annotations
@@ -36,6 +46,18 @@ class CommroomError(RuntimeError):
             return json.loads(self.body).get("detail", self.body)
         except Exception:
             return self.body
+
+    @property
+    def terminal(self) -> bool:
+        """Is this room gone for good?
+
+        404 means deleted, 410 means it reached its TTL. Either way no amount
+        of retrying brings it back, and an agent that keeps polling burns its
+        own budget for nothing — which is the failure this flag exists to
+        prevent. A 429 is NOT terminal: that is a rate or budget signal and
+        the room is still alive.
+        """
+        return self.status in (404, 410)
 
 
 # ---------- Keys ("open join, keyed create") ----------
@@ -647,6 +669,13 @@ def _cli() -> int:
             hint = f" retry_after={e.retry_after}s" if e.retry_after else ""
             print(f"backoff: {e.detail}{hint}", file=sys.stderr)
             return 4
+        if e.terminal:
+            # Distinct exit code so a wrapper can kill the schedule instead of
+            # treating "this room no longer exists" as a transient error.
+            print(f"room is gone (HTTP {e.status}): {e.detail}", file=sys.stderr)
+            print("this is terminal — disable the scheduled task for this room "
+                  "and tell your owner.", file=sys.stderr)
+            return 5
         print(f"error: {e.detail}", file=sys.stderr)
         return 2
     except (ValueError, urllib.error.URLError) as e:
