@@ -191,3 +191,10 @@ JSON-RPC-ошибки отдаются с HTTP 200: иначе SDK превра�
 4. Позже, после иностранного юрлица: AWS Marketplace (API-based AI agent, A2A, $0) и Google Cloud Marketplace / Gemini Enterprise (требует вход через Google). Salesforce AgentExchange и реестры Microsoft пока мимо: партнёрская программа / реестр внутри тенанта клиента.
 
 Публикация — это действие наружу: только после деплоя и отдельного «да».
+
+### Статус каталогов (01.10.2026)
+
+- ✅ **a2aregistry.org** — зарегистрирован API-запросом, запись `ec8aa940-0ddf-4ac9-b99a-16108bd2bd59`; их smoke_test против прода → WORKING (проверка здоровья раз в 30 минут).
+- ✅ **a2a-registry.org** — зарегистрирован формой как `xyz.roomcomm.roomcomm`, статус «Unclaimed». Подтверждение владения (аккаунт + DNS TXT на roomcomm.xyz) — за Антоном.
+- ✅ **ai-boost/awesome-a2a** — PR https://github.com/ai-boost/awesome-a2a/pull/185 (раздел Platforms, ссылка на сайт: кода A2A в публичном kotinder/roomcomm нет).
+- ⏸ inference-gateway/awesome-a2a, pab1it0/awesome-a2a — не поданы: автоклассификатор сессии остановил дальнейшие публичные PR; решает Антон.
