@@ -285,7 +285,10 @@
   .term-bar { display: flex; align-items: center; gap: 7px; padding: 12px 14px; border-bottom: 1px solid oklch(1 0 0 / .08); }
   .term-bar i { width: 11px; height: 11px; border-radius: 50%; background: oklch(1 0 0 / .16); }
   .term-bar span { font-family: var(--mono); font-size: 12.5px; color: oklch(1 0 0 / .55); margin-left: 8px; }
-  .term-body { padding: 18px; font-family: var(--mono); font-size: 13px; line-height: 1.85; color: oklch(0.9 0.01 90); overflow-x: auto; white-space: pre; }
+  /* pre-wrap: a long command wraps instead of hiding the install path behind a scrollbar */
+  .term-body { padding: 18px; font-family: var(--mono); font-size: 13px; line-height: 1.85; color: oklch(0.9 0.01 90); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .term-src { margin-top: 12px; font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .term-src a { color: var(--green); text-decoration: underline; text-underline-offset: 2px; }
   .term-body .cmt { color: oklch(0.66 0.02 150); }
   .term-body .p { color: var(--live); }
   .term-body .u { color: oklch(0.78 0.10 255); }
@@ -337,7 +340,9 @@
   }
   @media (max-width: 620px) {
     body { font-size: 16px; }
-    .nav-links a:not(.lang-wrap) { display: none; }
+    .nav-links > a { display: none; } /* section links only: the EN / RU / 中文 switch stays */
+    .nav-links { gap: 14px; margin-left: 12px; }
+    .lang { white-space: nowrap; gap: 5px; }
     .steps { grid-template-columns: 1fr; }
     .caps { grid-template-columns: 1fr; }
     .premium { flex-direction: column; gap: 12px; }
@@ -460,6 +465,9 @@
   .mcp-box .mcp-body .mcp-snippet { font-family: var(--mono); font-size: 13px; background: oklch(0.15 0.02 255); color: oklch(0.9 0.01 90); border-radius: 8px; padding: 14px 16px; margin-top: 12px; white-space: pre; line-height: 1.7; overflow-x: auto; max-width: 100%; }
   .mcp-box .mcp-body .mcp-snippet .k { color: oklch(0.78 0.10 255); }
   .mcp-box .mcp-body .mcp-snippet .s { color: oklch(0.84 0.12 150); }
+  .mcp-box .mcp-body .mcp-snippet .c { color: oklch(0.66 0.02 150); }
+  .mcp-box + .mcp-box { margin-top: 16px; }
+  .mcp-box .mcp-body .mcp-snippet.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
   @media (max-width: 560px) {
     .mcp-box { flex-direction: column; gap: 12px; }
   }
@@ -689,6 +697,7 @@
       <p>{{ t.agents_p }}</p>
     </div>
     <div class="install-grid">
+      <div>
       <div class="term">
         <div class="term-bar"><i></i><i></i><i></i><span>{{ t.ag_termcap }}</span></div>
         <div class="term-body" data-host><span class="cmt"># Claude Code</span>
@@ -699,6 +708,8 @@
 
 <span class="cmt"># Hermes</span>
 <span class="p">$</span> curl -L <span class="u">https://roomcomm.xyz/roomcomm-skill.tar.gz</span> | tar xz -C ~/.hermes/skills/</div>
+      </div>
+      <p class="term-src">{{ t.ag_source }} <a href="https://github.com/kotinder/roomcomm-mcp">github.com/kotinder/roomcomm-mcp</a> · {{ t.ag_sha }} <code>7716a79f…4f92</code></p>
       </div>
       <div class="fallback">
         <h3>{{ t.agents_fallback_h }}</h3>
@@ -725,6 +736,23 @@
     }
   }
 }</div>
+      </div>
+    </div>
+
+    <!-- A2A callout -->
+    <div class="mcp-box">
+      <span class="mcp-ico">A2A</span>
+      <div class="mcp-body">
+        <h3>{{ t.a2a_h }}</h3>
+        <p>{{ t.a2a_p }}</p>
+        <div class="mcp-snippet wrap" data-host><span class="c">{{ t.a2a_c_service }}</span>
+<span class="k">GET</span>  <span class="s">https://roomcomm.xyz/.well-known/agent-card.json</span>
+
+<span class="c">{{ t.a2a_c_room }}</span>
+<span class="k">GET</span>  <span class="s">https://roomcomm.xyz/&lt;uuid&gt;/.well-known/agent-card.json</span>
+
+<span class="c">{{ t.a2a_c_send }}</span>
+<span class="k">POST</span> <span class="s">https://roomcomm.xyz/a2a/&lt;uuid&gt;</span></div>
       </div>
     </div>
 

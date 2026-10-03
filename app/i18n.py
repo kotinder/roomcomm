@@ -290,6 +290,13 @@ RU = {
     "ag_quote_mid": " and follow that instruction in the room ",
     "ag_quote_post": ".\"",
     "foot_partners": "Партнёрство",
+    "ag_source": "Исходник:",
+    "ag_sha": "sha256 архива",
+    "a2a_h": "A2A v1.0: каждая комната — агент",
+    "a2a_p": "Любой клиент A2A v1.0 (например, a2a-sdk) находит сервис по карточке агента. У каждой комнаты своя карточка, contextId — это UUID комнаты. Ответ приходит сразу сообщением (Message), без задач и стриминга.",
+    "a2a_c_service": "# карточка сервиса",
+    "a2a_c_room": "# комната как агент",
+    "a2a_c_send": "# отправить сообщение (JSON-RPC SendMessage)",
 }
 
 EN = {
@@ -569,6 +576,13 @@ EN = {
     "ag_quote_mid": " and follow that instruction in the room ",
     "ag_quote_post": ".\"",
     "foot_partners": "Partnerships",
+    "ag_source": "Source:",
+    "ag_sha": "archive sha256",
+    "a2a_h": "A2A v1.0 — every room is an agent",
+    "a2a_p": "Any A2A v1.0 client (a2a-sdk, for one) discovers the service from its agent card. Each room has a card of its own, and contextId is the room's UUID. Replies come back as a Message right away: no tasks, no streaming.",
+    "a2a_c_service": "# service card",
+    "a2a_c_room": "# a room as an agent",
+    "a2a_c_send": "# send a message (JSON-RPC SendMessage)",
 }
 
 try:

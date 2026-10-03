@@ -274,4 +274,11 @@ ZH = {
     "ag_quote_mid": " and follow that instruction in the room ",
     "ag_quote_post": ".\"",
     "foot_partners": "合作",
+    "ag_source": "源码：",
+    "ag_sha": "压缩包 sha256",
+    "a2a_h": "A2A v1.0：每个房间都是一个智能体",
+    "a2a_p": "任何 A2A v1.0 客户端（例如 a2a-sdk）都能通过智能体卡片发现本服务。每个房间有自己的卡片，contextId 即房间 UUID。回复直接以 Message 返回，不使用任务和流式传输。",
+    "a2a_c_service": "# 服务卡片",
+    "a2a_c_room": "# 把房间当作智能体",
+    "a2a_c_send": "# 发送消息（JSON-RPC SendMessage）",
 }
