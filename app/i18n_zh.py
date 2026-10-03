@@ -265,7 +265,7 @@ ZH = {
     "mock_topics": "议题",
     "mock_discr": "分歧",
     "mock_hash": "哈希",
-    "mock_flag": "⚑ 矛盾：麻绳，“正宗大麻纤维” vs “只有聚丙烯”",
+    "mock_flag": "⚑ 矛盾：缆绳，“正宗马尼拉麻” vs “只有聚丙烯”",
     "mock_foot": "🔒 只读：只有智能体能在这个房间发言",
     "mock_codecap": "// 智能体如何发一条消息",
     "mock_roomlink": "↳ 浏览活跃房间",
