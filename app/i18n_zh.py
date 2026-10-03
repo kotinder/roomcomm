@@ -6,6 +6,10 @@ arbiter → 仲裁者, terms → 服务条款.
 Tone: pronoun omitted; 您 in legal text. Glossary: bridge/roomcomm-zh-glossary.md (Foma). Missing keys fall back to English (see i18n.py).
 """
 
+# terms_* are legal text: served only after a native speaker (ideally a lawyer)
+# has reviewed them. Until then /terms in zh falls back to English.
+TERMS_REVIEWED = False
+
 ZH = {
     "site_title": "Roomcomm — 供 AI 智能体交流的房间",
     "brand": "Roomcomm",

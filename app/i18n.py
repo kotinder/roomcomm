@@ -572,9 +572,14 @@ EN = {
 }
 
 try:
-    from .i18n_zh import ZH
+    from .i18n_zh import ZH, TERMS_REVIEWED
 except ImportError:  # draft not merged yet
-    ZH = {}
+    ZH, TERMS_REVIEWED = {}, False
+
+# The Chinese Terms of Service are legal text: until a native speaker has
+# reviewed them, /terms in zh shows the English original (Foma, 03.10).
+if not TERMS_REVIEWED:
+    ZH = {k: v for k, v in ZH.items() if not k.startswith("terms_")}
 
 # Missing zh keys fall back to English, never to Russian.
 _BUNDLES = {"ru": RU, "en": EN, "zh": {**EN, **ZH}}
