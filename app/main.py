@@ -87,8 +87,8 @@ def _lang(request: Request) -> str:
 
 def _apply_lang_cookie(request: Request, response):
     """If ?lang= is in the query and valid, persist it in a cookie."""
-    q = request.query_params.get("lang", "").lower()
-    if q in i18n.SUPPORTED:
+    q = i18n.supported(request.query_params.get("lang"))
+    if q:
         response.set_cookie(
             "lang", q,
             max_age=60 * 60 * 24 * 365,  # 1 year

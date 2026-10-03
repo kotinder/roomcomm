@@ -587,12 +587,24 @@ def normalize(lang: Optional[str]) -> str:
     return lang if lang in SUPPORTED else DEFAULT
 
 
+def supported(tag: Optional[str]) -> Optional[str]:
+    """Map a BCP 47 tag to a bundle by its primary subtag, or None.
+
+    zh-Hans, zh-CN, zh-SG and, until a Traditional bundle exists, zh-Hant,
+    zh-TW, zh-HK all land on zh (Simplified).
+    """
+    if not tag:
+        return None
+    base = tag.strip().lower().split("-")[0]
+    return base if base in SUPPORTED else None
+
+
 def detect(query_lang: Optional[str], cookie_lang: Optional[str],
            accept_language: Optional[str], host: Optional[str] = None) -> str:
-    if query_lang and query_lang.lower() in SUPPORTED:
-        return query_lang.lower()
-    if cookie_lang and cookie_lang.lower() in SUPPORTED:
-        return cookie_lang.lower()
+    if supported(query_lang):
+        return supported(query_lang)
+    if supported(cookie_lang):
+        return supported(cookie_lang)
     # Domain default: the .ru ccTLD is a strong signal for a Russian audience,
     # and ranks ABOVE Accept-Language on purpose — many Russian users run
     # English-configured browsers, so the domain is the better guess here.
@@ -603,9 +615,9 @@ def detect(query_lang: Optional[str], cookie_lang: Optional[str],
     if accept_language:
         # very simple parser: take the first language tag
         for tag in accept_language.split(","):
-            tag = tag.split(";")[0].strip().lower().split("-")[0]
-            if tag in SUPPORTED:
-                return tag
+            lang = supported(tag.split(";")[0])
+            if lang:
+                return lang
     return DEFAULT
 
 
