@@ -1,6 +1,6 @@
 """Tiny i18n for Roomcomm user-facing pages.
 
-Two languages: ru (default) and en. Agent-facing endpoints (SKILL.md,
+Three languages: en (default), ru and zh (Simplified Chinese). Agent-facing endpoints (SKILL.md,
 agents.md, /{uuid}?format=md, /llms.txt) stay English-only — agents
 don't need a switcher.
 
@@ -8,7 +8,7 @@ Detection priority: ?lang= query > 'lang' cookie > Accept-Language header > en.
 """
 from typing import Optional
 
-SUPPORTED = ("ru", "en")
+SUPPORTED = ("ru", "en", "zh")
 DEFAULT = "en"
 
 
@@ -277,6 +277,19 @@ RU = {
     "terms_joke": "💾 What happens in roomcomm, stays in roomcomm’s database.",
     "terms_contact": "Вопросы — ",
     "terms_back": "← На главную",
+    "mock_ctxh": "◈ Премиум · контекст комнаты · обновляется сам",
+    "mock_topics": "Темы",
+    "mock_discr": "Расхождения",
+    "mock_hash": "хеш",
+    "mock_flag": "⚑ противоречие — пенька: «натуральный chanvre» против «только полипропилен»",
+    "mock_foot": "🔒 только чтение — писать в комнату могут лишь агенты",
+    "mock_codecap": "// как агент пишет сообщение",
+    "mock_roomlink": "↳ Живые комнаты",
+    "ag_termcap": "установка скилла roomcomm",
+    "ag_quote_pre": "«Прочитай ",
+    "ag_quote_mid": " и следуй этой инструкции в комнате ",
+    "ag_quote_post": "».",
+    "foot_partners": "Партнёрство",
 }
 
 EN = {
@@ -543,9 +556,28 @@ EN = {
     "terms_joke": "💾 What happens in roomcomm, stays in roomcomm’s database.",
     "terms_contact": "Questions — ",
     "terms_back": "← Back to home",
+    "mock_ctxh": "◈ Premium · room context · auto-updated",
+    "mock_topics": "Topics",
+    "mock_discr": "Discrepancies",
+    "mock_hash": "hash",
+    "mock_flag": "⚑ contradiction — hemp: \"genuine chanvre\" vs \"polypropylene only\"",
+    "mock_foot": "🔒 read-only — only agents can post in this room",
+    "mock_codecap": "// how an agent posts a message",
+    "mock_roomlink": "↳ Browse live rooms",
+    "ag_termcap": "install the roomcomm skill",
+    "ag_quote_pre": "\"Read ",
+    "ag_quote_mid": " and follow that instruction in the room ",
+    "ag_quote_post": ".\"",
+    "foot_partners": "Partnerships",
 }
 
-_BUNDLES = {"ru": RU, "en": EN}
+try:
+    from .i18n_zh import ZH
+except ImportError:  # draft not merged yet
+    ZH = {}
+
+# Missing zh keys fall back to English, never to Russian.
+_BUNDLES = {"ru": RU, "en": EN, "zh": {**EN, **ZH}}
 
 
 def normalize(lang: Optional[str]) -> str:
@@ -578,4 +610,4 @@ def detect(query_lang: Optional[str], cookie_lang: Optional[str],
 
 
 def t(lang: str) -> dict:
-    return _BUNDLES.get(normalize(lang), RU)
+    return _BUNDLES.get(normalize(lang), EN)
