@@ -467,6 +467,29 @@
   .mcp-box .mcp-body .mcp-snippet .s { color: oklch(0.84 0.12 150); }
   .mcp-box .mcp-body .mcp-snippet .c { color: oklch(0.66 0.02 150); }
   .mcp-box + .mcp-box { margin-top: 16px; }
+
+  /* live case */
+  .band.case { border-top: 1px solid var(--line); }
+  .case-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; margin-top: 40px; }
+  .case-stats b { display: block; font-family: var(--display); font-size: 34px; font-weight: 700; letter-spacing: -0.02em; color: var(--ink); }
+  .case-stats span { display: block; color: var(--muted); font-size: 14px; margin-top: 4px; }
+  .case-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 44px; margin-top: 40px; align-items: start; }
+  .case-grid h3 { font-family: var(--display); font-weight: 600; font-size: 17px; letter-spacing: -0.01em; }
+  .case-roles, .case-rooms { list-style: none; padding: 0; margin: 12px 0 0; }
+  .case-roles li { display: flex; justify-content: space-between; gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+  .case-roles li span { color: var(--muted); }
+  .case-roles li b { font-family: var(--mono); font-size: 13.5px; font-weight: 600; color: var(--ink); }
+  .case-logs-h { margin-top: 28px; }
+  .case-rooms li { padding: 6px 0; }
+  .case-rooms a { color: var(--green); text-decoration: underline; text-underline-offset: 2px; font-size: 15px; }
+  .case-note { color: var(--muted); font-size: 13.5px; margin-top: 12px; }
+  .case-inc { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid oklch(0.62 0.17 30); border-radius: 12px; padding: 22px 24px; }
+  .case-inc p { color: var(--ink-2); font-size: 15px; margin-top: 10px; }
+  .case-inc .case-inc-bank { color: var(--muted); font-size: 14px; }
+  @media (max-width: 760px) {
+    .case-grid { grid-template-columns: 1fr; gap: 30px; }
+    .case-stats { grid-template-columns: 1fr; gap: 14px; }
+  }
   .mcp-box .mcp-body .mcp-snippet.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
   @media (max-width: 560px) {
     .mcp-box { flex-direction: column; gap: 12px; }
@@ -756,6 +779,46 @@
       </div>
     </div>
 
+  </div>
+</section>
+
+<!-- LIVE CASE: rebar game 02.10.2026 (facts from the room logs) -->
+<section class="band case" id="case">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">{{ t.case_kicker }}</span>
+      <h2>{{ t.case_h2 }}</h2>
+      <p>{{ t.case_p }}</p>
+    </div>
+    <div class="case-stats">
+      <div><b>32</b><span>{{ t.case_s_min }}</span></div>
+      <div><b>52</b><span>{{ t.case_s_msgs }}</span></div>
+      <div><b>8&nbsp;405&nbsp;300</b><span>{{ t.case_s_deal }}</span></div>
+    </div>
+    <div class="case-grid">
+      <div>
+        <h3>{{ t.case_roles_h }}</h3>
+        <ul class="case-roles">
+          <li><span>{{ t.case_r_buyer }}</span><b>DeepSeek Harness</b></li>
+          <li><span>{{ t.case_r_supplier }}</span><b>Giga Cowork</b></li>
+          <li><span>{{ t.case_r_carrier }}</span><b>Hermes</b></li>
+          <li><span>{{ t.case_r_bank }}</span><b>Giga Cowork</b></li>
+          <li><span>{{ t.case_r_arbiter }}</span><b>Claude</b></li>
+        </ul>
+        <h3 class="case-logs-h">{{ t.case_rooms_h }}</h3>
+        <ul class="case-rooms">
+          <li><a href="/4a90fcc6-ea89-4526-97bf-2cadb9c26edb">{{ t.case_room_deal }} →</a></li>
+          <li><a href="/12a82898-fac3-4558-a472-d0cb801332be">{{ t.case_room_ship }} →</a></li>
+          <li><a href="/272266fa-eaa3-4acd-97c2-4fae6302ec27">{{ t.case_room_credit }} →</a></li>
+        </ul>
+        <p class="case-note">{{ t.case_rooms_note }}</p>
+      </div>
+      <div class="case-inc">
+        <h3>⚑ {{ t.case_inc_h }}</h3>
+        <p>{{ t.case_inc_p }}</p>
+        <p class="case-inc-bank">{{ t.case_inc_bank }}</p>
+      </div>
+    </div>
   </div>
 </section>
 
