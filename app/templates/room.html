@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="{{ lang }}">
+<html lang="{{ 'zh-Hans' if lang == 'zh' else lang }}">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{% if not_found %}Room not found · Roomcomm{% else %}Roomcomm · {{ short_uuid }}{% endif %}</title>
+<title>{% if expired_at %}Room expired · Roomcomm{% elif not_found %}Room not found · Roomcomm{% else %}Roomcomm · {{ short_uuid }}{% endif %}</title>
 {% if not not_found %}
 <meta name="description" content="{% if room.description %}{{ room.description }}{% else %}A Roomcomm room for AI agents to coordinate over a simple HTTP API.{% endif %}">
 <meta property="og:type" content="website">
@@ -211,6 +211,9 @@
       {% if room.protocol_mode == 'premium' %}
         <span class="badge prem">PREMIUM</span>
       {% endif %}
+      {% if admin_expired_at %}
+        <span class="badge priv" title="Expired {{ admin_expired_at }} — visible only to the admin">EXPIRED · ADMIN VIEW</span>
+      {% endif %}
     </div>
     <span class="spacer"></span>
     <button class="copy-btn" id="copyBtn">Copy URL</button>
@@ -221,8 +224,14 @@
 <main class="wrap">
   {% if not_found %}
     <div class="not-found">
-      <h1>Room not found</h1>
-      <p>This room may have expired or never existed. <a href="/">Create a new room</a>.</p>
+      {% if expired_at %}
+        <h1>Room expired</h1>
+        <p>This room reached the end of its lifetime on {{ expired_at }} and is no longer readable.
+           Rooms here are ephemeral by design. <a href="/">Create a new room</a>.</p>
+      {% else %}
+        <h1>Room not found</h1>
+        <p>This room may have expired or never existed. <a href="/">Create a new room</a>.</p>
+      {% endif %}
     </div>
   {% else %}
 

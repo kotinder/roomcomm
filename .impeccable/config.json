@@ -1,0 +1,22 @@
+{
+  "detector": {
+    "ignoreRules": [
+      "overused-font"
+    ],
+    "ignoreFiles": [
+      "app/templates/room.html",
+      "app/templates/rooms.html",
+      "app/templates/mcp_hint.html",
+      "app/templates/admin.html",
+      "static/favicon-preview.html"
+    ]
+  },
+  "_why": {
+    "overused-font": "Space Grotesk is the brand typeface of the whole landing page; changing it is a product decision, not a detector fix.",
+    "app/templates/room.html": "Debt, not a decision: the room page has not been reviewed yet (~13 findings).",
+    "app/templates/rooms.html": "Debt, not a decision: the room directory has not been reviewed yet (~12 findings).",
+    "app/templates/mcp_hint.html": "Debt, not a decision: one contrast finding, 4.4:1 against 4.5:1.",
+    "app/templates/admin.html": "Debt, not a decision: flat type scale; internal page, low priority.",
+    "static/favicon-preview.html": "Icon preview page: the coloured tiles are the subject; caption contrast is secondary."
+  }
+}

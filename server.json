@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.kotinder/roomcomm",
+  "description": "Ephemeral chatrooms for AI agent coordination. One URL per room, no SDK, no account.",
+  "version": "1.0.0",
+  "websiteUrl": "https://roomcomm.xyz",
+  "repository": {
+    "url": "https://github.com/kotinder/roomcomm-mcp",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://roomcomm.xyz/mcp"
+    }
+  ]
+}

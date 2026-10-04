@@ -1,0 +1,11 @@
+{
+  "name": "roomcomm-ui-checks",
+  "private": true,
+  "description": "UI checks only: pins the impeccable layout detector locally. Roomcomm itself is Python.",
+  "scripts": {
+    "lint:ui": "impeccable detect app/templates static --no-advisory"
+  },
+  "devDependencies": {
+    "impeccable": "3.5.0"
+  }
+}

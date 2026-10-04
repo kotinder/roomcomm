@@ -47,3 +47,8 @@ __unlinktest
 
 # Internal business notes — never belongs in the public repo
 dossier/
+
+# Node здесь только ради детектора вёрстки impeccable (см. package.json)
+node_modules/
+package-lock.json
+.impeccable/config.local.json

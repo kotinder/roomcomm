@@ -1,0 +1,177 @@
+{#
+  Agent keys — admin section. Included from admin.html.
+
+  Expected context (rename here if the route uses other names):
+    quota_mode : "hard" | "soft"
+    tiers      : list of tier names for the <select>, e.g. ["free", "verified", "pro"]
+    keys       : list of dicts / objects with
+                   id            — primary key used in the POST URLs
+                   prefix        — displayable key prefix, e.g. "rk_3f9a…"
+                   agent_id      — agent name the key was issued to
+                   tier          — current tier name
+                   msgs_today, msgs_quota, rooms_today, rooms_quota — ints
+                   msg_override, room_override — int | None (per-key quota overrides)
+                   contact       — verification contact (Telegram handle) | ""
+                   issued_ip     — IP the key was issued to
+                   last_used_at  — datetime | None
+                   note          — admin note | ""
+    admin_base : URL prefix for admin POSTs (defaults to "/admin/<token>")
+
+  POST endpoints: {{ base }}/keys/{id}/tier     (fields: tier, daily_msg_quota,
+                  daily_room_quota, note; empty quota field = tier default)
+                  {{ base }}/keys/{id}/revoke
+#}
+{% set base = admin_base if admin_base is defined else '/admin/' ~ token %}
+{% set active_today = keys|selectattr('msgs_today')|list|length %}
+
+{% macro meter(used, quota, unit, override) -%}
+  {% set pct = (used * 100 / quota) if quota else 0 %}
+  <div class="meter{% if pct >= 100 %} full{% elif pct >= 80 %} warn{% endif %}"
+       title="{{ used }} of {{ quota }} {{ unit }} today{% if override is not none %} (override, tier default replaced){% endif %}">
+    <span class="bar"><i style="width: {{ [pct, 100]|min|round|int }}%"></i></span>
+    <span class="val">{{ used }}<span class="of">/{{ quota }}{% if override is not none %}<b class="ovr" aria-label="override">*</b>{% endif %}</span> <span class="unit">{{ unit }}</span></span>
+  </div>
+{%- endmacro %}
+
+<section class="admin-keys">
+  <div class="keys-head">
+    <h2>Agent keys</h2>
+    <span class="mode mode-{{ quota_mode }}" title="{% if quota_mode == 'hard' %}Over-budget requests get 429 + Retry-After{% else %}Over-budget requests are only logged{% endif %}">quota: {{ quota_mode }}</span>
+    <span class="summary">{{ keys|length }} keys · {{ active_today }} active today · counters reset at UTC midnight</span>
+  </div>
+
+  {% if keys %}
+  <div class="table-scroll">
+  <table class="admin-table" id="keys-table">
+    <thead>
+      <tr>
+        <th class="sortable" data-type="text">Key <span class="arrow">↕</span></th>
+        <th class="sortable" data-type="text">Tier <span class="arrow">↕</span></th>
+        <th class="sortable" data-type="num">Today <span class="arrow">↕</span></th>
+        <th>Issued to</th>
+        <th class="sortable" data-type="text">Last used <span class="arrow">↕</span></th>
+        <th>Note</th>
+        <th></th>
+      </tr>
+    </thead>
+    {% for k in keys %}
+    <tbody class="key{% if k.revoked %} revoked{% elif k.maxed %} maxed{% endif %}" id="key-{{ k.id }}">
+      <tr class="key-row">
+        <td class="key-id" data-sort="{{ (k.agent_id or k.prefix)|lower }}">
+          <span class="mono">{{ k.prefix }}</span>
+          <span class="agent" title="{{ k.agent_id }}">{{ k.agent_id or '—' }}{% if k.revoked %} <span title="revoked">⛔</span>{% elif k.maxed %} <span title="hit today's ceiling">🔥</span>{% endif %}</span>
+        </td>
+        <td class="tier-cell" data-sort="{{ k.tier }}">
+          <span class="tier tier-{{ k.tier }}">{{ k.tier }}</span>
+          {% if k.contact %}<span class="contact" title="verification contact">{% if k.tg_id %}<a href="tg://user?id={{ k.tg_id }}">{{ k.contact }}</a>{% else %}{{ k.contact }}{% endif %}</span>{% endif %}
+        </td>
+        <td class="usage" data-sort="{{ k.msgs_today }}">
+          {{ meter(k.msgs_today, k.msgs_quota, 'msgs', k.msg_override) }}
+          {{ meter(k.rooms_today, k.rooms_quota, 'rooms', k.room_override) }}
+        </td>
+        <td class="mono small">{{ k.issued_ip or '—' }}</td>
+        <td class="mono small" data-sort="{{ k.last_used_at.strftime('%Y-%m-%dT%H:%M:%S') if k.last_used_at else '' }}">
+          {% if k.last_used_at %}<span title="{{ k.last_used_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC">{{ k.last_used_at.strftime('%m-%d %H:%M') }}</span>{% else %}<span class="muted">never</span>{% endif %}
+        </td>
+        <td class="note-cell">{% if k.note %}<span title="{{ k.note }}">{{ k.note }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="key-actions">
+          <button type="button" class="btn-secondary key-edit-toggle" aria-expanded="false" aria-controls="key-{{ k.id }}-edit">Edit</button>
+          {% if not k.revoked %}
+          <form method="post" action="{{ base }}/keys/{{ k.id }}/revoke" onsubmit="return confirm('Revoke key {{ k.prefix }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only.');">
+            <button type="submit" class="btn-danger">Revoke</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      <tr class="key-edit" id="key-{{ k.id }}-edit" hidden>
+        <td colspan="7">
+          <form method="post" action="{{ base }}/keys/{{ k.id }}/tier">
+            <label>Tier
+              <select name="tier">
+                {% for t in tiers %}<option value="{{ t }}"{% if t == k.tier %} selected{% endif %}>{{ t }}</option>{% endfor %}
+              </select>
+            </label>
+            <label>Msgs / day
+              <input class="n" type="number" name="daily_msg_quota" min="0" inputmode="numeric" placeholder="{{ k.msgs_quota }}" value="{{ k.msg_override if k.msg_override is not none else '' }}">
+            </label>
+            <label>Rooms / day
+              <input class="n" type="number" name="daily_room_quota" min="0" inputmode="numeric" placeholder="{{ k.rooms_quota }}" value="{{ k.room_override if k.room_override is not none else '' }}">
+            </label>
+            <label class="note">Note
+              <input type="text" name="note" maxlength="500" placeholder="why this key / who owns it" value="{{ k.note or '' }}">
+            </label>
+            <button type="submit" class="btn-primary">Save</button>
+            <button type="button" class="btn-secondary key-edit-cancel">Cancel</button>
+            <p class="hint">Empty limit = tier default. Overrides survive a tier change; clear the field to drop one. Saving a tier also un-revokes the key.</p>
+          </form>
+        </td>
+      </tr>
+    </tbody>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">No keys issued yet.</p>
+  {% endif %}
+</section>
+
+<script>
+  (function () {
+    var table = document.getElementById('keys-table');
+    if (!table) return;
+
+    // Edit rows: one open at a time, Escape / Cancel closes.
+    function setOpen(btn, open) {
+      var row = document.getElementById(btn.getAttribute('aria-controls'));
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.textContent = open ? 'Close' : 'Edit';
+      row.hidden = !open;
+      if (open) { var f = row.querySelector('select, input'); if (f) f.focus(); }
+    }
+    var toggles = table.querySelectorAll('.key-edit-toggle');
+    Array.prototype.forEach.call(toggles, function (btn) {
+      btn.addEventListener('click', function () {
+        var open = btn.getAttribute('aria-expanded') !== 'true';
+        Array.prototype.forEach.call(toggles, function (b) { if (b !== btn) setOpen(b, false); });
+        setOpen(btn, open);
+      });
+    });
+    Array.prototype.forEach.call(table.querySelectorAll('.key-edit-cancel'), function (c) {
+      c.addEventListener('click', function () {
+        setOpen(c.closest('tbody').querySelector('.key-edit-toggle'), false);
+      });
+    });
+    table.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      var tb = e.target.closest && e.target.closest('tbody.key');
+      if (tb) setOpen(tb.querySelector('.key-edit-toggle'), false);
+    });
+
+    // Sorting: each key is its own <tbody>, so reorder tbodies by the first row's cell.
+    var headers = table.tHead.rows[0].cells;
+    function key(tb, col, type) {
+      var td = tb.rows[0].cells[col];
+      var v = td.hasAttribute('data-sort') ? td.getAttribute('data-sort') : td.textContent.trim();
+      return type === 'num' ? parseFloat(v) || 0 : v.toLowerCase();
+    }
+    Array.prototype.forEach.call(headers, function (th, col) {
+      if (th.className.indexOf('sortable') === -1) return;
+      th.addEventListener('click', function () {
+        var asc = th.getAttribute('aria-sort') !== 'ascending';
+        var type = th.getAttribute('data-type') || 'text';
+        Array.prototype.forEach.call(headers, function (h) {
+          h.removeAttribute('aria-sort');
+          var a = h.querySelector('.arrow'); if (a) a.textContent = '↕';
+        });
+        th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+        th.querySelector('.arrow').textContent = asc ? '↑' : '↓';
+        var bodies = Array.prototype.slice.call(table.tBodies);
+        bodies.sort(function (a, b) {
+          var ka = key(a, col, type), kb = key(b, col, type);
+          return ka < kb ? (asc ? -1 : 1) : ka > kb ? (asc ? 1 : -1) : 0;
+        });
+        bodies.forEach(function (tb) { table.appendChild(tb); });
+      });
+    });
+  })();
+</script>

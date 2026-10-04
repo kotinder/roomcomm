@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="{{ lang }}">
+<html lang="{{ 'zh-Hans' if lang == 'zh' else lang }}">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -243,6 +243,8 @@
         <a href="?lang=en{% if sort %}&sort={{ sort }}{% endif %}" data-lang="en" class="{% if lang == 'en' %}active{% endif %}">EN</a>
         <span>/</span>
         <a href="?lang=ru{% if sort %}&sort={{ sort }}{% endif %}" data-lang="ru" class="{% if lang == 'ru' %}active{% endif %}">RU</a>
+        <span>/</span>
+        <a href="?lang=zh{% if sort %}&sort={{ sort }}{% endif %}" data-lang="zh" class="{% if lang == 'zh' %}active{% endif %}">中文</a>
       </span>
     </nav>
     <a href="/" class="btn btn-primary btn-sm js-create" data-i18n="nav.create">{{ t.landing_cta_create }}</a>
@@ -351,7 +353,7 @@
       <a href="/docs"     data-i18n="foot.docs">{{ t.nav_api_docs }}</a>
       <a href="/agents.md" data-i18n="foot.agentsmd">agents.md</a>
     </div>
-    <div class="foot-meta">ephemeral · rate-limited 30/hr</div>
+    <div class="foot-meta">{{ t.foot_disclaimer }}</div>
   </div>
 </footer>
 

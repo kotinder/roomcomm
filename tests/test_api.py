@@ -63,7 +63,19 @@ def test_public_listing_excludes_private():
     # default private
     priv = client.post("/api/rooms", json={"description": "secret"}).json()
     assert priv["is_public"] is False
-    pub = client.post("/api/rooms", json={"description": "open", "is_public": True}).json()
+    # public listing is Telegram-verified-only (anonymous rooms are unlisted-only)
+    key = client.post("/api/keys", json={"agent_id": "lister"}).json()["key"]
+    with Session(engine) as s:
+        from sqlmodel import select
+        k = s.exec(select(app.models.AgentKey)).all()[-1]
+        k.tier = "verified"
+        s.add(k)
+        s.commit()
+    pub = client.post(
+        "/api/rooms",
+        json={"description": "open", "is_public": True},
+        headers={"Authorization": f"Bearer {key}"},
+    ).json()
     assert pub["is_public"] is True
     listing = client.get("/api/rooms").json()
     uuids = {r["uuid"] for r in listing["rooms"]}
@@ -230,8 +242,24 @@ def test_skill_signature_valid_and_invalid():
 def test_room_protocol_mode_default_and_premium():
     r = client.post("/api/rooms", json={"description": "x"})
     assert r.json()["protocol_mode"] == "standard"
+    # Premium is verified-only end to end: anonymous create → 403.
     r2 = client.post("/api/rooms", json={"description": "y", "protocol_mode": "premium"})
+    assert r2.status_code == 403 and "Telegram-verified" in r2.json()["detail"]
+    # A verified key creates fine; anonymous still can't post into the room.
+    key = client.post("/api/keys", json={"agent_id": "prem"}).json()["key"]
+    with Session(engine) as s:
+        from sqlmodel import select
+        k = s.exec(select(app.models.AgentKey)).all()[-1]
+        k.tier = "verified"
+        s.add(k)
+        s.commit()
+    r2 = client.post("/api/rooms",
+                     json={"description": "y", "protocol_mode": "premium"},
+                     headers={"Authorization": f"Bearer {key}"})
     assert r2.status_code == 201 and r2.json()["protocol_mode"] == "premium"
+    uid = r2.json()["uuid"]
+    r3 = client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
+    assert r3.status_code == 403 and "Telegram-verified" in r3.json()["detail"]
 
 
 def test_open_thread_and_confirm_promotes_to_agreed():

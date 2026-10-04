@@ -18,17 +18,24 @@
     #rooms-table th.sortable:hover { text-decoration: underline; }
     #rooms-table th.sortable .arrow { opacity: .4; font-size: .85em; }
     #rooms-table th.sortable[aria-sort] .arrow { opacity: 1; }
+    .room-tabs { display: flex; gap: .4rem; margin-bottom: .6rem; flex-wrap: wrap; }
+    .room-tab { font: inherit; font-size: .9rem; margin: 0; padding: .3rem .8rem; cursor: pointer;
+                border: 1px solid var(--border, #ccc); border-radius: 999px;
+                background: transparent; color: inherit; }
+    .room-tab[aria-pressed="true"] { border-color: currentColor; font-weight: 600; }
+    .room-tab .muted { margin-left: .35rem; }
   </style>
 </head>
 <body>
   <main class="container admin">
     <header>
       <h1>Roomcomm <span class="muted">· admin</span></h1>
-      <p class="muted">Total rooms: {{ total }}. Sorted by last activity.</p>
+      <p class="muted">Total rooms: {{ total }} ({{ room_count }} rooms, {{ arena_count }} arena tables). Sorted by last activity.</p>
     </header>
 
     <section class="admin-stats">
       <h2>Usage · last {{ stats.days|length }} days <span class="muted small">(UTC, meaningful events only — scanner noise excluded)</span></h2>
+      <div class="table-scroll">
       <table class="admin-table">
         <thead>
           <tr>
@@ -49,6 +56,7 @@
           {% endfor %}
         </tbody>
       </table>
+      </div>
 
       <div class="stats-tops">
         <div>
@@ -78,7 +86,30 @@
       </div>
     </section>
 
+    {% if revoke_notice %}<p class="small" style="background:rgba(255,120,0,.12);padding:.4rem .6rem;border-radius:6px">{{ revoke_notice }}</p>{% endif %}
+    {% include "_admin_keys.html" %}
+
+    <section class="admin-subjects">
+      {% if top_subjects %}
+      <h3 style="margin-top:1rem">Top subjects today <span class="muted small">(keys and anonymous IPs, by volume; empty/404 = idle polls — the freeloader fingerprint)</span></h3>
+      <table class="admin-table">
+        <thead><tr><th>subject</th><th class="num">msgs</th><th class="num">rooms</th><th class="num">empty</th><th class="num">404</th><th class="num">list</th></tr></thead>
+        <tbody>
+          {% for s in top_subjects %}
+          <tr><td class="mono small">{{ s.subject }}</td><td class="num">{{ s.msg }}</td><td class="num">{{ s.room }}</td><td class="num">{{ s.read_empty }}</td><td class="num">{{ s.read_404 }}</td><td class="num">{{ s.read_list }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </section>
+
     {% if items %}
+    <div class="room-tabs" id="room-tabs" role="tablist">
+      <button type="button" class="room-tab" data-kind="room" aria-pressed="true">Rooms <span class="muted">{{ room_count }}</span></button>
+      <button type="button" class="room-tab" data-kind="arena" aria-pressed="false">Arena <span class="muted">{{ arena_count }}</span></button>
+      <button type="button" class="room-tab" data-kind="all" aria-pressed="false">All <span class="muted">{{ total }}</span></button>
+    </div>
+    <div class="table-scroll">
     <table class="admin-table" id="rooms-table">
       <thead>
         <tr>
@@ -87,21 +118,31 @@
           <th class="sortable" data-type="text">Description <span class="arrow">↕</span></th>
           <th class="sortable" data-type="text">Created <span class="arrow">↕</span></th>
           <th class="sortable" data-type="text">Last activity <span class="arrow">↕</span></th>
+          <th class="sortable" data-type="text">Expires <span class="arrow">↕</span></th>
           <th class="sortable num" data-type="num">Msgs <span class="arrow">↕</span></th>
           <th></th>
         </tr>
       </thead>
       <tbody>
         {% for r in items %}
-        <tr>
+        <tr data-kind="{{ r.kind }}">
           <td class="mono" data-sort="{{ r.short_uuid }}"><a href="/{{ r.uuid }}" target="_blank">{{ r.short_uuid }}</a></td>
           <td data-sort="{{ 'public' if r.is_public else 'private' }}">{% if r.is_public %}<span class="badge badge-public" title="public">🌐</span>{% else %}<span class="badge badge-private" title="private">🔒</span>{% endif %}</td>
-          <td data-sort="{{ (r.description or '')|lower }}">{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
+          <td data-sort="{{ (r.description or '')|lower }}">{% if r.arena_code %}<a href="{{ r.arena_url }}" target="_blank" rel="noopener" class="mono">{{ r.arena_code }}</a> {% endif %}{{ (r.description[:60] + '…') if r.description|length > 60 else r.description or '—' }}</td>
           <td class="mono small" data-sort="{{ r.created_at.strftime('%Y-%m-%dT%H:%M:%S') }}">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
           <td class="mono small" data-sort="{{ r.last_at.strftime('%Y-%m-%dT%H:%M:%S') if r.last_at else '' }}">{% if r.last_at %}{{ r.last_at.strftime('%Y-%m-%d %H:%M') }}{% else %}—{% endif %}</td>
+          <td class="mono small" data-sort="{{ r.expires_at.strftime('%Y-%m-%dT%H:%M:%S') if r.expires_at else '9999' }}">
+            {% if r.expires_at is none %}<span class="badge" title="pinned open — never expires">📌 never</span>
+            {% elif r.expired %}<span class="badge badge-private" title="expired at {{ r.expires_at.strftime('%Y-%m-%d %H:%M') }} UTC">⌛ expired</span>
+            {% else %}{{ r.expires_at.strftime('%Y-%m-%d %H:%M') }} <span class="muted">({{ r.expires_in_hours }}h)</span>{% endif %}
+          </td>
           <td class="num" data-sort="{{ r.msg_count }}">{{ r.msg_count }}</td>
           <td>
-            <form method="post" action="/admin/{{ token }}/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
+            <form method="post" action="/admin/rooms/{{ r.uuid }}/ttl" class="ttl-form">
+              <input type="text" name="ttl_hours" value="72" size="4" title="hours from now, or 'never' to pin, or 'now' to expire">
+              <button type="submit" class="small">Set TTL</button>
+            </form>
+            <form method="post" action="/admin/rooms/{{ r.uuid }}/delete" onsubmit="return confirm('Delete room {{ r.short_uuid }}? All {{ r.msg_count }} messages will be deleted permanently.');">
               <button type="submit" class="btn-danger">Delete</button>
             </form>
           </td>
@@ -109,12 +150,14 @@
         {% endfor %}
       </tbody>
     </table>
+    </div>
     {% else %}
     <p class="muted">No rooms yet.</p>
     {% endif %}
 
     <footer>
       <p class="muted"><a href="/">← back to home</a></p>
+      <form method="post" action="/admin/logout"><button type="submit" class="small">Log out</button></form>
     </footer>
   </main>
   <script>
@@ -156,6 +199,32 @@
           sortBy(col, th.getAttribute('data-type') || 'text', asc);
         });
       });
+
+      // Arena table-talk rooms are one per match played, so they outnumber
+      // everything else and none of them is a room anyone administers. Default
+      // view hides them; the tab is there when a game needs looking at.
+      var tabs = document.getElementById('room-tabs');
+      if (!tabs) return;
+      var buttons = tabs.querySelectorAll('.room-tab');
+
+      function show(kind) {
+        Array.prototype.forEach.call(tbody.rows, function (row) {
+          var mine = kind === 'all' || row.getAttribute('data-kind') === kind;
+          row.style.display = mine ? '' : 'none';
+        });
+        Array.prototype.forEach.call(buttons, function (b) {
+          b.setAttribute('aria-pressed', b.getAttribute('data-kind') === kind ? 'true' : 'false');
+        });
+        try { localStorage.setItem('admin.roomTab', kind); } catch (e) {}
+      }
+
+      Array.prototype.forEach.call(buttons, function (b) {
+        b.addEventListener('click', function () { show(b.getAttribute('data-kind')); });
+      });
+
+      var saved = null;
+      try { saved = localStorage.getItem('admin.roomTab'); } catch (e) {}
+      show(saved === 'arena' || saved === 'all' ? saved : 'room');
     })();
   </script>
 </body>

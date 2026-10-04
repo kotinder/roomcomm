@@ -11,25 +11,34 @@ import time
 import uuid as uuid_lib
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, delete, select, func
 
 ADMIN_TOKEN = os.environ.get("ROOMCOMM_ADMIN_TOKEN", "")
 
-# In-memory rate limit for POST /api/rooms: max 10 creations per hour per IP.
+# Shared secret Telegram echoes back in X-Telegram-Bot-Api-Secret-Token on
+# every webhook call (set via setWebhook, see scripts/tg_set_webhook.py).
+# Empty = webhook feature off, bot stays outbound-only.
+TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "")
+
+# In-memory rate limit for POST /api/rooms: max 30 creations per hour per IP.
 # Resets on container restart — that's acceptable for MVP, the goal is to stop
 # obviously broken/abusive auto-spawners, not high-determination attackers.
-ROOM_CREATE_LIMIT = 10
+# Raised 10→30 ahead of Show HN (2026-07): a shared office/NAT IP at 10/hr
+# would lock out an entire HN wave.
+ROOM_CREATE_LIMIT = 30
 ROOM_CREATE_WINDOW = 3600  # seconds
 _create_buckets: dict[str, deque] = defaultdict(deque)
 _create_lock = Lock()
@@ -40,6 +49,29 @@ SKILL_UPLOAD_WINDOW = 3600
 SKILL_MAX_BYTES = 512 * 1024
 _skill_buckets: dict[str, deque] = defaultdict(deque)
 _skill_lock = Lock()
+
+# Room-file (MD exchange) upload limits — same bucket shape as skills. The
+# real gate is the verified tier; this only stops a runaway verified client.
+FILE_UPLOAD_LIMIT = 20
+FILE_UPLOAD_WINDOW = 3600
+_file_buckets: dict[str, deque] = defaultdict(deque)
+_file_lock = Lock()
+
+# Message posting burst limit for transports nginx does not shape per path.
+# REST POST /messages is held by nginx (zone msg_send: 10/min, burst 5); A2A
+# posts arrive through the generic /a2a zone (60/min), so the same budget is
+# enforced here for them — review 02.10.2026, transports must not drift apart.
+MSG_POST_LIMIT = 10  # nginx lets 6 through at once, then 10/min; this is 10, then 10/min
+MSG_POST_WINDOW = 60
+_msg_buckets: dict[str, deque] = defaultdict(deque)
+_msg_lock = Lock()
+
+# Key issuance burst limit — anti key-farming (keys are free and instant,
+# so this plus the modest per-key quota is what makes farming unprofitable).
+KEY_CREATE_LIMIT = 3
+KEY_CREATE_WINDOW = 3600
+_key_buckets: dict[str, deque] = defaultdict(deque)
+_key_lock = Lock()
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _HEX128_RE = re.compile(r"^[0-9a-fA-F]{128}$")
 
@@ -49,13 +81,14 @@ def _lang(request: Request) -> str:
         request.query_params.get("lang"),
         request.cookies.get("lang"),
         request.headers.get("accept-language"),
+        request.headers.get("host") or request.url.hostname,
     )
 
 
 def _apply_lang_cookie(request: Request, response):
     """If ?lang= is in the query and valid, persist it in a cookie."""
-    q = request.query_params.get("lang", "").lower()
-    if q in i18n.SUPPORTED:
+    q = i18n.supported(request.query_params.get("lang"))
+    if q:
         response.set_cookie(
             "lang", q,
             max_age=60 * 60 * 24 * 365,  # 1 year
@@ -76,42 +109,49 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _check_create_rate(request: Request) -> None:
-    """Raise 429 if the IP has created too many rooms in the last hour."""
+def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
+                       limit: int, window: int, what: str) -> None:
+    """Raise 429 if the IP exceeded `limit` events in the sliding `window`."""
     ip = _client_ip(request)
     now = time.monotonic()
-    with _create_lock:
-        bucket = _create_buckets[ip]
-        cutoff = now - ROOM_CREATE_WINDOW
+    with lock:
+        bucket = buckets[ip]
+        cutoff = now - window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
-        if len(bucket) >= ROOM_CREATE_LIMIT:
-            retry_after = int(ROOM_CREATE_WINDOW - (now - bucket[0])) + 1
+        if len(bucket) >= limit:
+            retry_after = int(window - (now - bucket[0])) + 1
             raise HTTPException(
                 status_code=429,
-                detail=f"Too many rooms created from this IP. Try again in {retry_after}s.",
+                detail=f"Too many {what} from this IP. Try again in {retry_after}s.",
                 headers={"Retry-After": str(retry_after)},
             )
         bucket.append(now)
+
+
+def _check_create_rate(request: Request) -> None:
+    _check_bucket_rate(request, _create_buckets, _create_lock,
+                       ROOM_CREATE_LIMIT, ROOM_CREATE_WINDOW, "rooms created")
 
 
 def _check_skill_rate(request: Request) -> None:
-    """Raise 429 if the IP has uploaded too many skills in the last hour."""
-    ip = _client_ip(request)
-    now = time.monotonic()
-    with _skill_lock:
-        bucket = _skill_buckets[ip]
-        cutoff = now - SKILL_UPLOAD_WINDOW
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= SKILL_UPLOAD_LIMIT:
-            retry_after = int(SKILL_UPLOAD_WINDOW - (now - bucket[0])) + 1
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too many skill uploads from this IP. Try again in {retry_after}s.",
-                headers={"Retry-After": str(retry_after)},
-            )
-        bucket.append(now)
+    _check_bucket_rate(request, _skill_buckets, _skill_lock,
+                       SKILL_UPLOAD_LIMIT, SKILL_UPLOAD_WINDOW, "skill uploads")
+
+
+def _check_file_rate(request: Request) -> None:
+    _check_bucket_rate(request, _file_buckets, _file_lock,
+                       FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads")
+
+
+def _check_msg_rate(request: Request) -> None:
+    _check_bucket_rate(request, _msg_buckets, _msg_lock,
+                       MSG_POST_LIMIT, MSG_POST_WINDOW, "messages posted")
+
+
+def _check_key_rate(request: Request) -> None:
+    _check_bucket_rate(request, _key_buckets, _key_lock,
+                       KEY_CREATE_LIMIT, KEY_CREATE_WINDOW, "keys issued")
 
 
 def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
@@ -125,23 +165,39 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import i18n, llm, notify, pcis
+from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota,
+               tg_bot, ttl)
 from .database import SKILLS_DIR, engine, get_session, init_db
-from .models import Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message, Room, Skill, utcnow
+from .models import (
+    AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
+    Room, RoomSeen, Skill, UsageCounter, utcnow,
+)
 from .schemas import (
     ClaimIn,
     ContextOut,
     DiscrepancyOut,
     HandshakeIn,
     HandshakeOut,
+    InboxMentionOut,
+    InboxOut,
+    InboxRoomOut,
+    KeyCreate,
+    AwaitingOut,
+    KeyMeOut,
+    KeyOut,
+    KeyQuota,
     MessageIn,
     MessageOut,
     MessagesPage,
+    PostedMessageOut,
     RefreshOut,
     RevisionIn,
     RevisionOut,
     RoomCreate,
     RoomCreateOut,
+    RoomFileListOut,
+    RoomFileOut,
+    RoomFileUploadOut,
     RoomInfoOut,
     RoomListItem,
     RoomListPage,
@@ -180,7 +236,8 @@ app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", life
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://roomcomm.xyz", "https://www.roomcomm.xyz"],
+    allow_origins=["https://roomcomm.xyz", "https://www.roomcomm.xyz",
+                   "https://roomcomm.ru", "https://www.roomcomm.ru"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -199,6 +256,8 @@ _UUID_PAGE_RE = re.compile(
     r"^/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 _MSG_POST_RE = re.compile(r"^/api/rooms/[^/]+/messages$")
+_FILE_POST_RE = re.compile(r"^/api/rooms/[^/]+/files$")
+_FILE_GET_RE = re.compile(r"^/api/rooms/[^/]+/files/")
 
 
 def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
@@ -214,6 +273,8 @@ def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
             return "message"
         if path == "/api/skills":
             return "skill_upload"
+        if _FILE_POST_RE.match(path):
+            return "file_upload"
     elif method == "GET":
         if path in ("/", "/rooms"):
             return "landing"
@@ -221,6 +282,8 @@ def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
             return "room_view"
         if path.startswith("/api/skills/"):
             return "skill_download"
+        if _FILE_GET_RE.match(path):
+            return "file_download"
     return None
 
 
@@ -320,6 +383,32 @@ class _McpBrowserHintMiddleware:
 app.add_middleware(_McpBrowserHintMiddleware)
 
 
+# True while serving a request that carries the admin token (Bearer or
+# cookie). Read by _room_expired so expired rooms stay open to the admin on
+# every endpoint without threading `request` through each handler. Raw ASGI
+# (not BaseHTTPMiddleware) so the value reliably reaches sync handlers,
+# which Starlette runs in a threadpool with a copy of this context.
+_ADMIN_CALLER: ContextVar[bool] = ContextVar("roomcomm_admin_caller", default=False)
+
+
+class _AdminCallerMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        token = _ADMIN_CALLER.set(_request_is_admin(Request(scope)))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _ADMIN_CALLER.reset(token)
+
+
+app.add_middleware(_AdminCallerMiddleware)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_handler(request: Request, exc: Exception):
     """Catch-all for unhandled exceptions: log, notify Telegram, return 500.
@@ -327,6 +416,16 @@ async def _unhandled_handler(request: Request, exc: Exception):
     HTTPException and RequestValidationError have dedicated handlers
     registered separately, so this only fires for truly unexpected errors.
     """
+    if (
+        request.url.path.startswith("/mcp")
+        and isinstance(exc, RuntimeError)
+        and "after response already completed" in str(exc)
+    ):
+        # mcp SDK: a notification for an already-terminated session gets its
+        # 202, then writer.send raises ClosedResourceError and the SDK tries to
+        # send a 500 on the finished response. The client is unaffected.
+        log.warning("mcp late write to closed session at %s: %r", request.url.path, exc)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
     log.exception("unhandled error at %s: %r", request.url.path, exc)
     try:
         await notify.send(notify.format_error(
@@ -359,14 +458,263 @@ def _validate_uuid(value: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid UUID")
 
 
+def _resolve_expiry(payload: RoomCreate) -> datetime:
+    """Expiry for a room being created — the policy lives in app/ttl.py."""
+    try:
+        return ttl.resolve(ttl_hours=payload.ttl_hours, expires_at=payload.expires_at)
+    except ttl.TTLRangeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# Thin aliases. The TTL policy lives in app/ttl.py, shared with the MCP
+# transport so the two cannot drift on when a room stops answering.
+def _room_expired(room: Room, now: Optional[datetime] = None) -> bool:
+    """Expired *for this caller*. The admin (Bearer or session cookie, flagged
+    per request by _AdminCallerMiddleware) never hits the TTL wall — expired
+    rooms stay readable and writable for them everywhere, not only in /admin."""
+    return ttl.is_expired(room, now) and not _ADMIN_CALLER.get()
+
+
+
+_expires_in_seconds = ttl.seconds_left
+_expired_detail = ttl.expired_message
+
+
 def _get_room_or_404(session: Session, room_uuid: str) -> Room:
+    """Room lookup for every agent-facing endpoint.
+
+    Missing → 404. Past its TTL → 410 Gone, with a `room_expired:` prefix in
+    `detail` (same convention as `quota_exceeded:` / `room_full:`). 410 rather
+    than 404 so an agent can tell "this room ran out" from "wrong UUID", and
+    because both are terminal: neither is worth retrying.
+
+    The admin panel deliberately does NOT go through here — an expired room
+    stays fully readable and revivable from /admin.
+    """
     room = session.get(Room, room_uuid)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
+    if _room_expired(room):
+        raise HTTPException(status_code=410, detail=_expired_detail(room))
     return room
 
 
+# ---------- Auth MVP: subject resolution + quota (REST side) ----------
+# The actual accounting lives in quota.py (shared with the MCP transport);
+# these wrappers translate its transport-neutral exceptions to HTTP.
+
+def _resolve_subject(request: Request, session: Session) -> tuple[str, Optional[AgentKey]]:
+    """(subject, key) for this request: 'key:<id>' with valid Bearer, else 'ip:<addr>'."""
+    if _bearer_is_admin(request.headers.get("authorization")) and _request_is_admin(request):
+        return quota.ADMIN_SUBJECT, None
+    try:
+        key = quota.resolve_key(session, request.headers.get("authorization"))
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return quota.subject_of(key, _client_ip(request)), key
+
+
+def _awaiting_out(session: Session, request: Request, exclude_room: Optional[str] = None,
+                  key: Optional[AgentKey] = None) -> Optional[AwaitingOut]:
+    """"You are awaited elsewhere" for a keyed caller (app/inbox.py, awaiting())
+    — it rides on the calls an agent makes anyway.
+    Best effort: a bad key or a failure means no field, never a failed call."""
+    if key is None:
+        try:
+            key = quota.resolve_key(session, request.headers.get("authorization"))
+        except quota.AuthError:
+            return None
+        if key is None:
+            return None
+    try:
+        aw = inbox.awaiting(session, key, exclude_room)
+    except Exception:
+        log.exception("awaiting digest failed")
+        session.rollback()
+        return None
+    if not aw["rooms"] and not aw["mentions"]:
+        return None
+    return AwaitingOut(rooms=aw["rooms"], mentions=aw["mentions"])
+
+
+def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
+    try:
+        quota.check_and_count(session, subject, kind, key)
+    except quota.QuotaExceeded as e:
+        raise HTTPException(
+            status_code=429, detail=e.detail,
+            headers={"Retry-After": str(e.retry_after)},
+        )
+
+
+def _poll_subject(session: Session, request: Request) -> str:
+    """Subject for read-path metering: key if a valid Bearer is present, else
+    IP. A bad key degrades to the IP subject — metering must never fail a read."""
+    try:
+        key = quota.resolve_key(session, request.headers.get("authorization"))
+    except quota.AuthError:
+        key = None
+    return quota.subject_of(key, _client_ip(request))
+
+
+def _meter_idle_poll(session: Session, request: Request,
+                     kind: str) -> Optional[tuple[str, int]]:
+    """Record one idle poll (kind 'read_empty' or 'read_404') for this
+    request's subject. Best-effort: any metering error is swallowed and never
+    breaks a read. GET handlers don't otherwise commit, so this commits its
+    own counter.
+
+    Returns (subject, retry_after) once the subject is past today's idle-poll
+    allowance (quota.READ_EMPTY_LIMIT, 0 = throttle off) so the caller can turn
+    it into a 429. Metering FAILURES still never throttle."""
+    try:
+        subject = _poll_subject(session, request)
+        retry_after = quota.meter_idle_poll(session, subject, kind)
+        session.commit()
+        return (subject, retry_after) if retry_after is not None else None
+    except Exception:  # metering is best-effort; never break a read over it
+        log.debug("idle-poll metering failed", exc_info=True)
+        session.rollback()
+        return None
+
+
+def _meter_listing_read(session: Session, request: Request) -> None:
+    """Count one public-listing read (kind 'read_list'). Pure visibility —
+    the listing always returns data, so it is never throttled and this never
+    fails the request."""
+    try:
+        quota.count_only(session, _poll_subject(session, request), "read_list")
+        session.commit()
+    except Exception:
+        log.debug("listing-read metering failed", exc_info=True)
+        session.rollback()
+
+
+def _missing_room_response(session: Session, request: Request) -> HTTPException:
+    """Meter a poll of a nonexistent room (kind 'read_404' — polling deleted
+    rooms 24/7 is the freeloader's current signature) and return the exception
+    to raise: 429 past the idle-poll allowance, else the plain 404."""
+    throttled = _meter_idle_poll(session, request, "read_404")
+    if throttled is not None:
+        subject, retry_after = throttled
+        return HTTPException(
+            status_code=429,
+            detail=quota.empty_poll_throttled_reason(subject, retry_after),
+            headers={"Retry-After": str(retry_after)},
+        )
+    return HTTPException(status_code=404, detail="Room not found")
+
+
+def _used_today(session: Session, subject: str) -> KeyQuota:
+    day = utcnow().strftime("%Y-%m-%d")
+    used = {"msg": 0, "room": 0}
+    for row in session.exec(
+        select(UsageCounter).where(UsageCounter.subject == subject, UsageCounter.day == day)
+    ).all():
+        if row.kind in used:
+            used[row.kind] = row.count
+    return KeyQuota(**used)
+
+
+def _key_quota_out(key: Optional[AgentKey]) -> KeyQuota:
+    return KeyQuota(msg=quota.daily_quota(key, "msg"), room=quota.daily_quota(key, "room"))
+
+
 # ---------- API ----------
+
+
+@app.post("/api/keys", response_model=KeyOut, status_code=201)
+def create_key(
+    payload: KeyCreate,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Issue a free agent key — instant, no email/password.
+
+    The key is returned once and only its sha256 is stored. Keys don't lift
+    limits to infinity — they move you from the anonymous IP budget to a
+    bigger, *accounted and revocable* per-key budget.
+    """
+    _check_key_rate(request)
+    raw = quota.generate_key()
+    key = AgentKey(
+        key_hash=quota.hash_key(raw),
+        agent_id=(payload.agent_id or "").strip(),
+        contact=(payload.contact or "").strip() or None,
+        created_ip=_client_ip(request)[:45],
+        verify_code=quota.generate_verify_code(),
+    )
+    session.add(key)
+    session.commit()
+    session.refresh(key)
+    return KeyOut(
+        key=raw,
+        agent_id=key.agent_id,
+        tier=key.tier,
+        quota=_key_quota_out(key),
+        verify_code=key.verify_code,
+        verify_hint=quota.verify_hint(key),
+    )
+
+
+@app.get("/api/keys/me", response_model=KeyMeOut)
+def key_me(request: Request, session: Session = Depends(get_session)):
+    """Introspect the presented key: tier, budget, what's spent today."""
+    subject, key = _resolve_subject(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="provide your key: Authorization: Bearer <key>")
+    session.commit()  # persist last_used_at touched by resolve_key
+    return KeyMeOut(
+        agent_id=key.agent_id,
+        tier=key.tier,
+        quota=_key_quota_out(key),
+        used_today=_used_today(session, subject),
+        revoked=key.revoked,
+        verify_code=key.verify_code,
+        verify_hint=quota.verify_hint(key),
+        contact=key.contact,
+        awaiting=_awaiting_out(session, request, key=key),
+    )
+
+@app.get("/api/me/inbox", response_model=InboxOut)
+def my_inbox(request: Request, session: Session = Depends(get_session)):
+    """"Did anyone look for me?" — cross-room digest for the presented key.
+
+    One call instead of polling every room: what's new past this key's read
+    watermark in each room it participates in, plus fresh mentions of its
+    agent_id in those rooms (never in a room the key has not joined). Reading a room's
+    messages with the Bearer key advances the watermark; so does posting.
+    The inbox itself is side-effect-free.
+
+    An inbox with nothing new counts toward the idle-poll allowance exactly
+    like an empty room read — the point of the inbox is to make one poll do
+    the work of many, not to hand out a free polling channel.
+    """
+    subject, key = _resolve_subject(request, session)
+    if key is None:
+        raise HTTPException(
+            status_code=401,
+            detail="the inbox is per-key: send Authorization: Bearer <key>. "
+                   + quota.GET_KEY_HINT,
+        )
+    data = inbox.build_inbox(session, key)
+    try:
+        quota.count_only(session, subject, "inbox")
+        session.commit()  # also persists last_used_at touched by resolve_key
+    except Exception:
+        log.debug("inbox metering failed", exc_info=True)
+        session.rollback()
+    if inbox.is_empty(data):
+        throttled = _meter_idle_poll(session, request, "read_empty")
+        if throttled is not None:
+            subject, retry_after = throttled
+            raise HTTPException(
+                status_code=429,
+                detail=quota.empty_poll_throttled_reason(subject, retry_after),
+                headers={"Retry-After": str(retry_after)},
+            )
+    return InboxOut(**data)
+
 
 @app.post("/api/rooms", response_model=RoomCreateOut, status_code=201)
 def create_room(
@@ -376,6 +724,26 @@ def create_room(
     session: Session = Depends(get_session),
 ):
     _check_create_rate(request)
+    subject, key = _resolve_subject(request, session)
+    # "Keyed create" wall: anonymous callers may read and post into open rooms,
+    # but creating a room requires a (revocable) key. Enforced independently of
+    # QUOTA_MODE; killswitch quota.KEYED_CREATE=off.
+    if key is None and quota.keyed_create_required():
+        raise HTTPException(status_code=403, detail=quota.keyed_create_denied_reason())
+    # Public listing requires a Telegram-verified key even when anonymous
+    # creation is allowed: the showcase is the one surface visible to everyone,
+    # so it needs an accountable human behind it. Anonymous rooms stay unlisted.
+    if payload.is_public:
+        reason = quota.public_create_denied_reason(key)
+        if reason is not None:
+            raise HTTPException(status_code=403, detail=reason)
+    # Premium is verified-only end to end: the arbiter burns LLM budget on
+    # every message, so creating the room is gated the same way as posting.
+    if payload.protocol_mode == "premium":
+        reason = quota.premium_create_denied_reason(key)
+        if reason is not None:
+            raise HTTPException(status_code=403, detail=reason)
+    _check_quota(session, subject, "room", key)
     description = (payload.description or "").strip()
     if len(description) > 500:
         raise HTTPException(status_code=400, detail="description too long (max 500)")
@@ -392,11 +760,48 @@ def create_room(
             detail="premium rooms require the LLM arbiter, which is not "
                    "configured on this server",
         )
+    # Content gate for the showcase. TG-verification makes vandalism expensive,
+    # not impossible — someone can burn one Telegram account to park something
+    # ugly on the public listing. Worse, that listing is read by *other people's
+    # agents* via list_rooms, so a description is also a prompt-injection vector.
+    # Screened by a fast LLM; an outage fails CLOSED (503), otherwise waiting for
+    # one would be the bypass. Private rooms are never screened.
+    if payload.is_public and llm.moderation_enabled():
+        try:
+            allowed, reason = llm.moderate_public_description_sync(description)
+        except llm.LLMUnavailable as e:
+            log.warning("public room creation blocked: moderation unavailable (%r)", e)
+            raise HTTPException(
+                status_code=503,
+                detail="automated moderation for the public listing is "
+                       "unavailable right now — retry shortly, or create the "
+                       "room unlisted (omit is_public).",
+            )
+        if not allowed:
+            log.warning("public room rejected by moderation: %s | %r", reason, description[:120])
+            raise HTTPException(
+                status_code=403,
+                detail=f"this description was rejected by automated moderation "
+                       f"for the public listing ({reason}). Reword it, or create "
+                       f"the room unlisted (omit is_public).",
+            )
+    expires_at = _resolve_expiry(payload)
+    # write_policy='key': generate the room write-key now — returned once in
+    # the response, only its hash is stored.
+    room_write_key: Optional[str] = None
+    write_key_hash: Optional[str] = None
+    if payload.write_policy == "key":
+        room_write_key = quota.generate_room_key()
+        write_key_hash = quota.hash_key(room_write_key)
     room = Room(
         uuid=str(uuid_lib.uuid4()),
         description=description,
         is_public=bool(payload.is_public),
         protocol_mode=payload.protocol_mode,
+        write_policy=payload.write_policy,
+        write_key_hash=write_key_hash,
+        owner_key_id=key.id if key else None,
+        expires_at=expires_at,
     )
     session.add(room)
     session.commit()
@@ -423,6 +828,9 @@ def create_room(
         created_at=room.created_at,
         is_public=room.is_public,
         protocol_mode=room.protocol_mode,
+        write_policy=room.write_policy,
+        write_key=room_write_key,
+        expires_at=room.expires_at,
     )
 
 
@@ -435,6 +843,8 @@ def list_public_rooms(
     session: Session = Depends(get_session),
 ):
     """Public listing of rooms — only is_public=true. For agent discovery."""
+    # Visibility only: who reads the showcase, and how often (read_list).
+    _meter_listing_read(session, request)
     base = str(request.base_url).rstrip("/")
     stmt = (
         select(
@@ -449,6 +859,10 @@ def list_public_rooms(
         .group_by(Room.uuid)
     )
     rows = session.exec(stmt).all()
+    # Expired rooms leave the showcase: every listed room must be one an agent
+    # can actually join, or discovery hands out dead UUIDs.
+    _now = utcnow()
+    rows = [r for r in rows if not _room_expired(r[0], _now)]
 
     def sort_key(row):
         if sort == "new":
@@ -481,9 +895,14 @@ def list_public_rooms(
 
 
 @app.get("/api/rooms/{room_uuid}", response_model=RoomInfoOut)
-def get_room(room_uuid: str, session: Session = Depends(get_session)):
+def get_room(room_uuid: str, request: Request, session: Session = Depends(get_session)):
     room_uuid = _validate_uuid(room_uuid)
-    room = _get_room_or_404(session, room_uuid)
+    room = session.get(Room, room_uuid)
+    if room is None:
+        # Room-info polling of a nonexistent room is idle polling too.
+        raise _missing_room_response(session, request)
+    if _room_expired(room):
+        raise HTTPException(status_code=410, detail=_expired_detail(room))
     count = session.exec(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
@@ -496,18 +915,25 @@ def get_room(room_uuid: str, session: Session = Depends(get_session)):
         protocol_mode=room.protocol_mode,
         arbiter_active=(room.protocol_mode == "premium" and llm.is_configured()),
         last_extraction_error=room.last_extraction_error,
+        expires_at=room.expires_at,
+        expires_in_seconds=_expires_in_seconds(room),
     )
 
 
 @app.get("/api/rooms/{room_uuid}/messages", response_model=MessagesPage)
 def list_messages(
     room_uuid: str,
+    request: Request,
     since: Optional[int] = Query(default=None, ge=0),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1),
     session: Session = Depends(get_session),
 ):
     room_uuid = _validate_uuid(room_uuid)
-    _get_room_or_404(session, room_uuid)
+    _room = session.get(Room, room_uuid)
+    if _room is None:
+        raise _missing_room_response(session, request)
+    if _room_expired(_room):
+        raise HTTPException(status_code=410, detail=_expired_detail(_room))
     effective_limit = min(limit, MAX_LIMIT)
 
     stmt = select(Message).where(Message.room_uuid == room_uuid)
@@ -517,29 +943,83 @@ def list_messages(
     rows = session.exec(stmt).all()
     has_more = len(rows) > effective_limit
     rows = rows[:effective_limit]
+    if not rows:
+        # Meter empty polls. An idle poll — reading a quiet room and getting
+        # nothing — is the polling-parasite's signature and exactly what a
+        # protocol-abiding agent is told to stop doing. A read that returns
+        # messages costs nothing, ever. With READ_EMPTY_LIMIT set (off by
+        # default), a subject far past the daily allowance starts getting 429s
+        # whose Retry-After grows with the overage.
+        throttled = _meter_idle_poll(session, request, "read_empty")
+        if throttled is not None:
+            subject, retry_after = throttled
+            raise HTTPException(
+                status_code=429,
+                detail=quota.empty_poll_throttled_reason(subject, retry_after),
+                headers={"Retry-After": str(retry_after)},
+            )
+    elif request.headers.get("authorization"):
+        # Keyed read that returned messages — advance the inbox watermark to
+        # the last id actually delivered. A bad key just skips the bookkeeping.
+        try:
+            seen_key = quota.resolve_key(session, request.headers.get("authorization"))
+        except quota.AuthError:
+            seen_key = None
+        inbox.advance_seen_best_effort(session, seen_key, room_uuid, rows)
+    # Provenance travels with every message: a display name alone never said
+    # who posted it (audit F2). One query for the whole page.
+    refs = authorship.refs_for(session, rows)
     return MessagesPage(
         messages=[
-            MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp)
+            MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp,
+                       pubkey_hex=m.pubkey_hex, signature_hex=m.signature_hex,
+                       memory_root=m.memory_root,
+                       auth=authorship.auth_level(m), key_ref=refs.get(m.key_id))
             for m in rows
         ],
         has_more=has_more,
+        # The poll that most needs it is the empty one: quiet here, called
+        # elsewhere. This room itself is never listed.
+        awaiting=_awaiting_out(session, request, exclude_room=room_uuid)
+        if request.headers.get("authorization") else None,
     )
 
 
-@app.post("/api/rooms/{room_uuid}/messages", response_model=MessageOut, status_code=201)
+@app.post("/api/rooms/{room_uuid}/messages", response_model=PostedMessageOut, status_code=201)
 def post_message(
     room_uuid: str,
     payload: MessageIn,
+    request: Request,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
     room_uuid = _validate_uuid(room_uuid)
     room = _get_room_or_404(session, room_uuid)
+    # Auth MVP: write-policy gate (403) before the daily budget (429), both
+    # before any DB mutation.
+    subject, key = _resolve_subject(request, session)
+    try:
+        quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+        quota.check_public_write(room, key)
+        quota.check_premium_write(room, key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    # A handful of names speak for the service itself; borrowing one is the
+    # forgery with consequences (audit F2). Every other name stays free.
+    denied = authorship.protected_denied_reason(
+        payload.agent_id, key, quota.PREMIUM_TIERS)
+    if denied:
+        raise HTTPException(status_code=403, detail=denied)
+    _check_quota(session, subject, "msg", key)
     count = session.exec(
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
     if count >= MAX_MESSAGES_PER_ROOM:
-        raise HTTPException(status_code=429, detail="Room message limit reached (1000)")
+        raise HTTPException(
+            status_code=429,
+            detail="room_full: room message limit reached (1000) — permanent "
+                   "for this room, not your quota. Ask the owner for a new room.",
+        )
 
     # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
     # ts_iso must be provided together. Verification happens *before* insert
@@ -583,6 +1063,7 @@ def post_message(
         pubkey_hex=pk,
         signature_hex=sg,
         memory_root=payload.memory_root,
+        key_id=key.id if key else None,
     )
     # If signed, lock the message timestamp to the agent's ts_iso so the
     # signed surface remains reproducible. Otherwise the default factory
@@ -591,6 +1072,14 @@ def post_message(
         from datetime import datetime as _dt
         msg.timestamp = _dt.fromisoformat(ts_iso.replace("Z", "+00:00"))
     session.add(msg)
+    session.flush()  # assign msg.id so the watermark below can point at it
+    if key is not None:
+        # Posting = caught up: your reply lands after everything you saw.
+        inbox.advance_seen(session, key.id, room_uuid, msg.id)
+    # A room that is being used does not run out. The TTL counts from the last
+    # message, so it retires silence rather than interrupting a conversation.
+    if ttl.extend_on_activity(room):
+        session.add(room)
     session.commit()
     session.refresh(msg)
 
@@ -605,10 +1094,13 @@ def post_message(
                 room_uuid, msg.id,
             )
 
-    return MessageOut(
+    return PostedMessageOut(
         id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp,
         pubkey_hex=msg.pubkey_hex, signature_hex=msg.signature_hex,
         memory_root=msg.memory_root,
+        auth=authorship.auth_level(msg), key_ref=authorship.key_ref(key),
+        awaiting=_awaiting_out(session, request, exclude_room=room_uuid, key=key)
+        if key is not None else None,
     )
 
 
@@ -836,6 +1328,11 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
     room = session.get(Room, room_uuid)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
+    # Defensive: callers reach this through _get_room_or_404, but the arbiter
+    # also runs as a background task that can outlive the request that queued
+    # it — don't burn LLM budget on a room that expired in the meantime.
+    if _room_expired(room):
+        raise HTTPException(status_code=410, detail=_expired_detail(room))
 
     if full:
         room.last_extracted_msg_id = 0
@@ -873,9 +1370,14 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
             ).order_by(Message.id.desc()).limit(4)
         ).all()
         tail = [_msg_dict(m) for m in reversed(tail_rows)]
+        msg_payload = _msg_dict(msg)
+        # Hand the pooled connection back while the LLM call runs (up to
+        # minutes with fallbacks). Holding it across the await exhausted the
+        # pool and hung the whole server on 2026-09-30.
+        session.commit()
 
         try:
-            out, model_used = await llm.process_message(_msg_dict(msg), tail, thread_payload)
+            out, model_used = await llm.process_message(msg_payload, tail, thread_payload)
             last_model_used = model_used
         except llm.LLMUnavailable as e:
             log.warning("LLM unavailable while processing msg #%s: %r", msg.id, e)
@@ -1202,6 +1704,144 @@ def handshake(
         pubkey_hex=h.pubkey_hex, signature_hex=h.signature_hex,
         created_at=h.created_at, signature_valid=sig_valid,
     )
+
+
+@app.get("/api/anchors")
+def list_anchors(
+    limit: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+):
+    """Recent external anchors, newest first.
+
+    Each row is a Merkle root over every room's state at that moment, plus the
+    receipt from wherever it was published. `receipt: null` means the root was
+    computed but publication failed — shown rather than hidden, because a run
+    of failed publications must not look like an anchored history.
+    """
+    rows = session.exec(
+        select(Anchor).order_by(Anchor.id.desc()).limit(limit)
+    ).all()
+    return {
+        "anchors": [
+            {
+                "id": a.id,
+                "root": a.root,
+                "leaf_count": a.leaf_count,
+                "digest_version": a.digest_version,
+                "created_at": a.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "receipt": a.receipt,
+                "published_via": a.published_via,
+                # Timestamped by a third party is the claim that matters: a
+                # published receipt we control proves less than a signature we
+                # cannot forge.
+                "tsa_url": a.tsa_url,
+                "tsa_time": a.tsa_time,
+                "timestamped": a.tsa_token is not None,
+                "token_url": f"/api/anchors/{a.id}/tsa" if a.tsa_token else None,
+                "published": a.receipt is not None or a.tsa_token is not None,
+            }
+            for a in rows
+        ],
+        "arbiter_pubkey": pcis.arbiter_pubkey_hex(),
+    }
+
+
+@app.get("/api/anchors/{anchor_id}/tsa")
+def anchor_tsa_token(anchor_id: int, session: Session = Depends(get_session)):
+    """The raw RFC 3161 token for an anchor, for offline verification.
+
+    This is the one artefact here that does not depend on trusting this
+    server: a public timestamp authority signed the root with its own key, at
+    a time we cannot move. Check it with standard tooling —
+
+        curl -o token.tsr https://roomcomm.xyz/api/anchors/1/tsa
+        printf '%s' "<root from /api/anchors>" > root.txt
+        openssl ts -verify -data root.txt -in token.tsr -CAfile <tsa-ca.pem>
+    """
+    row = session.get(Anchor, anchor_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such anchor")
+    if not row.tsa_token:
+        raise HTTPException(
+            status_code=404,
+            detail="this anchor has no timestamp token — the root was stored "
+                   "but no timestamp authority signed it",
+        )
+    return Response(
+        content=row.tsa_token,
+        media_type="application/timestamp-reply",
+        headers={"Content-Disposition": f'attachment; filename="anchor-{anchor_id}.tsr"'},
+    )
+
+
+@app.get("/api/rooms/{room_uuid}/anchor")
+def room_anchor(room_uuid: str, session: Session = Depends(get_session)):
+    """Proof that this room's history was included in a published root.
+
+    Returns the room's current digest, the newest anchor that covers it, and
+    the sibling path from the one to the other. Recompute the digest from
+    `GET /api/rooms/{uuid}/messages`, replay the path, and compare the result
+    with the root as published externally — at no point do you have to take
+    this server's word for anything.
+
+    `digest_matches_anchor` is false when the room has changed since the
+    anchor: normal for a live conversation, and the reason `anchored_digest`
+    is reported separately.
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    # Expired rooms answer here on purpose: the whole point of an anchor is to
+    # still be checkable once the conversation itself is over.
+    if session.get(Room, room_uuid) is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    # One room's digest, computed now — cheap. The proof itself comes from the
+    # leaf set stored with the anchor, never from a fresh sweep of the server:
+    # a proof has to run against the state as it was when the root was
+    # published, and rebuilding every leaf per request cost 2.4 s on production
+    # data, which is both slow and a free way to load the box.
+    current_digest = anchor.room_digest(session, room_uuid)
+    latest = session.exec(select(Anchor).order_by(Anchor.id.desc()).limit(1)).first()
+    if latest is None:
+        return {
+            "room_uuid": room_uuid,
+            "current_digest": current_digest,
+            "digest_version": anchor.DIGEST_VERSION,
+            "anchor": None,
+            "note": "no anchor has been published yet",
+        }
+
+    leaves = anchor.load_leaves(latest)
+    anchored_digest = dict(leaves).get(room_uuid) if leaves else None
+    proof = anchor.inclusion_proof(leaves, room_uuid) if leaves else None
+
+    body = {
+        "room_uuid": room_uuid,
+        # What the room hashes to right now.
+        "current_digest": current_digest,
+        # What it hashed to when the root below was published. Different means
+        # the room has simply moved on — normal for a live conversation.
+        "anchored_digest": anchored_digest,
+        "unchanged_since_anchor": (
+            anchored_digest is not None and anchored_digest == current_digest
+        ),
+        "digest_version": latest.digest_version or anchor.DIGEST_VERSION,
+        "anchor": {
+            "id": latest.id,
+            "root": latest.root,
+            "leaf_count": latest.leaf_count,
+            "created_at": latest.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "receipt": latest.receipt,
+            "published_via": latest.published_via,
+        },
+        "proof": proof,
+    }
+    if anchored_digest is None:
+        body["note"] = (
+            "this room is not covered by the latest anchor — either it was "
+            "created after that root was published, or the anchor predates "
+            "stored leaf sets"
+        )
+    return body
 
 
 @app.get("/api/arbiter/pubkey")
@@ -1599,6 +2239,178 @@ def download_skill(
     )
 
 
+# ---------- Room files (verified-only MD exchange) ----------
+# Agents in a room exchange Markdown documents — briefs, drafts, contracts —
+# too big or too durable for the message stream. The channel is gated behind
+# the Telegram-verified tier in BOTH directions (upload and download): every
+# transfer has an accountable human on each end, so the file store can't be
+# used as an anonymous dead-drop. Core logic lives in files.py (shared with
+# the MCP tools); these handlers translate it to HTTP.
+
+def file_exchange_enabled() -> bool:
+    """MD file exchange is on by default; disable with ROOMCOMM_FILE_EXCHANGE=0."""
+    return os.environ.get("ROOMCOMM_FILE_EXCHANGE", "on").strip().lower() \
+        not in {"0", "false", "no", "off"}
+
+
+def _require_file_exchange() -> None:
+    if not file_exchange_enabled():
+        raise HTTPException(status_code=404, detail="file exchange is disabled")
+
+
+def _room_file_out(request: Request, rf, deduped: Optional[bool] = None):
+    base = str(request.base_url).rstrip("/")
+    kwargs = dict(
+        id=rf.id,
+        name=rf.name,
+        description=rf.description,
+        sha256=rf.sha256,
+        size_bytes=rf.size_bytes,
+        agent_id=rf.agent_id,
+        fetch_url=f"{base}/api/rooms/{rf.room_uuid}/files/{rf.id}",
+        uploaded_at=rf.uploaded_at,
+    )
+    if deduped is None:
+        return RoomFileOut(**kwargs)
+    return RoomFileUploadOut(**kwargs, deduped=deduped)
+
+
+def _content_disposition(name: str) -> str:
+    """Build the download header for a name that is usually NOT ASCII.
+
+    Agents share Russian Markdown here, and a raw non-Latin-1 name in a header
+    kills the response with UnicodeEncodeError. RFC 6266: quoted ASCII fallback
+    for old clients plus the percent-encoded UTF-8 form everyone else reads.
+    """
+    fallback = name.encode("ascii", "ignore").decode("ascii").strip(' "\\')
+    if not fallback.lower().endswith(".md"):
+        fallback = (fallback + ".md") if fallback else "file.md"
+    return f'inline; filename="{fallback}"; filename*=UTF-8\'\'{quote(name)}'
+
+
+def _file_exchange_key(request: Request, session: Session) -> AgentKey:
+    """Resolve and gate the caller for any file-exchange operation:
+    valid Bearer key of tier verified/trusted, else 401/403."""
+    _, key = _resolve_subject(request, session)
+    try:
+        quota.check_file_exchange(key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return key
+
+
+@app.post("/api/rooms/{room_uuid}/files", response_model=RoomFileUploadOut,
+          status_code=201, dependencies=[Depends(_require_file_exchange)])
+async def upload_room_file(
+    room_uuid: str,
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form("", max_length=100),
+    description: str = Form("", max_length=300),
+    agent_id: str = Form("", max_length=100),
+    session: Session = Depends(get_session),
+):
+    """Share a Markdown file (≤ 256 KB, UTF-8) into a room.
+
+    Requires a Telegram-verified key. Write-protected rooms additionally need
+    the room write-key (X-Room-Key header) unless you own the room. Dedup per
+    (room, sha256): re-sharing the same bytes returns the existing record with
+    `deduped: true`.
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    room = _get_room_or_404(session, room_uuid)
+    key = _file_exchange_key(request, session)
+    try:
+        quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    _check_file_rate(request)
+
+    data = await file.read(files.MAX_BYTES + 1)
+    try:
+        rf, deduped = files.store(
+            session, room, key,
+            agent_id=(agent_id or "").strip() or key.agent_id or "unknown",
+            name=name or file.filename,
+            data=data,
+            description=description,
+        )
+    except files.FileError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return _room_file_out(request, rf, deduped=deduped)
+
+
+@app.get("/api/rooms/{room_uuid}/files", response_model=RoomFileListOut,
+         dependencies=[Depends(_require_file_exchange)])
+def list_room_files(
+    room_uuid: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """List the files shared into a room. Verified keys only."""
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    _file_exchange_key(request, session)
+    session.commit()  # persist last_used_at touched by resolve_key
+    rows = files.list_room_files(session, room_uuid)
+    return RoomFileListOut(
+        files=[_room_file_out(request, rf) for rf in rows],
+        total=len(rows),
+    )
+
+
+@app.get("/api/rooms/{room_uuid}/files/{file_id}",
+         dependencies=[Depends(_require_file_exchange)])
+def download_room_file(
+    room_uuid: str,
+    file_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Fetch a shared file's Markdown content. Verified keys only.
+
+    Served through the app (not the nginx CDN) precisely because the download
+    side of the exchange is auth-gated too.
+    """
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    _file_exchange_key(request, session)
+    session.commit()  # persist last_used_at touched by resolve_key
+    try:
+        rf = files.get_room_file(session, room_uuid, file_id)
+        content = files.load_content(rf)
+    except files.FileError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": _content_disposition(rf.name)},
+    )
+
+
+@app.delete("/api/rooms/{room_uuid}/files/{file_id}", status_code=204,
+            dependencies=[Depends(_require_file_exchange)])
+def delete_room_file(
+    room_uuid: str,
+    file_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Delete a shared file — only the key that uploaded it may do so."""
+    room_uuid = _validate_uuid(room_uuid)
+    _get_room_or_404(session, room_uuid)
+    key = _file_exchange_key(request, session)
+    try:
+        rf = files.get_room_file(session, room_uuid, file_id)
+    except files.FileError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    if rf.key_id != key.id:
+        raise HTTPException(status_code=403,
+                            detail="only the key that shared this file may delete it")
+    files.delete(session, rf)
+    return Response(status_code=204)
+
+
 # ---------- HTML ----------
 
 @app.get("/", response_class=HTMLResponse)
@@ -1606,13 +2418,16 @@ def index(request: Request):
     lang = _lang(request)
     resp = templates.TemplateResponse(
         request, "index.html",
-        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/')},
+        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/'),
+         # Landing texts about Telegram verification flip with the bot state,
+         # same as the API hints — the page never advertises a dead bot.
+         "tg_active": quota.tg_verification_active()},
     )
     return _apply_lang_cookie(request, resp)
 
 
 _ROBOTS_TXT = """User-agent: *
-Disallow: /admin/
+Disallow: /admin
 Disallow: /api/
 Disallow: /mcp
 """
@@ -1621,6 +2436,16 @@ Disallow: /mcp
 @app.get("/robots.txt", include_in_schema=False)
 def robots_txt():
     return PlainTextResponse(_ROBOTS_TXT)
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page(request: Request):
+    lang = _lang(request)
+    resp = templates.TemplateResponse(
+        request, "terms.html",
+        {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/')},
+    )
+    return _apply_lang_cookie(request, resp)
 
 
 @app.get("/rooms", response_class=HTMLResponse)
@@ -1661,6 +2486,23 @@ def _render_room_agent_md(request: Request, room: Optional[Room], room_uuid: str
     )
 
 
+# NOTE: must be registered BEFORE the /{room_uuid} catch-all below, or the
+# room page swallows the one-segment /admin path. The rest of the admin
+# section (login, keys, helpers) lives further down; names resolve at call time.
+@app.get("/admin", response_class=HTMLResponse)
+def admin_home(request: Request, session: Session = Depends(get_session)):
+    try:
+        _check_admin_request(request)
+    except HTTPException:
+        # Show the login form instead of a bare 404: the page itself reveals
+        # nothing, and the POST target is rate-limited.
+        resp = HTMLResponse(ADMIN_LOGIN_HTML)
+        for k, v in _NOINDEX_HEADERS.items():
+            resp.headers[k] = v
+        return resp
+    return _render_admin(request, session)
+
+
 @app.get("/{room_uuid}", response_class=HTMLResponse)
 def room_page(room_uuid: str, request: Request, session: Session = Depends(get_session)):
     lang = _lang(request)
@@ -1691,6 +2533,31 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         )
         return _apply_lang_cookie(request, resp)
 
+    if _room_expired(room):
+        # Same shape as "not found" for the viewer — the room is gone as far as
+        # anyone outside /admin is concerned — but say *why*, so the owner knows
+        # this was a TTL and not a deletion, and gets a 410 rather than a 404.
+        when = room.expires_at.strftime("%Y-%m-%d %H:%M UTC") if room.expires_at else "?"
+        if _wants_markdown(request):
+            return PlainTextResponse(
+                f"# Room expired\n\nThis room reached its TTL at {when} and is "
+                f"no longer readable.\nRooms here are ephemeral by design. "
+                f"Start a new one at {str(request.base_url).rstrip('/')}/.\n",
+                status_code=410, media_type="text/markdown; charset=utf-8",
+            )
+        resp = templates.TemplateResponse(
+            request,
+            "room.html",
+            {
+                "room": None, "messages": [], "not_found": True,
+                "expired_at": when,
+                "lang": lang, "t": t,
+                "base_url": str(request.base_url).rstrip('/'),
+            },
+            status_code=410,
+        )
+        return _apply_lang_cookie(request, resp)
+
     if _wants_markdown(request):
         return PlainTextResponse(
             _render_room_agent_md(request, room, room_uuid),
@@ -1710,6 +2577,11 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
             "not_found": False,
             "short_uuid": room.uuid[:8],
             "agent_md": agent_md,
+            # Only reachable past the TTL by the admin (see _room_expired).
+            "admin_expired_at": (
+                room.expires_at.strftime("%Y-%m-%d %H:%M UTC")
+                if ttl.is_expired(room) else None
+            ),
             "lang": lang,
             "t": t,
             "base_url": str(request.base_url).rstrip('/'),
@@ -1718,11 +2590,145 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
     return _apply_lang_cookie(request, resp)
 
 
-# ---------- Admin ----------
+# ---------- Telegram webhook (free -> verified escalation) ----------
 
-def _check_admin(token: str) -> None:
-    if not ADMIN_TOKEN or not secrets.compare_digest(token, ADMIN_TOKEN):
+@app.post("/tg/webhook")
+async def tg_webhook(request: Request, session: Session = Depends(get_session)):
+    """Inbound updates for @RoomComm_bot. Auth = the secret Telegram echoes
+    back on every call; anyone else gets the same 404 the admin paths use."""
+    if not TG_WEBHOOK_SECRET or not secrets.compare_digest(
+        request.headers.get("x-telegram-bot-api-secret-token", ""),
+        TG_WEBHOOK_SECRET,
+    ):
         raise HTTPException(status_code=404, detail="Not found")
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}  # malformed body — ack so Telegram doesn't retry
+    try:
+        await tg_bot.handle_update(update, session)
+    except Exception:
+        log.exception("tg webhook handler failed")
+    return {"ok": True}  # always ack: a retry loop can't fix a logic error
+
+
+# ---------- Admin ----------
+# Hardened: the token no longer travels in the URL path (paths leak into
+# nginx logs, browser history and Referer). Login once via POST form →
+# HttpOnly SameSite=strict cookie; API calls may instead send
+# Authorization: Bearer <admin token>. The legacy /admin/{token} URL still
+# works as a one-shot login redirect so old bookmarks keep functioning.
+
+ADMIN_COOKIE = "admin_token"
+ADMIN_HEADER = "x-roomcomm-admin"
+ADMIN_LOGIN_LIMIT = 10          # failed attempts per hour per IP
+ADMIN_LOGIN_WINDOW = 3600
+_admin_login_buckets: dict[str, deque] = defaultdict(deque)
+_admin_login_lock = Lock()
+
+# Failed admin-token guesses per IP, across every door (login form, legacy
+# /admin/{token}, Bearer, X-Roomcomm-Admin, cookie). Past the limit the IP is
+# locked out of admin for the rest of the window — even with the right token —
+# so the per-request header check can't be used to brute-force the token.
+# Non-admin traffic from that IP is unaffected.
+ADMIN_FAIL_LIMIT = 10
+ADMIN_FAIL_WINDOW = 3600
+_admin_fail_buckets: dict[str, deque] = defaultdict(deque)
+_admin_fail_lock = Lock()
+
+
+def _admin_locked_out(ip: str) -> bool:
+    now = time.monotonic()
+    with _admin_fail_lock:
+        bucket = _admin_fail_buckets[ip]
+        while bucket and bucket[0] < now - ADMIN_FAIL_WINDOW:
+            bucket.popleft()
+        if not bucket:
+            del _admin_fail_buckets[ip]
+            return False
+        return len(bucket) >= ADMIN_FAIL_LIMIT
+
+
+def _record_admin_fail(ip: str) -> None:
+    with _admin_fail_lock:
+        _admin_fail_buckets[ip].append(time.monotonic())
+    log.warning("admin token mismatch from %s", ip)
+
+
+def _admin_attempt(request: Request, candidates: list) -> bool:
+    """True if one of the presented candidate tokens is the admin token.
+    Nothing presented → False, not a failure. Locked-out IP → always False."""
+    presented = [c for c in candidates if c]
+    if not presented:
+        return False
+    ip = _client_ip(request)
+    if _admin_locked_out(ip):
+        return False
+    if any(_admin_token_ok(c) for c in presented):
+        return True
+    _record_admin_fail(ip)
+    return False
+
+
+def _admin_token_ok(token: Optional[str]) -> bool:
+    return bool(ADMIN_TOKEN) and bool(token) and secrets.compare_digest(token, ADMIN_TOKEN)
+
+
+def _bearer_is_admin(authorization: Optional[str]) -> bool:
+    auth = authorization or ""
+    return auth.lower().startswith("bearer ") and _admin_token_ok(auth[7:].strip())
+
+
+def _check_admin(request: Request, token: str) -> None:
+    if not _admin_attempt(request, [token]):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _check_admin_request(request: Request) -> None:
+    """Admin auth from header (Bearer) or session cookie. 404 on failure —
+    same hide-the-door behavior as before."""
+    # Evaluated once per request (middleware + endpoint + MCP share the ASGI
+    # scope), so one request never counts as several failed guesses.
+    ok = request.scope.get("roomcomm.admin")
+    if ok is None:
+        auth = request.headers.get("authorization") or ""
+        bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if bearer.startswith(quota.KEY_PREFIX):
+            bearer = ""  # an agent key, not an admin-token guess
+        ok = _admin_attempt(request, [
+            bearer,
+            # Separate header so an agent can keep its own key in Authorization
+            # (authorship, verified-only gates) and still be the admin.
+            request.headers.get(ADMIN_HEADER),
+            request.cookies.get(ADMIN_COOKIE),
+        ])
+        request.scope["roomcomm.admin"] = ok
+    if not ok:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _request_is_admin(request: Request) -> bool:
+    try:
+        _check_admin_request(request)
+        return True
+    except HTTPException:
+        return False
+
+
+def _set_admin_cookie(response, request: Request):
+    # path="/" (not "/admin"): the cookie must also reach /{uuid} and /api/*,
+    # otherwise the admin is anonymous there and expired rooms answer 410.
+    response.set_cookie(
+        ADMIN_COOKIE, ADMIN_TOKEN,
+        max_age=60 * 60 * 24 * 30,  # 30 days
+        httponly=True,
+        samesite="strict",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
+    for k, v in _NOINDEX_HEADERS.items():
+        response.headers[k] = v
+    return response
 
 
 _NOINDEX_HEADERS = {"X-Robots-Tag": "noindex, nofollow", "Cache-Control": "private, no-store"}
@@ -1736,6 +2742,8 @@ STATS_EVENTS = [
     ("mcp_hint", "MCP page"),
     ("skill_download", "Skill DL"),
     ("skill_upload", "Skill UL"),
+    ("file_download", "File DL"),
+    ("file_upload", "File UL"),
 ]
 
 
@@ -1781,9 +2789,124 @@ def _admin_stats(session: Session, days_back: int = 14) -> dict:
     }
 
 
+def _admin_keys(session: Session) -> list[dict]:
+    """Keys table for the dashboard: identity, tier, today's spend vs budget."""
+    day = utcnow().strftime("%Y-%m-%d")
+    used: dict[str, dict[str, int]] = {}
+    for row in session.exec(
+        select(UsageCounter).where(UsageCounter.day == day)
+    ).all():
+        used.setdefault(row.subject, {})[row.kind] = row.count
+    items = []
+    for k in session.exec(select(AgentKey).order_by(AgentKey.id.desc())).all():
+        u = used.get(f"key:{k.id}", {})
+        q_msg = quota.daily_quota(k, "msg")
+        q_room = quota.daily_quota(k, "room")
+        items.append({
+            "id": k.id,
+            # Only the hash is stored, so there is no key prefix to show; the
+            # row id is what the admin URLs and the revoke notice speak in.
+            "prefix": f"#{k.id}",
+            "agent_id": k.agent_id or "—",
+            "tier": k.tier,
+            "contact": k.contact or "",
+            "tg_id": (k.contact or "")[3:] if (k.contact or "").startswith("tg:") else "",
+            "issued_ip": k.created_ip,
+            "created_at": k.created_at,
+            "last_used_at": k.last_used_at,
+            "revoked": k.revoked,
+            "note": k.note or "",
+            "msgs_today": u.get("msg", 0),
+            "rooms_today": u.get("room", 0),
+            "msgs_quota": q_msg,
+            "rooms_quota": q_room,
+            "msg_override": k.daily_msg_quota,
+            "room_override": k.daily_room_quota,
+            "maxed": u.get("msg", 0) >= q_msg or u.get("room", 0) >= q_room,
+        })
+    return items
+
+
+def _admin_top_subjects(session: Session, limit: int = 15) -> list[dict]:
+    """Today's hungriest subjects (keys AND anonymous IPs). Ranked by write load
+    (msg + room) with a small read-side term — a subject with huge idle-poll
+    counts (read_empty of quiet rooms, read_404 of deleted ones) and near-zero
+    writes is the polling-parasite fingerprint; read_list shows who watches
+    the showcase."""
+    day = utcnow().strftime("%Y-%m-%d")
+    kinds = ("msg", "room", "read_empty", "read_404", "read_list")
+    agg: dict[str, dict[str, int]] = {}
+    for row in session.exec(
+        select(UsageCounter).where(UsageCounter.day == day)
+    ).all():
+        agg.setdefault(row.subject, dict.fromkeys(kinds, 0))[row.kind] = row.count
+    top = sorted(
+        agg.items(),
+        key=lambda kv: -(kv[1]["msg"] + kv[1]["room"] * 10
+                         + (kv[1].get("read_empty", 0) + kv[1].get("read_404", 0)
+                            + kv[1].get("read_list", 0)) * 0.01),
+    )
+    return [
+        {"subject": s, **{k: v.get(k, 0) for k in kinds}}
+        for s, v in top[:limit]
+    ]
+
+
+ADMIN_LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
+<title>Roomcomm · admin</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main class="container" style="max-width:360px">
+<h1>Admin</h1>
+<form method="post" action="/admin/login">
+  <input type="password" name="token" placeholder="admin token" autofocus
+         style="width:100%;margin-bottom:.6rem">
+  <button type="submit">Sign in</button>
+</form>
+</main></body></html>"""
+
+
+@app.post("/admin/login")
+def admin_login(request: Request, token: str = Form(default="")):
+    _check_bucket_rate(request, _admin_login_buckets, _admin_login_lock,
+                       ADMIN_LOGIN_LIMIT, ADMIN_LOGIN_WINDOW, "login attempts")
+    if not _admin_attempt(request, [token.strip()]):
+        raise HTTPException(status_code=404, detail="Not found")
+    return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    _check_admin_request(request)
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.delete_cookie(ADMIN_COOKIE, path="/")
+    resp.delete_cookie(ADMIN_COOKIE, path="/admin")  # pre-2026-09-24 cookies
+    return resp
+
+
 @app.get("/admin/{token}", response_class=HTMLResponse)
-def admin_page(token: str, request: Request, session: Session = Depends(get_session)):
-    _check_admin(token)
+def admin_page_legacy(token: str, request: Request):
+    """Old bookmark path — logs in and redirects so the token leaves the URL."""
+    _check_admin(request, token)
+    return _set_admin_cookie(RedirectResponse(url="/admin", status_code=303), request)
+
+
+# The Igra Station arena opens one roomcomm room per table and names it in the
+# room description. Those rooms are match transcripts, not conversations anyone
+# administers, and there is one of them per game played — left mixed into the
+# room list they bury the rooms that actually matter. Recognised here so the
+# admin list can put them on their own tab.
+ARENA_BASE = os.environ.get("ARENA_BASE", "https://arena.roomcomm.xyz")
+_ARENA_ROOM_RE = re.compile(
+    r"^table talk for (?:the )?igra station arena match ([a-z0-9]{4,16})\b")
+
+
+def _arena_match_code(description: str) -> Optional[str]:
+    """Match code if this room is an arena table-talk room, else None."""
+    m = _ARENA_ROOM_RE.match((description or "").strip().lower())
+    return m.group(1).upper() if m else None
+
+
+def _render_admin(request: Request, session: Session):
     rows = session.exec(
         select(
             Room,
@@ -1800,27 +2923,111 @@ def admin_page(token: str, request: Request, session: Session = Depends(get_sess
         return (last is None, -(last.timestamp() if last else 0), -row[0].created_at.timestamp())
 
     rows = sorted(rows, key=sort_key)
-    items = [
-        {
+    items = []
+    for r in rows:
+        description = (r[0].description or "").strip()
+        arena_code = _arena_match_code(description)
+        items.append({
             "uuid": r[0].uuid,
             "short_uuid": r[0].uuid[:8],
-            "description": (r[0].description or "").strip(),
+            "description": description,
             "created_at": r[0].created_at,
             "last_at": r[2],
             "msg_count": r[1],
             "is_public": r[0].is_public,
-        }
-        for r in rows
-    ]
+            "kind": "arena" if arena_code else "room",
+            "arena_code": arena_code,
+            "arena_url": f"{ARENA_BASE}/m/{arena_code}" if arena_code else None,
+            # TTL state. Expired rooms stay listed here on purpose: /admin is
+            # the one surface that can still read or revive them.
+            "expires_at": r[0].expires_at,
+            "expired": ttl.is_expired(r[0]),
+            "expires_in_hours": (
+                None if r[0].expires_at is None
+                else round(ttl.seconds_left(r[0]) / 3600, 1)
+            ),
+        })
+    arena_count = sum(1 for i in items if i["kind"] == "arena")
+    revoke_notice = ""
+    if request.query_params.get("revoked"):
+        revoke_notice = (
+            f"Key #{request.query_params['revoked']} revoked; "
+            f"{request.query_params.get('sealed', '0')} of its open rooms sealed "
+            f"(read-only until reopened via write_policy)."
+        )
     response = templates.TemplateResponse(
         request,
         "admin.html",
-        {"items": items, "token": token, "total": len(items),
-         "stats": _admin_stats(session)},
+        {"items": items, "total": len(items),
+         "arena_count": arena_count,
+         "room_count": len(items) - arena_count,
+         "stats": _admin_stats(session),
+         "keys": _admin_keys(session),
+         "top_subjects": _admin_top_subjects(session),
+         "quota_mode": quota.QUOTA_MODE,
+         "admin_base": "/admin",
+         "revoke_notice": revoke_notice,
+         "tiers": ["free", "verified", "trusted", "blocked"]},
     )
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
     return response
+
+
+@app.post("/admin/keys/{key_id}/revoke")
+def admin_revoke_key(key_id: int, request: Request, session: Session = Depends(get_session)):
+    """Revoke a key AND seal its open rooms. Revoking only the key would leave
+    its rooms accepting anonymous posts forever — exactly the free-infra setup
+    the keyed-create wall exists to prevent. Sealing = write_policy='key' with
+    no write-key issued: history stays readable, nobody can post. Rooms that
+    already have a write-key keep it (their legit writers are unaffected);
+    un-revoking via /tier does NOT unseal — reopen per-room via
+    /admin/rooms/{uuid}/write_policy if the revoke was a mistake."""
+    _check_admin_request(request)
+    key = session.get(AgentKey, key_id)
+    if key is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.revoked = True
+    session.add(key)
+    sealed = 0
+    for room in session.exec(
+        select(Room).where(Room.owner_key_id == key.id, Room.write_policy == "open")
+    ).all():
+        room.write_policy = "key"
+        session.add(room)
+        sealed += 1
+    session.commit()
+    return RedirectResponse(
+        url=f"/admin?revoked={key.id}&sealed={sealed}", status_code=303)
+
+
+@app.post("/admin/keys/{key_id}/tier")
+def admin_set_tier(
+    key_id: int,
+    request: Request,
+    tier: str = Form(...),
+    daily_msg_quota: str = Form(default=""),
+    daily_room_quota: str = Form(default=""),
+    note: str = Form(default=""),
+    session: Session = Depends(get_session),
+):
+    """Move a key between tiers; optional per-key quota overrides (empty =
+    tier default). Also the un-revoke path: setting a tier clears `revoked`."""
+    _check_admin_request(request)
+    if tier not in ("free", "verified", "trusted", "blocked"):
+        raise HTTPException(status_code=400, detail="bad tier")
+    key = session.get(AgentKey, key_id)
+    if key is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.tier = tier
+    key.daily_msg_quota = int(daily_msg_quota) if daily_msg_quota.strip() else None
+    key.daily_room_quota = int(daily_room_quota) if daily_room_quota.strip() else None
+    if note.strip():
+        key.note = note.strip()[:500]
+    key.revoked = False
+    session.add(key)
+    session.commit()
+    return RedirectResponse(url="/admin", status_code=303)
 
 
 # ---------- MCP (Streamable HTTP, /mcp) ----------
@@ -1829,14 +3036,20 @@ def admin_page(token: str, request: Request, session: Session = Depends(get_sess
 from .mcp_server import mcp_endpoint as _mcp_endpoint  # noqa: E402
 app.add_route("/mcp", _mcp_endpoint, methods=["GET", "POST", "DELETE"])
 
+# ---------- A2A (Agent2Agent v1.0, JSON-RPC at /a2a) ----------
+# Agent Cards at /.well-known/agent-card.json and /{uuid}/.well-known/…;
+# see app/a2a.py and docs/a2a-design.md.
+from .a2a import router as _a2a_router  # noqa: E402
+app.include_router(_a2a_router)
 
-@app.post("/admin/{token}/rooms/{room_uuid}/delete")
+
+@app.post("/admin/rooms/{room_uuid}/delete")
 def admin_delete_room(
-    token: str,
     room_uuid: str,
+    request: Request,
     session: Session = Depends(get_session),
 ):
-    _check_admin(token)
+    _check_admin_request(request)
     try:
         room_uuid = str(uuid_lib.UUID(room_uuid))
     except (ValueError, AttributeError, TypeError):
@@ -1856,9 +3069,116 @@ def admin_delete_room(
     session.exec(delete(Discrepancy).where(Discrepancy.room_uuid == room_uuid))
     session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))
     session.exec(delete(Message).where(Message.room_uuid == room_uuid))
+    session.exec(delete(RoomSeen).where(RoomSeen.room_uuid == room_uuid))
     session.delete(room)
     session.commit()
-    response = RedirectResponse(url=f"/admin/{token}", status_code=303)
+    response = RedirectResponse(url="/admin", status_code=303)
     for k, v in _NOINDEX_HEADERS.items():
         response.headers[k] = v
     return response
+
+
+@app.post("/admin/rooms/{room_uuid}/write-policy")
+def admin_set_write_policy(
+    room_uuid: str,
+    request: Request,
+    write_policy: str = Form(...),
+    owner_key_id: str = Form(default=""),
+    session: Session = Depends(get_session),
+):
+    """Change a room's write policy in place (no delete/recreate) — used to seal
+    existing rooms (e.g. finished demos) as read-only showcases.
+
+    write_policy='key' + owner_key_id=<a key's id> makes that key's owner the
+    only writer (its Bearer bypasses the gate; everyone else gets 403, reads stay
+    open). write_policy='open' reopens the room. Admin-authenticated. Returns
+    JSON (scriptable), not the admin redirect."""
+    _check_admin_request(request)
+    if write_policy not in ("open", "key"):
+        raise HTTPException(status_code=400, detail="write_policy must be 'open' or 'key'")
+    try:
+        room_uuid = str(uuid_lib.UUID(room_uuid))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid UUID")
+    room = session.get(Room, room_uuid)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if owner_key_id.strip():
+        try:
+            oid = int(owner_key_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="owner_key_id must be an integer")
+        if session.get(AgentKey, oid) is None:
+            raise HTTPException(status_code=400, detail=f"owner_key_id {oid}: no such key")
+        room.owner_key_id = oid
+    room.write_policy = write_policy
+    if write_policy == "open":
+        # Reopening: drop any room write-key so it can't linger as a backdoor.
+        room.write_key_hash = None
+    session.add(room)
+    session.commit()
+    return {
+        "ok": True,
+        "uuid": room.uuid,
+        "write_policy": room.write_policy,
+        "owner_key_id": room.owner_key_id,
+    }
+
+
+@app.post("/admin/rooms/{room_uuid}/ttl")
+def admin_set_room_ttl(
+    room_uuid: str,
+    request: Request,
+    ttl_hours: str = Form(default=""),
+    session: Session = Depends(get_session),
+):
+    """Extend, shorten, pin or expire a room — the admin escape hatch on TTL.
+
+    `ttl_hours`:
+      * a positive integer — the room now expires that many hours from *now*,
+        which also revives an already-expired room;
+      * `never` — pin the room open (expires_at = NULL). Deliberately reachable
+        only from here: the public API has no immortal rooms, or "ephemeral"
+        goes back to being decoration;
+      * `now` — expire it immediately, without deleting the history.
+
+    Returns JSON (scriptable), not the admin redirect.
+    """
+    _check_admin_request(request)
+    try:
+        room_uuid = str(uuid_lib.UUID(room_uuid))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid UUID")
+    # Deliberately NOT _get_room_or_404: an expired room must stay reachable
+    # from here, otherwise it could never be revived.
+    room = session.get(Room, room_uuid)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    raw = (ttl_hours or "").strip().lower()
+    if raw == "never":
+        room.expires_at = None
+    elif raw == "now":
+        room.expires_at = utcnow()
+    else:
+        try:
+            hours = int(raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="ttl_hours must be a positive integer, 'never' or 'now'",
+            )
+        if hours < 1:
+            raise HTTPException(status_code=400, detail="ttl_hours must be >= 1")
+        room.expires_at = utcnow() + timedelta(hours=hours)
+
+    session.add(room)
+    session.commit()
+    session.refresh(room)
+    log.info("admin set TTL for room %s → %s", room.uuid, ttl.format_expiry(room))
+    return {
+        "ok": True,
+        "uuid": room.uuid,
+        "expires_at": room.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ") if room.expires_at else None,
+        "expired": ttl.is_expired(room),
+    }

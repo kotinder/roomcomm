@@ -6,6 +6,8 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 SKILLS_DIR = DATA_DIR / "skills"
 SKILLS_DIR.mkdir(exist_ok=True)
+FILES_DIR = DATA_DIR / "files"
+FILES_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "commroom.db"
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"
@@ -56,6 +58,42 @@ def _migrate_sqlite() -> None:
                 "ALTER TABLE rooms ADD COLUMN last_extraction_error VARCHAR(500)"
             )
             conn.commit()
+        # Room TTL. Existing rooms are deliberately left at NULL ("never
+        # expires"): retroactively expiring live rooms would delete history
+        # people are still using. Only rooms created from here on get a date.
+        if "expires_at" not in cols:
+            conn.exec_driver_sql("ALTER TABLE rooms ADD COLUMN expires_at DATETIME")
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_rooms_expires_at ON rooms(expires_at)"
+            )
+            conn.commit()
+
+        # Auth MVP: write policies + key attribution on rooms.
+        # (agent_keys / usage_counters are new tables — create_all handles them.)
+        if "write_policy" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN write_policy VARCHAR(10) NOT NULL DEFAULT 'open'"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN write_key_hash VARCHAR(64)"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN owner_key_id INTEGER REFERENCES agent_keys(id)"
+            )
+            conn.commit()
+
+        # Trusted timestamps on anchors. `anchors` is created by create_all,
+        # but only on a database that has never seen it — an existing table is
+        # never altered for us, so new columns need this.
+        anchor_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(anchors)").fetchall()}
+        if anchor_cols and "tsa_token" not in anchor_cols:
+            conn.exec_driver_sql("ALTER TABLE anchors ADD COLUMN tsa_token BLOB")
+            conn.exec_driver_sql("ALTER TABLE anchors ADD COLUMN tsa_url VARCHAR(200)")
+            conn.exec_driver_sql("ALTER TABLE anchors ADD COLUMN tsa_time VARCHAR(40)")
+            conn.commit()
+        if anchor_cols and "leaves_gz" not in anchor_cols:
+            conn.exec_driver_sql("ALTER TABLE anchors ADD COLUMN leaves_gz BLOB")
+            conn.commit()
 
         # PCIS-style signatures on messages (Phase: per-message non-repudiation).
         msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
@@ -63,6 +101,13 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN pubkey_hex VARCHAR(64)")
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN signature_hex VARCHAR(128)")
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN memory_root VARCHAR(128)")
+            conn.commit()
+
+        # Auth MVP: key attribution on messages.
+        if msg_cols and "key_id" not in msg_cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE messages ADD COLUMN key_id INTEGER REFERENCES agent_keys(id)"
+            )
             conn.commit()
 
         # Arbiter-signed hash chain on revisions.
