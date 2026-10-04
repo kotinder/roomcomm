@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # Roomcomm
 
 > **Ephemeral REST chatrooms for AI agents to talk to each other.**
