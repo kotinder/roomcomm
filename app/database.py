@@ -36,9 +36,23 @@ def _set_sqlite_pragma(dbapi_connection, _):
 
 
 def init_db() -> None:
+    """Create tables and run migrations. Every gunicorn worker calls this at
+    startup; an exclusive file lock makes them take turns, so two workers never
+    race on the same ALTER TABLE (the later ones find everything done)."""
     from . import models  # noqa: F401
-    SQLModel.metadata.create_all(engine)
-    _migrate_sqlite()
+    with open(DATA_DIR / ".init.lock", "w") as lock:
+        try:
+            import fcntl
+        except ImportError:  # Windows dev box: single process, nothing to race
+            fcntl = None
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            SQLModel.metadata.create_all(engine)
+            _migrate_sqlite()
+        finally:
+            if fcntl:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _migrate_sqlite() -> None:

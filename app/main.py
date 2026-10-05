@@ -112,8 +112,19 @@ def _client_ip(request: Request) -> str:
 
 def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
                        limit: int, window: int, what: str) -> None:
-    """Raise 429 if the IP exceeded `limit` events in the sliding `window`."""
+    """Raise 429 if the IP exceeded `limit` events in the sliding `window`.
+    Counted in Redis across all workers; the in-process bucket is the
+    fallback while Redis is unavailable (see app/shared.py)."""
     ip = _client_ip(request)
+    retry = shared.rate_hit(what.replace(" ", "_"), ip, limit, window)
+    if retry is not None:
+        if retry > 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many {what} from this IP. Try again in {retry}s.",
+                headers={"Retry-After": str(retry)},
+            )
+        return
     now = time.monotonic()
     with lock:
         bucket = buckets[ip]
@@ -166,7 +177,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota,
+from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota, shared,
                tg_bot, ttl)
 from .database import SKILLS_DIR, engine, get_session, init_db, DB_PATH
 from .models import (
@@ -214,6 +225,27 @@ log = logging.getLogger("roomcomm")
 # concurrent messages in a premium room don't both call the LLM at the same
 # time and double-insert the same claims.
 _refresh_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# A refresh can wait on the LLM for minutes (retries, slow provider); the
+# cross-worker lock expires after this so a killed worker cannot wedge a room.
+REFRESH_LOCK_TTL = 600
+
+
+@asynccontextmanager
+async def _room_refresh_lock(room_uuid: str):
+    """Serialize arbiter refreshes of one room across tasks AND workers: the
+    asyncio lock covers this process, a Redis lock (app/shared.py) the others.
+    Without Redis it degrades to the per-process lock alone."""
+    async with _refresh_locks[room_uuid]:
+        name = f"refresh:{room_uuid}"
+        token = shared.try_lock(name, REFRESH_LOCK_TTL)
+        while token == "":
+            await asyncio.sleep(0.5)
+            token = shared.try_lock(name, REFRESH_LOCK_TTL)
+        try:
+            yield
+        finally:
+            if token:
+                shared.unlock(name, token)
 
 MAX_MESSAGES_PER_ROOM = 1000
 DEFAULT_LIMIT = 100
@@ -1510,7 +1542,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
 async def _refresh_room_context_bg(room_uuid: str) -> None:
     """Background variant — fresh session, swallows errors to log."""
     try:
-        async with _refresh_locks[room_uuid]:
+        async with _room_refresh_lock(room_uuid):
             from .database import engine as _eng
             with Session(_eng) as s:
                 out = await _process_new_messages_for_room(s, room_uuid)
@@ -1704,7 +1736,7 @@ async def refresh_context(
     if not llm.is_configured():
         raise HTTPException(status_code=503,
                             detail="LLM arbiter not configured on this server")
-    async with _refresh_locks[room_uuid]:
+    async with _room_refresh_lock(room_uuid):
         try:
             out = await _process_new_messages_for_room(session, room_uuid, full=full)
         except llm.LLMUnavailable as e:
@@ -2704,6 +2736,9 @@ _admin_fail_lock = Lock()
 
 
 def _admin_locked_out(ip: str) -> bool:
+    shared_count = shared.rate_count("admin_fail", ip, ADMIN_FAIL_WINDOW)
+    if shared_count is not None:
+        return shared_count >= ADMIN_FAIL_LIMIT
     now = time.monotonic()
     with _admin_fail_lock:
         bucket = _admin_fail_buckets[ip]
@@ -2716,8 +2751,9 @@ def _admin_locked_out(ip: str) -> bool:
 
 
 def _record_admin_fail(ip: str) -> None:
-    with _admin_fail_lock:
-        _admin_fail_buckets[ip].append(time.monotonic())
+    if not shared.rate_add("admin_fail", ip, ADMIN_FAIL_WINDOW):
+        with _admin_fail_lock:
+            _admin_fail_buckets[ip].append(time.monotonic())
     log.warning("admin token mismatch from %s", ip)
 
 

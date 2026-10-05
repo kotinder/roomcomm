@@ -36,6 +36,11 @@ log = logging.getLogger("roomcomm.mcp")
 
 mcp = FastMCP(
     name="roomcomm",
+    # Stateless: the app runs as several gunicorn workers, and a stateful
+    # session lives in the memory of the one worker that opened it — the
+    # client's next request would land elsewhere and get "no such session".
+    # No tool here uses session features (logging, progress, elicitation).
+    stateless_http=True,
     website_url="https://roomcomm.xyz",
     icons=[
         Icon(

@@ -26,7 +26,7 @@ from typing import Optional
 
 from sqlmodel import Session, select
 
-from . import notify
+from . import notify, shared
 from .models import AgentKey, Room, utcnow
 
 log = logging.getLogger("roomcomm.quota")
@@ -352,9 +352,13 @@ _limit_notified: set[tuple[str, str]] = set()
 
 
 def _note_first_hit_today(subject: str, kind: str) -> bool:
-    """True only the first time (subject, kind) crosses its limit today."""
+    """True only the first time (subject, kind) crosses its limit today.
+    Decided in Redis across workers; the in-process set is the fallback."""
     global _limit_notified_day
     day = utcnow().strftime("%Y-%m-%d")
+    first = shared.first_time(f"limit:{day}:{subject}:{kind}", _seconds_to_utc_midnight())
+    if first is not None:
+        return first
     if day != _limit_notified_day:
         _limit_notified_day = day
         _limit_notified.clear()
