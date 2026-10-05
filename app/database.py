@@ -28,6 +28,9 @@ engine = create_engine(
 def _set_sqlite_pragma(dbapi_connection, _):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
+    # The documented setting for WAL: no corruption risk; a power cut may lose
+    # only the last few commits instead of paying an fsync on every one.
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
@@ -133,8 +136,20 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql("DROP TABLE IF EXISTS claim_acks")
             conn.exec_driver_sql("DROP TABLE IF EXISTS claims")
             conn.commit()
+        # "Rooms this key posted in" (inbox) and "the key's last message in a
+        # room" filtered messages by key_id with no index: a full scan of the
+        # table, ~60% of every /api/me/inbox (profile 05.10.2026).
+        msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
+        if {"key_id", "room_uuid"} <= msg_cols:
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_messages_key_room ON messages(key_id, room_uuid)")
+            conn.commit()
 
 
 def get_session():
-    with Session(engine) as session:
+    # expire_on_commit=False: handlers commit mid-request (watermarks, metering)
+    # and then keep using the rows they loaded. With the default, every later
+    # attribute access re-SELECTed its row one by one — the 05.10.2026 profile
+    # of a keyed GET /messages spent ~60% in that N+1 reload of the page.
+    with Session(engine, expire_on_commit=False) as session:
         yield session

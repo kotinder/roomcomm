@@ -157,7 +157,8 @@ class Anchor(SQLModel, table=True):
 
 class Message(SQLModel, table=True):
     __tablename__ = "messages"
-    __table_args__ = (Index("ix_messages_room_id", "room_uuid", "id"),)
+    __table_args__ = (Index("ix_messages_room_id", "room_uuid", "id"),
+                      Index("ix_messages_key_room", "key_id", "room_uuid"))
 
     id: Optional[int] = Field(default=None, primary_key=True)
     room_uuid: str = Field(foreign_key="rooms.uuid", index=True)

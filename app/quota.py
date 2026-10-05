@@ -21,6 +21,7 @@ import logging
 import os
 import secrets
 import threading
+from datetime import timedelta
 from typing import Optional
 
 from sqlmodel import Session, select
@@ -29,6 +30,9 @@ from . import notify
 from .models import AgentKey, Room, utcnow
 
 log = logging.getLogger("roomcomm.quota")
+
+# How stale AgentKey.last_used_at may get before a request refreshes it.
+LAST_USED_RESOLUTION = timedelta(minutes=5)
 
 # Rollout switch: flipped to "hard" via env when phase 1 starts. Tests and the
 # admin may also flip the module attribute directly.
@@ -171,8 +175,17 @@ def resolve_key(session: Session, authorization: Optional[str]) -> Optional[Agen
         raise AuthError("key revoked", status=403)
     if key.tier == "blocked":
         raise AuthError("key blocked", status=403)
-    key.last_used_at = utcnow()
-    session.add(key)
+    # Coarse on purpose. Touching it on every request turned each keyed READ
+    # into a write transaction: SQLite serializes writers, and the 05.10.2026
+    # profile spent most of a keyed GET waiting for that lock (autoflush of
+    # this UPDATE). "Last used" to the minute is all the admin page needs.
+    now = utcnow()
+    last = key.last_used_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=now.tzinfo)
+    if last is None or now - last >= LAST_USED_RESOLUTION:
+        key.last_used_at = now
+        session.add(key)
     return key
 
 
