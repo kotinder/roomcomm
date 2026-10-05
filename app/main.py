@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import tarfile
 import time
 import uuid as uuid_lib
@@ -167,7 +168,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
 
 from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota,
                tg_bot, ttl)
-from .database import SKILLS_DIR, engine, get_session, init_db
+from .database import SKILLS_DIR, engine, get_session, init_db, DB_PATH
 from .models import (
     AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
     Room, RoomSeen, Skill, UsageCounter, utcnow,
@@ -407,6 +408,71 @@ class _AdminCallerMiddleware:
 
 
 app.add_middleware(_AdminCallerMiddleware)
+
+
+# ---------- Overload shedding ----------
+# One uvicorn process = one core. Load test 05.10.2026: at ~40 req/s the queue
+# grew without bound, the DB pool timed out, and the process stayed pegged for
+# 4 minutes after the load stopped, serving nobody, until a restart. Past
+# MAX_INFLIGHT concurrent requests we answer 503 at once instead of queueing,
+# so overload costs some requests, never the whole service. Outermost
+# middleware (added last), so a shed request touches nothing — no stats row,
+# no DB. /mcp holds long-lived streams and has its own nginx budget; /healthz
+# must answer under shedding (that is how the watchdog tells "busy" from "hung").
+MAX_INFLIGHT = int(os.environ.get("ROOMCOMM_MAX_INFLIGHT", "32") or 0)
+_SHED_EXEMPT = ("/mcp", "/healthz", "/static/")
+_inflight = 0
+_shed_total = 0
+
+
+class _ShedMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        global _inflight, _shed_total
+        if (scope["type"] != "http" or MAX_INFLIGHT <= 0
+                or scope["path"].startswith(_SHED_EXEMPT)):
+            await self.app(scope, receive, send)
+            return
+        if _inflight >= MAX_INFLIGHT:
+            _shed_total += 1
+            if _shed_total % 100 == 1:
+                log.warning("overloaded: shedding (%d in flight, %d shed since start)",
+                            _inflight, _shed_total)
+            body = (b'{"detail":"overloaded: the server is at capacity right now. '
+                    b'Retry after a few seconds; nothing was lost or recorded."}')
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"retry-after", b"2"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        _inflight += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _inflight -= 1
+
+
+app.add_middleware(_ShedMiddleware)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Liveness for the host watchdog. Runs on the event loop with its own
+    sqlite3 connection — neither the threadpool nor the SQLAlchemy pool, which
+    are exactly what is exhausted under overload — so a slow answer here means
+    the process itself is stuck, not merely busy."""
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=2)
+        try:
+            con.execute("SELECT 1").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        return JSONResponse({"ok": False, "db": repr(e)}, status_code=503)
+    return {"ok": True, "inflight": _inflight, "shed_total": _shed_total}
 
 
 @app.exception_handler(Exception)

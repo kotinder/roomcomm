@@ -11,9 +11,16 @@ FILES_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "commroom.db"
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"
+# Pool sized to the overload cap (ROOMCOMM_MAX_INFLIGHT, 32 by default in
+# main.py) plus background work (arbiter, notify): SQLite connections are cheap.
+# A short pool_timeout fails a starved request in 5 s instead of the default 30 s
+# — at 30 s, the 05.10.2026 load test piled up requests until the process hung.
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},
+    pool_size=10,
+    max_overflow=30,
+    pool_timeout=5,
 )
 
 

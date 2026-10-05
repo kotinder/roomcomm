@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart the commroom container when /healthz stops answering
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/bin/bash /usr/local/bin/commroom-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
