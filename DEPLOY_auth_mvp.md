@@ -24,7 +24,7 @@
     cd /home/deploy/commroom
     docker build -t commroom .
     docker stop commroom && docker rm commroom   # контейнер, НЕ volume!
-    docker run -d --name commroom --restart unless-stopped \
+    docker run -d --name commroom --network commroom-net --restart unless-stopped \
       -p 127.0.0.1:8000:8000 -v commroom_data:/app/data \
       --env-file /home/deploy/commroom/.env commroom
 
