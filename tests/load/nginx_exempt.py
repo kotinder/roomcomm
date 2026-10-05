@@ -9,7 +9,7 @@ name too, because snippets/tg-console.conf and snippets/victus-q.conf use it.
 import re
 import sys
 
-EXEMPT = ["132.243.238.233", "127.0.0.1"]
+EXEMPT = ["132.243.238.233", "87.242.85.49", "127.0.0.1"]  # sg, mannov.ru VM, local sampler
 path = sys.argv[1]
 s = open(path, encoding="utf-8").read()
 if "$lt_key" in s:

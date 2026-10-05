@@ -26,11 +26,14 @@ TIMEOUT = aiohttp.ClientTimeout(total=15)
 ABORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ABORT")
 
 PHASES = {
-    "read":  {"rates": [5, 10, 20, 40, 80, 160, 240, 320], "write_share": 0.0},
-    "mixed": {"rates": [5, 10, 20, 40, 80, 160, 240], "write_share": 0.2},
-    "write": {"rates": [2, 5, 10, 20, 40, 80, 120], "write_share": 1.0},
-    "a2a":   {"rates": [2, 5, 10, 20, 40, 80], "a2a": True},
+    "read":  {"rates": [10, 20, 40, 60, 80, 120, 160, 240], "write_share": 0.0},
+    "mixed": {"rates": [10, 20, 40, 60, 80, 120, 160], "write_share": 0.2},
+    "write": {"rates": [5, 10, 20, 40, 60, 80, 120], "write_share": 1.0},
+    "a2a":   {"rates": [5, 10, 20, 40, 60, 80], "a2a": True},
 }
+# Several generators split one nominal rate: each runs RATE_MULT of it
+# (two machines -> 0.5), so the step labels stay the combined load.
+RATE_MULT = float(os.environ.get("RATE_MULT", "1"))
 
 cfg = json.load(open(sys.argv[1]))
 OUT = open(sys.argv[2], "a", buffering=1)
@@ -159,7 +162,7 @@ async def run_step(sess, canary, phase, rate):
     st = Step()
     tasks = set()
     t_end = time.monotonic() + STEP_S
-    interval = 1.0 / rate
+    interval = 1.0 / (rate * RATE_MULT)
     nxt = time.monotonic()
     abort = None
     while time.monotonic() < t_end:
@@ -185,7 +188,7 @@ async def run_step(sess, canary, phase, rate):
         await asyncio.wait(tasks, timeout=20)
     sent = sum(st.codes.values())
     res = dict(phase=phase, rate=rate, sent=sent, dropped=st.dropped,
-               achieved_rps=round(sent / STEP_S, 1),
+               achieved_rps=round(sent / STEP_S, 1), rate_mult=RATE_MULT,
                p50=pct(st.lat, .5), p95=pct(st.lat, .95), p99=pct(st.lat, .99),
                max=pct(st.lat, 1.0), err=st.err,
                err_rate=round(st.err / sent, 4) if sent else None,
