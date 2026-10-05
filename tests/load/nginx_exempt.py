@@ -21,5 +21,10 @@ head = ("# LOADTEST: temporary, restore the backup when done\n"
 s, n_zones = re.subn(r"^limit_req_zone \$binary_remote_addr zone=([a-z_0-9]+):",
                      r"limit_req_zone $lt_key zone=\1_lt:", s, flags=re.M)
 s, n_uses = re.subn(r"(limit_req zone=)([a-z_0-9]+) ", r"\1\2_lt ", s)
+# The per-IP connection limit too (the all-clients safety net stays as is):
+# a far-away generator holds many connections open just from its round trip.
+s, n_conn = re.subn(r"^limit_conn_zone \$binary_remote_addr zone=commroom_ip:",
+                    r"limit_conn_zone $lt_key zone=commroom_ip_lt:", s, flags=re.M)
+s = s.replace("limit_conn commroom_ip ", "limit_conn commroom_ip_lt ")
 open(path, "w", encoding="utf-8").write(head + s)
-print(f"zones renamed: {n_zones}, uses renamed: {n_uses}")
+print(f"zones renamed: {n_zones}, uses renamed: {n_uses}, conn zones: {n_conn}")

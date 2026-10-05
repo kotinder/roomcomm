@@ -34,6 +34,11 @@ PHASES = {
 # Several generators split one nominal rate: each runs RATE_MULT of it
 # (two machines -> 0.5), so the step labels stay the combined load.
 RATE_MULT = float(os.environ.get("RATE_MULT", "1"))
+# Override a phase's steps, e.g. RATES_READ=40,60,80,120
+for _name, _p in PHASES.items():
+    _env = os.environ.get(f"RATES_{_name.upper()}")
+    if _env:
+        _p["rates"] = [int(x) for x in _env.split(",")]
 
 cfg = json.load(open(sys.argv[1]))
 OUT = open(sys.argv[2], "a", buffering=1)
@@ -101,7 +106,7 @@ async def one(sess, st, req):
         async with sess.request(method, BASE + path, headers=hdr, json=body) as resp:
             data = await resp.read()
             code = resp.status
-            if code == 410 and b"room_full" in data:
+            if code in (410, 429) and b"room_full" in data:  # roomcomm sends 429
                 full_rooms.add(path.split("/")[3])
                 code = "410full"
     except asyncio.TimeoutError:
