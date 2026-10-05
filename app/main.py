@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import tarfile
 import time
 import uuid as uuid_lib
@@ -261,8 +262,11 @@ async def lifespan(app_: FastAPI):
     from .mcp_server import mcp_lifespan as _mcp_lifespan  # lazy — avoids circular import
     init_db()
     _prune_hits()
-    async with _mcp_lifespan(app_):
-        yield
+    try:
+        async with _mcp_lifespan(app_):
+            yield
+    finally:
+        _flush_hits()  # a graceful stop/restart keeps the buffered stats
 
 
 app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", lifespan=lifespan)
@@ -320,22 +324,55 @@ def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
     return None
 
 
+# Hits are buffered per worker and written in one transaction every
+# HIT_FLUSH_SECONDS: one write transaction per page view / MCP call / post
+# competed for SQLite's single writer lock with the app's real writes once
+# there were several workers (load test 05.10.2026: "database is locked").
+# Stats only — a crash loses at most the last few seconds of counts.
+HIT_FLUSH_SECONDS = 5.0
+_hit_buf: list[Hit] = []
+_hit_lock = Lock()
+_hit_flusher: Optional[threading.Thread] = None
+
+
 def _record_hit(event: str, path: str, headers: dict, client_host: str) -> None:
     # Same trust model as _client_ip: X-Real-IP is set by nginx, XFF is not trusted.
     ip = (headers.get("x-real-ip") or "").strip() or client_host
+    hit = Hit(
+        day=utcnow().strftime("%Y-%m-%d"),
+        event=event,
+        ip=ip[:45],
+        user_agent=(headers.get("user-agent") or "")[:200],
+        referer=(headers.get("referer") or "")[:300],
+        path=path[:200],
+    )
+    global _hit_flusher
+    with _hit_lock:
+        _hit_buf.append(hit)
+        if _hit_flusher is None or not _hit_flusher.is_alive():
+            _hit_flusher = threading.Thread(target=_hit_flush_loop, daemon=True,
+                                            name="hit-flusher")
+            _hit_flusher.start()
+
+
+def _flush_hits() -> None:
+    with _hit_lock:
+        batch = _hit_buf[:]
+        _hit_buf.clear()
+    if not batch:
+        return
     try:
         with Session(engine) as s:
-            s.add(Hit(
-                day=utcnow().strftime("%Y-%m-%d"),
-                event=event,
-                ip=ip[:45],
-                user_agent=(headers.get("user-agent") or "")[:200],
-                referer=(headers.get("referer") or "")[:300],
-                path=path[:200],
-            ))
+            s.add_all(batch)
             s.commit()
     except Exception:
-        log.exception("failed to record hit")
+        log.exception("failed to record %d hits", len(batch))
+
+
+def _hit_flush_loop() -> None:
+    while True:
+        time.sleep(HIT_FLUSH_SECONDS)
+        _flush_hits()
 
 
 def _prune_hits() -> None:
