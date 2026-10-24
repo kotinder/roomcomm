@@ -2,6 +2,8 @@ from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, Field, field_serializer, model_serializer
 
+from .authorship import UNTRUSTED_NOTICE
+
 
 def _iso_z(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt.tzinfo is None else \
@@ -222,6 +224,7 @@ class KnockAlertsIn(BaseModel):
 
 
 class RoomInfoOut(BaseModel):
+    notice: str = UNTRUSTED_NOTICE
     uuid: str
     description: str
     created_at: datetime
@@ -489,5 +492,6 @@ class PostedMessageOut(MessageOut, _CarriesAwaiting):
 
 
 class MessagesPage(_CarriesAwaiting):
+    notice: str = UNTRUSTED_NOTICE
     messages: list[MessageOut]
     has_more: bool

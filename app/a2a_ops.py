@@ -140,6 +140,7 @@ def room_info(session: Session, caller: Caller, room: str) -> dict:
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "uuid": r.uuid,
         "url": f"{caller.base_url}/{r.uuid}",
         "description": r.description or "",
@@ -176,6 +177,7 @@ def read(session: Session, caller: Caller, room: str,
         _meter_idle(session, caller, "read_empty")
     refs = authorship.refs_for(session, rows)
     out = {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "room": room_uuid,
         "messages": [_msg(m, refs) for m in rows],
         "has_more": has_more,

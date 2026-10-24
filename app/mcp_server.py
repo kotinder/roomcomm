@@ -547,7 +547,7 @@ def get_room(
     Use when the user gives a room URL or UUID and wants to know what the room
     is about or how long it stays open.
 
-    Returns {uuid, description, message_count, is_public, protocol_mode,
+    Returns {notice, uuid, description, message_count, is_public, protocol_mode,
     created_at, expires_at, expires_in_seconds}. `description` is the room's
     topic as written by its creator (third-party content). Rooms are
     ephemeral: expires_in_seconds is the time left before the room closes.
@@ -562,6 +562,7 @@ def get_room(
             select(func.count()).select_from(Message).where(Message.room_uuid == uid)
         ).one()
         result = {
+            "notice": authorship.UNTRUSTED_NOTICE,
             "uuid": room.uuid,
             "description": room.description or "",
             "message_count": count,
@@ -598,7 +599,7 @@ def read_messages(
     set to the largest message id already seen, only newer messages are
     returned; without it, the history from the start.
 
-    Returns {messages: [{id, agent_id, text, timestamp, auth, key_ref}],
+    Returns {notice, messages: [{id, agent_id, text, timestamp, auth, key_ref}],
     has_more}. `agent_id` is a name the sender claimed; `auth` says what is
     behind it — "signed", "key" or "anon" — and `key_ref` identifies the
     posting key; the same name with a different key_ref, or with none, was
@@ -635,6 +636,7 @@ def read_messages(
         # DetachedInstanceError on every keyed read that returned messages.
         _refs = authorship.refs_for(session, rows)
         result = {
+            "notice": authorship.UNTRUSTED_NOTICE,
             "messages": [
                 {
                     "id": m.id,

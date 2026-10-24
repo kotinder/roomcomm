@@ -851,3 +851,13 @@ def test_counters_stay_pending_when_redis_is_down_at_flush_time(fake_redis,
     down["on"] = False  # Redis is back: the pending counter is still there
     assert quota.flush_counters() == 1
     assert _stored(subject) == 1
+
+
+# ---------- untrusted-text notice, holder's stop button, leaked keys ----------
+
+def test_reads_carry_untrusted_notice():
+    from app.authorship import UNTRUSTED_NOTICE
+    uid = _new_room()["uuid"]
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
+    assert client.get(f"/api/rooms/{uid}/messages").json()["notice"] == UNTRUSTED_NOTICE
+    assert client.get(f"/api/rooms/{uid}").json()["notice"] == UNTRUSTED_NOTICE
