@@ -1351,7 +1351,7 @@ def post_message(
         payload.agent_id, key, quota.PREMIUM_TIERS)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
-    if quota.burn_leaked_keys(session, payload.text):
+    if quota.burn_leaked_keys(session, payload.text, payload.agent_id):
         session.commit()
         raise HTTPException(status_code=422, detail=quota.LEAKED_KEY_REASON)
 

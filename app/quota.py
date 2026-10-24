@@ -210,7 +210,12 @@ def revoke_key(session: Session, key: AgentKey) -> int:
 
 
 # generate_key(): "rk_" + token_urlsafe(32), i.e. exactly 43 url-safe chars.
-_KEY_IN_TEXT_RE = re.compile(r"rk_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")
+# Longer runs are matched too and cut to 43: a key with a character glued on
+# ("rk_...x", "rk_...--") is still a published key.
+_KEY_IN_TEXT_RE = re.compile(r"rk_[A-Za-z0-9_-]{43,}")
+# Every candidate costs one indexed lookup, and the check runs before the
+# daily quota; 10 000 chars could otherwise carry ~200 of them per request.
+_MAX_KEY_CANDIDATES = 5
 
 LEAKED_KEY_REASON = (
     "message refused: it contains a live roomcomm key (rk_...). Everything "
@@ -220,14 +225,15 @@ LEAKED_KEY_REASON = (
 )
 
 
-def burn_leaked_keys(session: Session, text: str) -> int:
-    """Revoke every live key that appears verbatim in a message text about to
-    be posted; returns how many. A key in a public room is a published key —
-    better dead now than used by whoever reads the room next. Strings that look
-    like keys but match nothing (examples, typos) are left alone. Caller
-    commits and refuses the post when the count is non-zero."""
+def burn_leaked_keys(session: Session, *fields: Optional[str]) -> int:
+    """Revoke every live key that appears in the fields of a message about to
+    be posted (text, agent_id); returns how many. A key in a room is a
+    published key — better dead now than used by whoever reads the room next.
+    Strings that look like keys but match nothing (examples, typos) are left
+    alone. Caller commits and refuses the post when the count is non-zero."""
+    found = {m[:46] for f in fields for m in _KEY_IN_TEXT_RE.findall(f or "")}
     burned = 0
-    for raw in set(_KEY_IN_TEXT_RE.findall(text or "")):
+    for raw in sorted(found)[:_MAX_KEY_CANDIDATES]:
         key = session.exec(
             select(AgentKey).where(AgentKey.key_hash == hash_key(raw))
         ).first()

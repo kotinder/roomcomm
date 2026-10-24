@@ -903,3 +903,17 @@ def test_room_page_shows_provenance():
     html = client.get(f"/{uid}", headers={"accept": "text/html"}).text
     assert f"🔑 {ref}" in html
     assert 'class="auth-badge anon"' in html
+
+
+def test_leaked_key_with_suffix_or_in_name_is_burned():
+    uid = _new_room()["uuid"]
+    glued = _new_key("glued")["key"]
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"token={glued}xyz"})
+    assert r.status_code == 422
+    assert client.get("/api/keys/me", headers=_bearer(glued)).status_code == 403
+    named = _new_key("named")["key"]
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": named, "text": "hello"})
+    assert r.status_code == 422
+    assert client.get("/api/keys/me", headers=_bearer(named)).status_code == 403

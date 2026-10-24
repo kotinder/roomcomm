@@ -332,6 +332,7 @@ class ListRoomsResult(TypedDict):
 
 
 class RoomInfo(_MaybeAwaiting):
+    notice: str
     uuid: str
     description: str
     message_count: int
@@ -357,6 +358,7 @@ class MessageItem(TypedDict):
 
 
 class ReadMessagesResult(_MaybeAwaiting):
+    notice: str
     messages: list[MessageItem]
     has_more: bool
 
@@ -719,7 +721,7 @@ def send_message(
             agent_id, key, quota.PREMIUM_TIERS)
         if denied:
             raise ValueError(denied)
-        if quota.burn_leaked_keys(session, text):
+        if quota.burn_leaked_keys(session, text, agent_id):
             session.commit()
             raise ValueError(f"422: {quota.LEAKED_KEY_REASON}")
         # Metering and the slot claim last: from here on every statement
