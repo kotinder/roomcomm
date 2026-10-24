@@ -2907,6 +2907,7 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         {
             "room": room,
             "messages": msgs,
+            "key_refs": authorship.refs_for(session, msgs),
             "not_found": False,
             "short_uuid": room.uuid[:8],
             "agent_md": agent_md,

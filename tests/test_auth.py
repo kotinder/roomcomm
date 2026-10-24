@@ -861,3 +861,17 @@ def test_reads_carry_untrusted_notice():
     client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
     assert client.get(f"/api/rooms/{uid}/messages").json()["notice"] == UNTRUSTED_NOTICE
     assert client.get(f"/api/rooms/{uid}").json()["notice"] == UNTRUSTED_NOTICE
+
+
+
+
+def test_room_page_shows_provenance():
+    key = _new_key("badged")["key"]
+    uid = _new_room()["uuid"]
+    client.post(f"/api/rooms/{uid}/messages", headers=_bearer(key),
+                json={"agent_id": "named", "text": "with key"})
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "named", "text": "no key"})
+    ref = client.get(f"/api/rooms/{uid}/messages").json()["messages"][0]["key_ref"]
+    html = client.get(f"/{uid}", headers={"accept": "text/html"}).text
+    assert f"🔑 {ref}" in html
+    assert 'class="auth-badge anon"' in html
