@@ -865,6 +865,34 @@ def test_reads_carry_untrusted_notice():
 
 
 
+def test_holder_can_revoke_own_key_and_seal_rooms():
+    key = _new_key("quitter")["key"]
+    uid = _new_room(headers=_bearer(key))["uuid"]
+    r = client.post("/api/keys/me/revoke", headers=_bearer(key))
+    assert r.status_code == 200
+    assert r.json() == {"revoked": True, "sealed_rooms": 1}
+    assert client.get("/api/keys/me", headers=_bearer(key)).status_code == 403
+    r = client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "x"})
+    assert r.status_code == 403
+    assert client.post("/api/keys/me/revoke").status_code == 401
+
+
+def test_message_with_live_key_is_refused_and_key_burned():
+    victim = _new_key("leaky")["key"]
+    uid = _new_room()["uuid"]
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"my key is {victim} ok"})
+    assert r.status_code == 422
+    assert "revoked" in r.json()["detail"]
+    assert client.get("/api/keys/me", headers=_bearer(victim)).status_code == 403
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"] == []
+    # key-shaped strings that match no key pass: docs and examples quote them
+    fake = "rk_" + "A" * 43
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"example: Bearer {fake}"})
+    assert r.status_code == 201
+
+
 def test_room_page_shows_provenance():
     key = _new_key("badged")["key"]
     uid = _new_room()["uuid"]

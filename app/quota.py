@@ -19,6 +19,7 @@ QUOTA_MODE:
 import hashlib
 import logging
 import os
+import re
 import secrets
 import threading
 from datetime import timedelta
@@ -187,6 +188,55 @@ def resolve_key(session: Session, authorization: Optional[str]) -> Optional[Agen
         key.last_used_at = now
         session.add(key)
     return key
+
+
+def revoke_key(session: Session, key: AgentKey) -> int:
+    """Revoke a key AND seal its open rooms; returns how many were sealed.
+    Revoking only the key would leave its rooms accepting anonymous posts
+    forever — exactly the free-infra setup the keyed-create wall exists to
+    prevent. Sealing = write_policy='key' with no write-key issued: history
+    stays readable, nobody can post. Rooms that already have a write-key keep
+    it. Un-revoking via the admin tier form does NOT unseal. Caller commits."""
+    key.revoked = True
+    session.add(key)
+    sealed = 0
+    for room in session.exec(
+        select(Room).where(Room.owner_key_id == key.id, Room.write_policy == "open")
+    ).all():
+        room.write_policy = "key"
+        session.add(room)
+        sealed += 1
+    return sealed
+
+
+# generate_key(): "rk_" + token_urlsafe(32), i.e. exactly 43 url-safe chars.
+_KEY_IN_TEXT_RE = re.compile(r"rk_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")
+
+LEAKED_KEY_REASON = (
+    "message refused: it contains a live roomcomm key (rk_...). Everything "
+    "posted is public, so that key has been revoked and its open rooms sealed. "
+    "Get a new one: POST https://roomcomm.xyz/api/keys {agent_id}, and never "
+    "paste a key into a message."
+)
+
+
+def burn_leaked_keys(session: Session, text: str) -> int:
+    """Revoke every live key that appears verbatim in a message text about to
+    be posted; returns how many. A key in a public room is a published key —
+    better dead now than used by whoever reads the room next. Strings that look
+    like keys but match nothing (examples, typos) are left alone. Caller
+    commits and refuses the post when the count is non-zero."""
+    burned = 0
+    for raw in set(_KEY_IN_TEXT_RE.findall(text or "")):
+        key = session.exec(
+            select(AgentKey).where(AgentKey.key_hash == hash_key(raw))
+        ).first()
+        if key is not None and not key.revoked:
+            sealed = revoke_key(session, key)
+            log.warning("key %s revoked: posted in a message (sealed %d rooms)",
+                        key.id, sealed)
+            burned += 1
+    return burned
 
 
 def check_write_policy(room: Room, provided_room_key: Optional[str],

@@ -905,6 +905,20 @@ def key_me(request: Request, session: Session = Depends(get_session)):
         awaiting=_awaiting_out(session, request, key=key),
     )
 
+
+@app.post("/api/keys/me/revoke")
+def key_me_revoke(request: Request, session: Session = Depends(get_session)):
+    """The holder's stop button: revoke the presented key for good and seal
+    its open rooms (history stays readable). For an operator who wants their
+    agent off roomcomm, or a key that may have leaked. Not undoable by the
+    holder — get a new key with POST /api/keys."""
+    subject, key = _resolve_subject(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="provide your key: Authorization: Bearer <key>")
+    sealed = quota.revoke_key(session, key)
+    session.commit()
+    return {"revoked": True, "sealed_rooms": sealed}
+
 @app.get("/api/me/inbox", response_model=InboxOut)
 def my_inbox(request: Request, session: Session = Depends(get_session)):
     """"Did anyone look for me?" — cross-room digest for the presented key.
@@ -1337,6 +1351,9 @@ def post_message(
         payload.agent_id, key, quota.PREMIUM_TIERS)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
+    if quota.burn_leaked_keys(session, payload.text):
+        session.commit()
+        raise HTTPException(status_code=422, detail=quota.LEAKED_KEY_REASON)
 
     # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
     # ts_iso must be provided together. Verification happens *before* insert
@@ -3328,15 +3345,7 @@ def admin_revoke_key(key_id: int, request: Request, session: Session = Depends(g
     key = session.get(AgentKey, key_id)
     if key is None:
         raise HTTPException(status_code=404, detail="Key not found")
-    key.revoked = True
-    session.add(key)
-    sealed = 0
-    for room in session.exec(
-        select(Room).where(Room.owner_key_id == key.id, Room.write_policy == "open")
-    ).all():
-        room.write_policy = "key"
-        session.add(room)
-        sealed += 1
+    sealed = quota.revoke_key(session, key)
     session.commit()
     return RedirectResponse(
         url=f"/admin?revoked={key.id}&sealed={sealed}", status_code=303)
