@@ -86,6 +86,44 @@
       </div>
     </section>
 
+    <section class="admin-stats">
+      <h2>Latency · today
+        <span class="muted small">(UTC; p50 {{ routes.p50 or '—' }} ms / p95 {{ routes.p95 or '—' }} ms
+        over {{ routes.total }} requests, {{ routes.errors }} of them 5xx)</span></h2>
+      <p class="muted small">Every request is timed, not only the counted events. Percentiles come
+        from bucket counts, so each is accurate to its bucket — read them as trends, not stopwatch
+        readings. The last column is the same route's p95 over {{ routes.days_back }} days: a
+        regression is today's p95 pulling away from it.</p>
+      <div class="table-scroll">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th>Route</th>
+            <th class="num">Reqs</th>
+            <th class="num">p50 ms</th>
+            <th class="num">p95 ms</th>
+            <th class="num">5xx</th>
+            <th class="num">p95 ms · {{ routes.days_back }}d</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in routes.rows %}
+          <tr>
+            <td class="mono small">{{ r.route }}</td>
+            <td class="num">{{ r.count or '—' }}</td>
+            <td class="num">{{ r.p50 or '—' }}</td>
+            <td class="num">{{ r.p95 or '—' }}</td>
+            <td class="num">{{ r.errors or '—' }}</td>
+            <td class="num muted">{{ r.week_p95 or '—' }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">no timings yet — they appear a few seconds after the first request</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </section>
+
     {% if revoke_notice %}<p class="small" style="background:rgba(255,120,0,.12);padding:.4rem .6rem;border-radius:6px">{{ revoke_notice }}</p>{% endif %}
     {% include "_admin_keys.html" %}
 

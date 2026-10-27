@@ -182,8 +182,8 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, knock, llm, notify, pcis,
-               posting, quota, shared, tg_bot, ttl)
+from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, notify,
+               pcis, posting, quota, shared, tg_bot, ttl)
 from .database import (SKILLS_DIR, engine, get_session, init_db, wal_checkpoint,
                        DB_PATH)
 from .models import (
@@ -270,7 +270,7 @@ STATIC_DIR = BASE_DIR.parent / "static"
 async def lifespan(app_: FastAPI):
     from .mcp_server import mcp_lifespan as _mcp_lifespan  # lazy — avoids circular import
     init_db()
-    _prune_hits()
+    _prune_stats()
     _ensure_flusher()
     try:
         async with _mcp_lifespan(app_):
@@ -280,6 +280,7 @@ async def lifespan(app_: FastAPI):
         # usage that has not reached usage_counters yet.
         _flush_hits()
         quota.flush_counters()
+        latency.flush()
 
 
 app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", lifespan=lifespan)
@@ -401,22 +402,36 @@ def _hit_flush_loop() -> None:
         except Exception:
             log.exception("quota counter flush failed")
         try:
+            latency.flush()
+        except Exception:
+            log.exception("latency flush failed")
+        try:
             wal_checkpoint()
         except Exception:
             log.exception("wal checkpoint failed")
 
 
-def _prune_hits() -> None:
+def _prune_stats() -> None:
     cutoff = (utcnow() - timedelta(days=HITS_RETENTION_DAYS)).strftime("%Y-%m-%d")
     with Session(engine) as s:
         s.exec(delete(Hit).where(Hit.day < cutoff))
+        latency.prune(s, cutoff)
         s.commit()
 
 
 class _StatsMiddleware:
     """Pure ASGI middleware — BaseHTTPMiddleware would buffer/interfere with
     the long-lived SSE streams on /mcp. Records the event as soon as the
-    response status is known (SSE responses may never complete)."""
+    response status is known (SSE responses may never complete).
+
+    Also times every request, counted or not: the hit events are a usage
+    signal and deliberately skip most of the surface (reads, errors, the
+    whole API), while app/latency.py needs all of it to answer "what is slow".
+    The clock stops at the response head for the same reason the event is
+    recorded there — an SSE stream on /mcp is open for minutes, and its first
+    byte is the part that has to be fast. Recording is a dict update, so it
+    stays on the event loop; only the hit row, which allocates and may hit
+    the DB, is worth a thread hop."""
 
     def __init__(self, app):
         self.app = app
@@ -427,9 +442,18 @@ class _StatsMiddleware:
             return
         method = scope["method"]
         path = scope["path"]
+        started = time.perf_counter()
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
+                # The router has run by now and wrote its match into the same
+                # scope dict, so path_params/endpoint are there to read.
+                latency.record(
+                    latency.route_label(method, path, scope.get("path_params"),
+                                        "endpoint" in scope),
+                    (time.perf_counter() - started) * 1000.0,
+                    message["status"],
+                )
                 event = _classify_hit(method, path, message["status"])
                 if event:
                     headers = {
@@ -3253,6 +3277,7 @@ def _render_admin(request: Request, session: Session):
          "arena_count": arena_count,
          "room_count": len(items) - arena_count,
          "stats": _admin_stats(session),
+         "routes": latency.route_table(session),
          "keys": _admin_keys(session),
          "top_subjects": _admin_top_subjects(session),
          "quota_mode": quota.QUOTA_MODE,

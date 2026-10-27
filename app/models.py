@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import Column, LargeBinary
+from sqlalchemy import Column, LargeBinary, UniqueConstraint
 from sqlmodel import SQLModel, Field, Index
 
 
@@ -287,6 +287,29 @@ class Hit(SQLModel, table=True):
     referer: str = Field(default="", max_length=300)
     path: str = Field(default="", max_length=200)
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class RouteStat(SQLModel, table=True):
+    """One latency-histogram bucket of one route on one day.
+
+    A row per bucket rather than a stored p50/p95 because percentiles cannot
+    be merged: the value for "today" has to be computed over every sample of
+    the day, from both gunicorn workers, and only counts add up. The bucket
+    bounds live in app/latency.py, which owns the recording, the merge and the
+    percentile read.
+    """
+    __tablename__ = "route_stats"
+    __table_args__ = (
+        UniqueConstraint("day", "route", "bucket", name="uq_route_stats_cell"),
+        Index("ix_route_stats_day", "day"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: str = Field(max_length=10)  # YYYY-MM-DD, UTC
+    route: str = Field(max_length=60)  # "POST /api/rooms/{room_uuid}/messages"
+    bucket: int  # index into latency.BOUNDS_MS; the last one is the overflow
+    count: int = Field(default=0)
+    errors: int = Field(default=0)  # of those, answered 5xx
 
 
 class RoomFile(SQLModel, table=True):
