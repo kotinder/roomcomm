@@ -154,3 +154,58 @@ def unlock(name: str, token: str) -> None:
         r.eval(_UNLOCK_LUA, 1, f"{PREFIX}lock:{name}", token)
     except Exception as e:
         _failed(e)
+
+
+# Daily usage counters (quota.py). One INCR instead of a SQLite write
+# transaction per metered request; the SQLite table is caught up in one batch
+# every few seconds (quota.flush_counters). A counter absent from Redis is
+# seeded from its stored value first, so a Redis restart does not hand
+# everyone a fresh budget — see counter_incr / counter_seed_incr below.
+_INCR_IF_EXISTS_LUA = ("if redis.call('EXISTS', KEYS[1]) == 1 then "
+                       "return redis.call('INCR', KEYS[1]) else return -1 end")
+# SET NX then INCR, so two workers seeding the same counter at once cannot
+# lose a count: whoever loses the SET still increments the winner's value.
+_SEED_INCR_LUA = ("redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX') "
+                  "return redis.call('INCR', KEYS[1])")
+
+
+def counter_incr(key: str) -> Optional[int]:
+    """Increment counter `key` and return its new value. -1 when the counter
+    does not exist yet (the caller seeds it with counter_seed_incr), None when
+    Redis is unavailable."""
+    r = _r()
+    if r is None:
+        return None
+    try:
+        return int(r.eval(_INCR_IF_EXISTS_LUA, 1, f"{PREFIX}q:{key}"))
+    except Exception as e:
+        _failed(e)
+        return None
+
+
+def counter_seed_incr(key: str, base: int, ttl: int) -> Optional[int]:
+    """Create counter `key` at `base` (expiring in `ttl` s) unless another
+    worker just did, then increment. Returns the new value, or None."""
+    r = _r()
+    if r is None:
+        return None
+    try:
+        return int(r.eval(_SEED_INCR_LUA, 1, f"{PREFIX}q:{key}",
+                          base, max(1, int(ttl))))
+    except Exception as e:
+        _failed(e)
+        return None
+
+
+def counter_get(keys: list[str]) -> Optional[list[Optional[int]]]:
+    """Current values of several counters, None per counter that does not
+    exist, or None for the whole call when Redis is unavailable."""
+    r = _r()
+    if r is None or not keys:
+        return None if r is None else []
+    try:
+        raw = r.mget([f"{PREFIX}q:{k}" for k in keys])
+        return [None if v is None else int(v) for v in raw]
+    except Exception as e:
+        _failed(e)
+        return None

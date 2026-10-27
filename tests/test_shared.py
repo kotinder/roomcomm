@@ -81,3 +81,31 @@ def test_app_rate_limit_is_shared_through_redis(fake_redis):
     with pytest.raises(HTTPException) as e:
         main._check_msg_rate(req)
     assert e.value.status_code == 429
+
+
+# ---------- daily usage counters (quota.py's storage) ----------
+
+def test_counters_fall_back_without_redis(monkeypatch):
+    monkeypatch.setattr(shared, "REDIS_URL", "")
+    assert shared.counter_incr("ip:1.2.3.4:2026-10-27:msg") is None
+    assert shared.counter_seed_incr("ip:1.2.3.4:2026-10-27:msg", 5, 60) is None
+    assert shared.counter_get(["ip:1.2.3.4:2026-10-27:msg"]) is None
+
+
+def test_counter_incr_reports_an_absent_counter(fake_redis):
+    assert shared.counter_incr("key:1:2026-10-27:msg") == -1
+
+
+def test_seeding_carries_the_stored_value_over(fake_redis):
+    # The counter was at 40 in usage_counters when Redis came up empty.
+    assert shared.counter_seed_incr("key:1:2026-10-27:msg", 40, 3600) == 41
+    assert shared.counter_incr("key:1:2026-10-27:msg") == 42
+    # A second seeder does not reset the counter it finds.
+    assert shared.counter_seed_incr("key:1:2026-10-27:msg", 40, 3600) == 43
+    assert shared.counter_get(["key:1:2026-10-27:msg"]) == [43]
+
+
+def test_counter_get_reports_missing_counters_as_none(fake_redis):
+    shared.counter_seed_incr("key:1:2026-10-27:msg", 0, 3600)
+    assert shared.counter_get(["key:1:2026-10-27:msg",
+                               "key:1:2026-10-27:room"]) == [1, None]

@@ -189,6 +189,33 @@ def test_posting_extends_the_expiry():
     assert abs(after["expires_in_seconds"] - ttl.DEFAULT_HOURS * 3600) < 60
 
 
+def test_a_second_post_within_the_slack_does_not_rewrite_the_expiry():
+    """`expires_at` is indexed, so writing it costs an index write too. Posting
+    only moves it when it is more than ttl.EXTEND_SLACK behind the target, so a
+    busy room pays that once an hour instead of once a message."""
+    room = _create(description="busy room", ttl_hours=2)
+    uid = room["uuid"]
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "first"}).status_code == 201
+    with Session(engine) as s:
+        after_first = s.get(Room, uid).expires_at
+    for i in range(3):
+        assert client.post(f"/api/rooms/{uid}/messages",
+                           json={"agent_id": "a", "text": f"m{i}"}).status_code == 201
+    with Session(engine) as s:
+        assert s.get(Room, uid).expires_at == after_first
+    # Walk the stored expiry back past the slack: the next post moves it again.
+    with Session(engine) as s:
+        r = s.get(Room, uid)
+        r.expires_at = utcnow() + timedelta(hours=ttl.DEFAULT_HOURS) - timedelta(hours=2)
+        s.add(r)
+        s.commit()
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "much later"}).status_code == 201
+    with Session(engine) as s:
+        assert s.get(Room, uid).expires_at > after_first - timedelta(hours=2)
+
+
 def test_activity_never_shortens_a_longer_expiry():
     # A room deliberately created with a month of runway keeps it.
     room = _create(description="long-lived", ttl_hours=ttl.MAX_HOURS)

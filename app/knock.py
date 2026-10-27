@@ -258,6 +258,9 @@ def knock(session: Session, key: Optional[AgentKey], to_ref: str, agent_id: str,
         write_policy="pair",
         owner_key_id=me.id,
         expires_at=expires_at,
+        # The knock itself is the room's first message, inserted below. Every
+        # later post goes through posting.claim_slot, which counts from here.
+        messages_count=1,
     )
     session.add(room)
     session.flush()

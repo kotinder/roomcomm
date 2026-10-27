@@ -26,6 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.exc import OperationalError as SAOperationalError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlmodel import Session, delete, select, func
 
 ADMIN_TOKEN = os.environ.get("ROOMCOMM_ADMIN_TOKEN", "")
@@ -180,9 +182,10 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, knock, llm, notify, pcis, quota,
-               shared, tg_bot, ttl)
-from .database import SKILLS_DIR, engine, get_session, init_db, DB_PATH
+from . import (anchor, authorship, files, i18n, inbox, knock, llm, notify, pcis,
+               posting, quota, shared, tg_bot, ttl)
+from .database import (SKILLS_DIR, engine, get_session, init_db, wal_checkpoint,
+                       DB_PATH)
 from .models import (
     AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Knock, Message,
     Room, RoomSeen, Skill, UsageCounter, utcnow,
@@ -255,7 +258,6 @@ async def _room_refresh_lock(room_uuid: str):
             if token:
                 shared.unlock(name, token)
 
-MAX_MESSAGES_PER_ROOM = 1000
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 500
 
@@ -269,11 +271,15 @@ async def lifespan(app_: FastAPI):
     from .mcp_server import mcp_lifespan as _mcp_lifespan  # lazy — avoids circular import
     init_db()
     _prune_hits()
+    _ensure_flusher()
     try:
         async with _mcp_lifespan(app_):
             yield
     finally:
-        _flush_hits()  # a graceful stop/restart keeps the buffered stats
+        # A graceful stop/restart keeps the buffered stats and the metered
+        # usage that has not reached usage_counters yet.
+        _flush_hits()
+        quota.flush_counters()
 
 
 app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", lifespan=lifespan)
@@ -353,9 +359,17 @@ def _record_hit(event: str, path: str, headers: dict, client_host: str) -> None:
         referer=(headers.get("referer") or "")[:300],
         path=path[:200],
     )
-    global _hit_flusher
     with _hit_lock:
         _hit_buf.append(hit)
+    _ensure_flusher()
+
+
+def _ensure_flusher() -> None:
+    """Start the periodic flusher, or restart it if it died. Called at startup
+    (the WAL checkpoint and the quota flush must not wait for the first page
+    view) and on every recorded hit."""
+    global _hit_flusher
+    with _hit_lock:
         if _hit_flusher is None or not _hit_flusher.is_alive():
             _hit_flusher = threading.Thread(target=_hit_flush_loop, daemon=True,
                                             name="hit-flusher")
@@ -377,9 +391,19 @@ def _flush_hits() -> None:
 
 
 def _hit_flush_loop() -> None:
+    """The one periodic writer in the process: stats, metered usage, and the
+    WAL checkpoint that would otherwise land on a random request's commit."""
     while True:
         time.sleep(HIT_FLUSH_SECONDS)
         _flush_hits()
+        try:
+            quota.flush_counters()
+        except Exception:
+            log.exception("quota counter flush failed")
+        try:
+            wal_checkpoint()
+        except Exception:
+            log.exception("wal checkpoint failed")
 
 
 def _prune_hits() -> None:
@@ -499,6 +523,9 @@ MAX_INFLIGHT = int(os.environ.get("ROOMCOMM_MAX_INFLIGHT", "32") or 0)
 _SHED_EXEMPT = ("/mcp", "/healthz", "/static/")
 _inflight = 0
 _shed_total = 0
+# Requests lost to write-lock contention or an exhausted pool. Reported
+# by /healthz next to the shed count: both say "past capacity".
+_db_busy_total = 0
 
 
 class _ShedMiddleware:
@@ -548,7 +575,33 @@ async def healthz():
             con.close()
     except sqlite3.Error as e:
         return JSONResponse({"ok": False, "db": repr(e)}, status_code=503)
-    return {"ok": True, "inflight": _inflight, "shed_total": _shed_total}
+    return {"ok": True, "inflight": _inflight, "shed_total": _shed_total,
+            "db_busy_total": _db_busy_total}
+
+
+@app.exception_handler(SAOperationalError)
+@app.exception_handler(SATimeoutError)
+async def _db_busy_handler(request: Request, exc: Exception):
+    """Contention for SQLite's single write lock answers like the shedder.
+
+    Two ways a request can lose that race: the write lock stayed busy for
+    database.BUSY_TIMEOUT_MS ("database is locked"), or the connection pool
+    had nothing free within pool_timeout. Both mean "we are past capacity,
+    come back in a moment" — a 503 + Retry-After says that, where the 500 this
+    used to raise told the caller its request was malformed. Any other
+    OperationalError is a real fault and goes to the 500 handler below.
+    """
+    if isinstance(exc, SAOperationalError) and "database is locked" not in str(exc):
+        return await _unhandled_handler(request, exc)
+    global _db_busy_total
+    _db_busy_total += 1
+    log.warning("db busy at %s (%d so far): %s", request.url.path,
+                _db_busy_total, type(exc).__name__)
+    return JSONResponse(
+        status_code=503, headers={"Retry-After": "2"},
+        content={"detail": "db_busy: the service is writing at capacity — "
+                           "retry in a couple of seconds."},
+    )
 
 
 @app.exception_handler(Exception)
@@ -1251,16 +1304,6 @@ def post_message(
         payload.agent_id, key, quota.PREMIUM_TIERS)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
-    _check_quota(session, subject, "msg", key)
-    count = session.exec(
-        select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
-    ).one()
-    if count >= MAX_MESSAGES_PER_ROOM:
-        raise HTTPException(
-            status_code=429,
-            detail="room_full: room message limit reached (1000) — permanent "
-                   "for this room, not your quota. Ask the owner for a new room.",
-        )
 
     # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
     # ts_iso must be provided together. Verification happens *before* insert
@@ -1297,6 +1340,13 @@ def post_message(
                 detail="signature does not verify against (text || ts_iso || room_uuid || memory_root)",
             )
 
+    # Nothing below can reject the post, so this is where metering belongs —
+    # and from here on every statement is a write, which keeps SQLite's write
+    # lock held for the insert burst only (profile 05.10.2026).
+    _check_quota(session, subject, "msg", key)
+    if not posting.claim_slot(session, room):
+        raise HTTPException(status_code=429, detail=posting.ROOM_FULL_DETAIL)
+
     msg = Message(
         room_uuid=room_uuid,
         agent_id=payload.agent_id.strip(),
@@ -1317,10 +1367,6 @@ def post_message(
     if key is not None:
         # Posting = caught up: your reply lands after everything you saw.
         inbox.advance_seen(session, key.id, room_uuid, msg.id)
-    # A room that is being used does not run out. The TTL counts from the last
-    # message, so it retires silence rather than interrupting a conversation.
-    if ttl.extend_on_activity(room):
-        session.add(room)
     session.commit()
     session.refresh(msg)
 

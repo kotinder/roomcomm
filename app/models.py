@@ -95,6 +95,11 @@ class Room(SQLModel, table=True):
     # Watermark for incremental LLM processing — only messages with id >
     # last_extracted_msg_id are fed to the arbiter on the next refresh.
     last_extracted_msg_id: int = Field(default=0)
+    # Messages posted into the room, maintained by posting.claim_slot. Exists
+    # so the 1000-message cap costs no COUNT(*) on the write path; deliberately
+    # NOT indexed, because it is written on every post. Authoritative for the
+    # cap, not for display: a room's history is the messages table.
+    messages_count: int = Field(default=0)
     # Last arbiter extraction error (None when healthy). Surfaced via the API
     # so clients can tell whether the premium arbiter is actually working
     # without having to call verify_integrity.

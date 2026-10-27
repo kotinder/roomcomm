@@ -24,6 +24,21 @@ engine = create_engine(
 )
 
 
+# How long a blocked writer waits for SQLite's single write lock before giving
+# up with "database is locked". This is pysqlite's own default (its connect()
+# timeout of 5 s), pinned here so the value is ours rather than the driver's:
+# main.py turns the timeout into a 503 + Retry-After, and the number is what
+# bounds how long a saturated writer may sit on an in-flight slot.
+BUSY_TIMEOUT_MS = 5000
+# WAL checkpointing is kept OFF the request path: a checkpoint lands on
+# whichever commit crosses the threshold and stalls writers while it runs,
+# which is what the p95 spikes in the 05.10.2026 write phase looked like.
+# main.py checkpoints from the stats flusher thread instead; the autocheckpoint
+# stays armed, far out, as a safety net for when that thread is not running
+# (scripts, tests, a crashed flusher).
+WAL_AUTOCHECKPOINT_PAGES = 8000  # ~32 MB of WAL at the default 4 KB page
+
+
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, _):
     cursor = dbapi_connection.cursor()
@@ -32,7 +47,29 @@ def _set_sqlite_pragma(dbapi_connection, _):
     # only the last few commits instead of paying an fsync on every one.
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    cursor.execute(f"PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}")
+    # Page cache is PER CONNECTION, and the pool can hold 40 of them in each
+    # worker — so this is deliberately modest (8 MB, up from the 2 MB default)
+    # rather than "as much as the database". The mapping below is what carries
+    # the hot pages: mmap'd reads come straight from the OS page cache, shared
+    # by every connection and reclaimable under memory pressure, instead of
+    # being copied into 80 private caches.
+    cursor.execute("PRAGMA cache_size=-8192")
+    cursor.execute("PRAGMA mmap_size=268435456")
     cursor.close()
+
+
+def wal_checkpoint() -> tuple[int, int]:
+    """Fold the WAL back into the database, from a background thread.
+
+    PASSIVE: if a writer holds the lock, the call does nothing rather than
+    waiting for it, so checkpointing never blocks a request. Returns
+    (busy, pages_moved) — busy=1 means it stepped aside this round.
+    """
+    with engine.connect() as conn:
+        row = conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    return (int(row[0]), int(row[1])) if row else (0, 0)
 
 
 def init_db() -> None:
@@ -90,6 +127,23 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_rooms_expires_at ON rooms(expires_at)"
             )
+            conn.commit()
+
+        # Message counter on the room: the 1000-message cap used to cost a
+        # COUNT(*) over the room's messages on every post. Backfilled once
+        # here — a full scan of messages, seconds on a database this size, and
+        # the alternative is a cap that reads as 0 for every existing room.
+        if "messages_count" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN messages_count INTEGER NOT NULL DEFAULT 0"
+            )
+            have = {row[1] for row in
+                    conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
+            if "room_uuid" in have:
+                conn.exec_driver_sql(
+                    "UPDATE rooms SET messages_count = ("
+                    "  SELECT COUNT(*) FROM messages WHERE messages.room_uuid = rooms.uuid)"
+                )
             conn.commit()
 
         # Auth MVP: write policies + key attribution on rooms.

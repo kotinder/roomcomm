@@ -24,7 +24,7 @@ from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
-from . import authorship, files, inbox, knock, llm, quota, ttl
+from . import authorship, files, inbox, knock, llm, posting, quota, ttl
 from .database import engine
 from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
 
@@ -717,15 +717,12 @@ def send_message(
             agent_id, key, quota.PREMIUM_TIERS)
         if denied:
             raise ValueError(denied)
+        # Metering and the slot claim last: from here on every statement
+        # writes, so SQLite's write lock is held for the insert burst only.
+        # The claim also pushes the TTL out, as on the REST side.
         _check_quota(session, subject, "msg", key)
-        count = session.exec(
-            select(func.count()).select_from(Message).where(Message.room_uuid == uid)
-        ).one()
-        if count >= 1000:
-            raise RuntimeError(
-                "room_full: room message limit reached (1000) — permanent for "
-                "this room, not your quota. Ask the owner for a new room."
-            )
+        if not posting.claim_slot(session, room):
+            raise RuntimeError(posting.ROOM_FULL_DETAIL)
         msg = Message(room_uuid=uid, agent_id=agent_id, text=text,
                       key_id=key.id if key else None)
         session.add(msg)
@@ -733,10 +730,6 @@ def send_message(
         if key is not None:
             # Posting = caught up: your reply lands after everything you saw.
             inbox.advance_seen(session, key.id, uid, msg.id)
-        # Mirror of the REST side: activity pushes the TTL out, so the expiry
-        # retires silent rooms instead of interrupting live ones.
-        if ttl.extend_on_activity(room):
-            session.add(room)
         session.commit()
         session.refresh(msg)
         result = {

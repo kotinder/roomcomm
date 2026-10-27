@@ -431,13 +431,40 @@ def _notify_limit_hit(subject: str, kind: str, count: int, quota: int,
     ))
 
 
-def count_only(session: Session, subject: str, kind: str) -> int:
-    """Increment today's (subject, kind) counter with NO quota check, owner
-    notification, or rejection — for metering a brand-new signal (e.g.
-    'read_empty' idle polls) before a threshold is chosen. Rides the caller's
-    transaction like check_and_count; safe to call in soft or hard mode.
-    Returns the new count so callers may layer their own threshold on top."""
-    day = utcnow().strftime("%Y-%m-%d")
+# ---------- Where the counters actually live ----------
+#
+# Every metered request used to be a SQLite write transaction: the UPSERT below
+# competed for the single writer lock with the posts themselves, and on the
+# READ path (idle-poll metering) it turned a pure read into a write. With Redis
+# configured the increment is one INCR and `usage_counters` is caught up in one
+# batch every few seconds (flush_counters, driven by main's flusher thread).
+#
+# Two consequences, both deliberate:
+#   * The increment no longer rides the caller's transaction, so a request that
+#     fails *after* metering stays counted. Callers meter last, once nothing
+#     can reject the request, so this is the crash case rather than the 4xx one.
+#   * `usage_counters` lags by up to one flush interval. It is the durable
+#     record and what /admin reads; Redis is the live value enforcement uses.
+# Without REDIS_URL (or while Redis is down) nothing changes: the UPSERT runs
+# inline, exactly as before.
+
+#: Counters outlive the day they belong to by this much, so a flush that fires
+#: just after UTC midnight still finds yesterday's value.
+COUNTER_GRACE_S = 3600
+
+_dirty: set[tuple[str, str, str]] = set()
+_dirty_lock = threading.Lock()
+
+
+def _stored_count(session: Session, subject: str, day: str, kind: str) -> int:
+    row = session.connection().exec_driver_sql(
+        "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
+        (subject, day, kind),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _sqlite_bump(session: Session, subject: str, day: str, kind: str) -> int:
     conn = session.connection()
     conn.exec_driver_sql(
         "INSERT INTO usage_counters (subject, day, kind, count) VALUES (?, ?, ?, 1) "
@@ -448,6 +475,70 @@ def count_only(session: Session, subject: str, kind: str) -> int:
         "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
         (subject, day, kind),
     ).scalar_one()
+
+
+def _bump(session: Session, subject: str, kind: str) -> int:
+    """Increment today's (subject, kind) counter and return the new value."""
+    day = utcnow().strftime("%Y-%m-%d")
+    key = f"{subject}:{day}:{kind}"
+    count = shared.counter_incr(key)
+    if count is not None and count < 0:
+        # First request of the day for this counter: carry the stored value
+        # over, so a Redis restart cannot hand everyone a fresh budget.
+        count = shared.counter_seed_incr(
+            key, _stored_count(session, subject, day, kind),
+            _seconds_to_utc_midnight() + COUNTER_GRACE_S)
+    if count is None:
+        return _sqlite_bump(session, subject, day, kind)
+    with _dirty_lock:
+        _dirty.add((subject, day, kind))
+    return count
+
+
+def flush_counters() -> int:
+    """Write the Redis counters touched since the last call into
+    `usage_counters`, in one transaction. Returns the number of rows written.
+
+    Never lowers a stored count: a counter Redis lost (restart, eviction) would
+    otherwise walk budgets backwards, and the next request reseeds it from this
+    table anyway.
+    """
+    with _dirty_lock:
+        pending = sorted(_dirty)
+        _dirty.clear()
+    if not pending:
+        return 0
+    values = shared.counter_get([f"{s}:{d}:{k}" for s, d, k in pending])
+    if values is None:  # Redis unreachable — retry on the next tick
+        with _dirty_lock:
+            _dirty.update(pending)
+        return 0
+    rows = [(s, d, k, v) for (s, d, k), v in zip(pending, values) if v is not None]
+    if not rows:
+        return 0
+    from .database import engine  # local: keeps module import order unchanged
+    try:
+        with Session(engine) as session:
+            session.connection().exec_driver_sql(
+                "INSERT INTO usage_counters (subject, day, kind, count) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(subject, day, kind) "
+                "DO UPDATE SET count = MAX(count, excluded.count)",
+                rows,
+            )
+            session.commit()
+    except Exception:
+        log.exception("failed to flush %d usage counters", len(rows))
+        return 0
+    return len(rows)
+
+
+def count_only(session: Session, subject: str, kind: str) -> int:
+    """Increment today's (subject, kind) counter with NO quota check, owner
+    notification, or rejection — for metering a brand-new signal (e.g.
+    'read_empty' idle polls) before a threshold is chosen. Safe to call in soft
+    or hard mode. Returns the new count so callers may layer their own
+    threshold on top."""
+    return _bump(session, subject, kind)
 
 
 # Empty-read (idle poll) throttle — the ENFORCEMENT layer on top of the
@@ -491,14 +582,31 @@ def meter_idle_poll(session: Session, subject: str, kind: str) -> Optional[int]:
     Rides the caller's transaction like count_only."""
     if subject_exempt(subject):
         return None
-    count_only(session, subject, kind)
+    count = _bump(session, subject, kind)
+    if READ_EMPTY_LIMIT <= 0:
+        # Throttle off (the default): metering is the whole job here, and the
+        # total below would put a second query on the read path for a threshold
+        # nobody is comparing against.
+        return None
+    return empty_read_retry_after(_idle_poll_total(session, subject, kind, count))
+
+
+def _idle_poll_total(session: Session, subject: str, kind: str, count: int) -> int:
+    """Today's read_empty + read_404 for the subject, `count` being the value
+    _bump just returned for `kind`."""
     day = utcnow().strftime("%Y-%m-%d")
-    total = session.connection().exec_driver_sql(
-        "SELECT COALESCE(SUM(count), 0) FROM usage_counters "
-        "WHERE subject = ? AND day = ? AND kind IN ('read_empty', 'read_404')",
-        (subject, day),
-    ).scalar_one()
-    return empty_read_retry_after(total)
+    others = [k for k in IDLE_POLL_KINDS if k != kind]
+    values = shared.counter_get([f"{subject}:{day}:{k}" for k in others])
+    if values is None:
+        return session.connection().exec_driver_sql(
+            "SELECT COALESCE(SUM(count), 0) FROM usage_counters "
+            "WHERE subject = ? AND day = ? AND kind IN ('read_empty', 'read_404')",
+            (subject, day),
+        ).scalar_one()
+    total = count
+    for other, value in zip(others, values):
+        total += value if value is not None else _stored_count(session, subject, day, other)
+    return total
 
 
 def empty_poll_throttled_reason(subject: str, retry_after: int) -> str:
@@ -522,24 +630,14 @@ def check_and_count(session: Session, subject: str, kind: str,
 
     The admin token (subject ADMIN_SUBJECT) is never metered.
 
-    The increment rides the caller's transaction: on a 4xx raised here (or any
-    later handler failure) it rolls back with everything else, so in hard mode
-    the stored counter never exceeds the quota.
+    Where the increment lands — and what that costs the caller's transaction —
+    is described above _bump. Call this once every cheaper rejection (write
+    policy, protected names, a bad signature) is already out of the way.
     """
     if subject == ADMIN_SUBJECT or subject_exempt(subject):
         return
     quota = daily_quota(key, kind)
-    day = utcnow().strftime("%Y-%m-%d")
-    conn = session.connection()
-    conn.exec_driver_sql(
-        "INSERT INTO usage_counters (subject, day, kind, count) VALUES (?, ?, ?, 1) "
-        "ON CONFLICT(subject, day, kind) DO UPDATE SET count = count + 1",
-        (subject, day, kind),
-    )
-    count = conn.exec_driver_sql(
-        "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
-        (subject, day, kind),
-    ).scalar_one()
+    count = _bump(session, subject, kind)
     if count > quota:
         # Tell the owner (once per subject/kind/day) regardless of mode.
         _notify_limit_hit(subject, kind, count, quota, key)

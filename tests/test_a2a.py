@@ -340,9 +340,13 @@ def test_bad_key_is_refused_not_downgraded():
 
 def test_room_full():
     uid = _new_room()["uuid"]
+    # The cap is enforced against rooms.messages_count (app/posting.py), which
+    # a bulk insert bypasses — fill both so the room is full the way a real
+    # one is, not just in the messages table.
     with Session(engine) as s:
         for i in range(1000):
             s.add(models.Message(room_uuid=uid, agent_id="f", text=str(i)))
+        s.get(models.Room, uid).messages_count = 1000
         s.commit()
     _err(_send([{"text": "1001"}], f"/a2a/{uid}", metadata={"agent_id": "x"}), -32044)
 
