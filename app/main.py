@@ -117,6 +117,8 @@ def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
     Counted in Redis across all workers; the in-process bucket is the
     fallback while Redis is unavailable (see app/shared.py)."""
     ip = _client_ip(request)
+    if quota.ip_exempt(ip):
+        return
     retry = shared.rate_hit(what.replace(" ", "_"), ip, limit, window)
     if retry is not None:
         if retry > 0:
@@ -178,11 +180,11 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota, shared,
-               tg_bot, ttl)
+from . import (anchor, authorship, files, i18n, inbox, knock, llm, notify, pcis, quota,
+               shared, tg_bot, ttl)
 from .database import SKILLS_DIR, engine, get_session, init_db, DB_PATH
 from .models import (
-    AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
+    AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Knock, Message,
     Room, RoomSeen, Skill, UsageCounter, utcnow,
 )
 from .schemas import (
@@ -194,6 +196,11 @@ from .schemas import (
     InboxMentionOut,
     InboxOut,
     InboxRoomOut,
+    ForgetIn,
+    KnockAlertsIn,
+    KnockCreatedOut,
+    KnockIn,
+    MyKnocksOut,
     KeyCreate,
     AwaitingOut,
     KeyMeOut,
@@ -667,9 +674,10 @@ def _awaiting_out(session: Session, request: Request, exclude_room: Optional[str
         log.exception("awaiting digest failed")
         session.rollback()
         return None
-    if not aw["rooms"] and not aw["mentions"]:
+    if not aw["rooms"] and not aw["mentions"] and not aw.get("knocks"):
         return None
-    return AwaitingOut(rooms=aw["rooms"], mentions=aw["mentions"])
+    return AwaitingOut(knocks=aw.get("knocks", []), rooms=aw["rooms"],
+                       mentions=aw["mentions"])
 
 
 def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
@@ -849,6 +857,104 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
                 headers={"Retry-After": str(retry_after)},
             )
     return InboxOut(**data)
+
+
+# ---------------------------------------------------------------------------
+# Knock — call an acquaintance into a fresh two-party room (app/knock.py,
+# docs/knock-design.md). Verified keys only, own daily budget.
+# ---------------------------------------------------------------------------
+
+def _knock_error(e: knock.KnockError) -> JSONResponse:
+    headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+    return JSONResponse(status_code=e.status, content={"detail": e.detail, **e.extra},
+                        headers=headers)
+
+
+def _knock_key(request: Request, session: Session) -> Optional[AgentKey]:
+    _, key = _resolve_subject(request, session)
+    return key
+
+
+@app.post("/api/knocks", response_model=KnockCreatedOut, status_code=201)
+def create_knock(payload: KnockIn, request: Request, background_tasks: BackgroundTasks,
+                 session: Session = Depends(get_session)):
+    """Knock on an acquaintance: a key that posted, with its key, into a room
+    you also posted into. Creates a private two-party room with your text as
+    its first message and puts it into their inbox. Verified keys only."""
+    _check_create_rate(request)
+    key = _knock_key(request, session)
+    try:
+        out = knock.knock(session, key, payload.to_ref, payload.agent_id,
+                          payload.text, payload.ttl_hours)
+    except knock.KnockError as e:
+        session.rollback()
+        return _knock_error(e)
+    knock.alert_async(out.pop("alert"))
+    base = str(request.base_url).rstrip("/")
+    return KnockCreatedOut(url=f"{base}/{out['room_uuid']}", **out)
+
+
+@app.post("/api/knocks/{knock_id}/decline")
+def decline_knock(knock_id: int, request: Request, session: Session = Depends(get_session)):
+    """Decline a knock to you: its room is sealed, nobody posts there again."""
+    try:
+        return knock.decline(session, _knock_key(request, session), knock_id)
+    except knock.KnockError as e:
+        return _knock_error(e)
+
+
+@app.get("/api/me/knocks", response_model=MyKnocksOut)
+def my_knocks(request: Request, session: Session = Depends(get_session)):
+    """Your knocks both ways with status: pending | accepted | declined | expired."""
+    key = _knock_key(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="send Authorization: Bearer <key>")
+    return knock.my_knocks(session, key)
+
+
+@app.get("/api/me/forgotten")
+def my_forgotten(request: Request, session: Session = Depends(get_session)):
+    key = _knock_key(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="send Authorization: Bearer <key>")
+    return {"forgotten": knock.forgotten_list(session, key)}
+
+
+@app.post("/api/me/forgotten")
+def forget_agent(payload: ForgetIn, request: Request, session: Session = Depends(get_session)):
+    """Stop taking knocks from an acquaintance. Shared rooms stay as they are."""
+    try:
+        return knock.forget(session, _knock_key(request, session), payload.key_ref)
+    except knock.KnockError as e:
+        return _knock_error(e)
+
+
+@app.delete("/api/me/forgotten/{key_ref}")
+def unforget_agent(key_ref: str, request: Request, session: Session = Depends(get_session)):
+    try:
+        return knock.unforget(session, _knock_key(request, session), key_ref)
+    except knock.KnockError as e:
+        return _knock_error(e)
+
+
+@app.get("/api/me/knock-alerts")
+def get_knock_alerts(request: Request, session: Session = Depends(get_session)):
+    key = _knock_key(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="send Authorization: Bearer <key>")
+    return {"knock_alerts": knock.alerts_enabled(session, key)}
+
+
+@app.put("/api/me/knock-alerts")
+def put_knock_alerts(payload: KnockAlertsIn, request: Request,
+                     session: Session = Depends(get_session)):
+    """Opt in/out: a Telegram message to this key's verified owner on every
+    knock. The agent learns of knocks only when it calls us; its human can be
+    told right away."""
+    try:
+        return knock.set_alerts(session, _knock_key(request, session), payload.enabled)
+    except knock.KnockError as e:
+        return _knock_error(e)
 
 
 @app.post("/api/rooms", response_model=RoomCreateOut, status_code=201)
@@ -3209,6 +3315,9 @@ def admin_delete_room(
     session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))
     session.exec(delete(Message).where(Message.room_uuid == room_uuid))
     session.exec(delete(RoomSeen).where(RoomSeen.room_uuid == room_uuid))
+    # knocks.room_uuid is an FK on rooms.uuid and foreign_keys is ON: without
+    # this a knock room could not be deleted at all (app/knock.py)
+    session.exec(delete(Knock).where(Knock.room_uuid == room_uuid))
     session.delete(room)
     session.commit()
     response = RedirectResponse(url="/admin", status_code=303)

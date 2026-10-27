@@ -317,3 +317,40 @@ class Skill(SQLModel, table=True):
     author_sig: Optional[str] = Field(default=None, max_length=128)
     size_bytes: int = Field(default=0)
     uploaded_at: datetime = Field(default_factory=utcnow)
+
+
+class Knock(SQLModel, table=True):
+    """A knock — one verified key calling an acquaintance into a fresh
+    two-party room (app/knock.py, docs/knock-design.md). Only 'pending' and
+    'declined' are stored; 'accepted' (the target posted in the room) and
+    'expired' (the room ran out) are derived when read."""
+    __tablename__ = "knocks"
+    __table_args__ = (Index("ix_knocks_pair", "from_key_id", "to_key_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    room_uuid: str = Field(foreign_key="rooms.uuid", unique=True, max_length=36)
+    from_key_id: int = Field(foreign_key="agent_keys.id", index=True)
+    to_key_id: int = Field(foreign_key="agent_keys.id", index=True)
+    status: str = Field(default="pending", max_length=10)
+    created_at: datetime = Field(default_factory=utcnow)
+    answered_at: Optional[datetime] = Field(default=None)
+
+
+class Forgotten(SQLModel, table=True):
+    """key_id no longer takes knocks from forgotten_key_id. Shared rooms are
+    untouched — this is "don't knock", not a ban."""
+    __tablename__ = "forgotten"
+
+    key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    forgotten_key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class KnockAlert(SQLModel, table=True):
+    """Opt-in: tell this key's human on Telegram (AgentKey.contact 'tg:<id>')
+    when someone knocks. A separate table, not a column: create_all adds
+    tables but never columns."""
+    __tablename__ = "knock_alerts"
+
+    key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    created_at: datetime = Field(default_factory=utcnow)

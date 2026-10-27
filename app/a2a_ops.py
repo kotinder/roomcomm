@@ -417,6 +417,7 @@ def check_inbox(session: Session, caller: Caller) -> dict:
         "agent_id": data["agent_id"],
         "rooms": [{**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]],
         "mentions": [{**m, "at": _ts(m["at"])} for m in data["mentions"]],
+        "knocks": [{**k, "at": _ts(k["at"])} for k in data.get("knocks", [])],
     }
 
 

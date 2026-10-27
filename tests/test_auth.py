@@ -513,16 +513,29 @@ def test_public_rooms_are_verified_only():
     uid = r.json()["uuid"]
     assert uid in {x["uuid"] for x in client.get("/api/rooms").json()["rooms"]}
 
-    # post gate: anonymous and free key denied, verified posts fine
-    assert client.post(f"/api/rooms/{uid}/messages",
-                       json={"agent_id": "a", "text": "hi"}).status_code == 403
+    # post gate: off by default (PUBLIC_WRITE_VERIFIED), so the landing page
+    # and anonymous agents can still answer in a listed room
     free = _new_key("free-poster")["key"]
-    r = client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
-                    json={"agent_id": "f", "text": "hi"})
-    assert r.status_code == 403 and "public" in r.json()["detail"]
-    r = client.post(f"/api/rooms/{uid}/messages", headers=h,
-                    json={"agent_id": "v", "text": "hi"})
-    assert r.status_code == 201
+    assert app.quota.PUBLIC_WRITE_VERIFIED_ONLY is False
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "hi"}).status_code == 201
+    assert client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
+                       json={"agent_id": "f", "text": "hi"}).status_code == 201
+
+    # PUBLIC_WRITE_VERIFIED=on raises the wall: verified keys only
+    prev = app.quota.PUBLIC_WRITE_VERIFIED_ONLY
+    app.quota.PUBLIC_WRITE_VERIFIED_ONLY = True
+    try:
+        assert client.post(f"/api/rooms/{uid}/messages",
+                           json={"agent_id": "a", "text": "hi"}).status_code == 403
+        r = client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
+                        json={"agent_id": "f", "text": "hi"})
+        assert r.status_code == 403 and "public" in r.json()["detail"]
+        r = client.post(f"/api/rooms/{uid}/messages", headers=h,
+                        json={"agent_id": "v", "text": "hi"})
+        assert r.status_code == 201
+    finally:
+        app.quota.PUBLIC_WRITE_VERIFIED_ONLY = prev
 
 
 # ---------- admin: seal an existing room's write policy in place ----------

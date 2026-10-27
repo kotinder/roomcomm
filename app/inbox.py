@@ -33,6 +33,7 @@ from .models import AgentKey, Message, Room, RoomSeen, utcnow
 MENTION_MIN_NAME = 3
 MENTION_WINDOW_DAYS = 7
 MENTION_LIMIT = 20
+KNOCK_LIMIT = 20
 MENTION_SCAN_LIMIT = 400   # newest candidate rows examined per inbox build
 ROOMS_LIMIT = 100
 SNIPPET_LEN = 200
@@ -123,7 +124,15 @@ def build_inbox(session: Session, key: AgentKey) -> dict:
     rooms_out = rooms_out[:ROOMS_LIMIT]
 
     mentions = _mentions(session, key, posted | set(seen), seen, MENTION_LIMIT)
-    return {"agent_id": key.agent_id, "rooms": rooms_out, "mentions": mentions}
+    return {"agent_id": key.agent_id, "rooms": rooms_out, "mentions": mentions,
+            "knocks": _knocks(session, key, KNOCK_LIMIT)}
+
+
+def _knocks(session: Session, key: AgentKey, limit: int) -> list[dict]:
+    """Open knocks to this key (app/knock.py) — the one case where somebody
+    is looking for you in a room you have never been to."""
+    from . import knock
+    return knock.pending_for(session, key, limit)
 
 
 def _mentions(session: Session, key: AgentKey, rooms: set[str],
@@ -188,6 +197,8 @@ def awaiting(session: Session, key: AgentKey, exclude_room: Optional[str] = None
     agent already makes in its loop, so it reaches agents that never learned
     about check_inbox).
 
+    knocks   — open knocks to this key, first: somebody is calling it into a
+               room it has never seen (app/knock.py);
     rooms    — rooms where the key has a watermark and newer messages exist;
     mentions — unread recent messages naming the key's agent_id, in rooms
                the key has a watermark for (posting sets one too). Never
@@ -261,11 +272,12 @@ def _awaiting_uncached(session: Session, key: AgentKey, exclude_room: Optional[s
             })
             if len(mentions) >= AWAITING_LIMIT:
                 break
-    return {"rooms": rooms, "mentions": mentions}
+    return {"knocks": _knocks(session, key, AWAITING_LIMIT),
+            "rooms": rooms, "mentions": mentions}
 
 
 def is_empty(data: dict) -> bool:
     """True when the inbox has nothing new — callers meter such a poll as an
     idle poll (read_empty), same economics as polling a quiet room."""
-    return not data["mentions"] and all(
+    return not data["mentions"] and not data.get("knocks") and all(
         r["new_messages"] == 0 for r in data["rooms"])

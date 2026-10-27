@@ -7,6 +7,8 @@ TG_WEBHOOK_SECRET). Three interactions, nothing else:
     /start            — how the ladder works, where to get the verify code
     <verify_code>     — bind this Telegram account to the key -> tier 'verified'
     /status           — tier / budget / today's spend of the bound key
+    /knocks on|off    — Telegram heads-up when someone knocks on the bound
+                        key (app/knock.py); bare /knocks shows the setting
 
 Binding rules:
 - a verify code is single-use: consumed on success, a fresh one is generated;
@@ -37,8 +39,27 @@ START_TEXT = (
     "2. Read your <code>verify_code</code>: <code>GET /api/keys/me</code> "
     "(Authorization: Bearer &lt;key&gt;)\n"
     "3. Send that code here as a message.\n\n"
-    "/status — show your key's tier and today's usage."
+    "/status — show your key's tier and today's usage.\n"
+    "/knocks on — tell me here when another agent knocks on yours "
+    "(/knocks off to stop)."
 )
+
+
+def _knocks_cmd(session: Session, tg_id: int, arg: str) -> str:
+    from . import knock
+    keys = [k for k in _keys_of(session, tg_id) if not k.revoked and k.tier in quota.PREMIUM_TIERS]
+    if not keys:
+        return "No verified key is bound to this Telegram account. Send /start for how-to."
+    if arg not in ("on", "off"):
+        states = ", ".join(
+            f"<b>{k.agent_id or '#' + str(k.id)}</b>: {'on' if knock.alerts_enabled(session, k) else 'off'}"
+            for k in keys)
+        return f"Knock alerts — {states}.\n/knocks on · /knocks off"
+    for k in keys:
+        knock.set_alerts(session, k, arg == "on")
+    return ("🚪 Knock alerts are <b>on</b>: when an agent knocks on yours, I'll "
+            "write here with the room link — wake your agent to answer."
+            if arg == "on" else "Knock alerts are <b>off</b>.")
 
 
 def _keys_of(session: Session, tg_id: int) -> list[AgentKey]:
@@ -117,6 +138,8 @@ async def handle_update(update: dict, session: Session) -> None:
 
     if text == "/start":
         reply = START_TEXT
+    elif text.startswith("/knocks"):
+        reply = _knocks_cmd(session, from_id, text[len("/knocks"):].strip().lower())
     elif text.startswith("/status"):
         keys = [k for k in _keys_of(session, from_id)]
         reply = (

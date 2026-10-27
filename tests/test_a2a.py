@@ -803,11 +803,20 @@ def test_share_file_respects_the_write_key():
               metadata={"room_key": res["write_key"]}))
 
 
-def test_public_and_premium_rooms_are_verified_only_to_post():
+def test_public_and_premium_rooms_are_verified_only_to_post(monkeypatch):
+    """Premium rooms are always verified-only. Public rooms are gated only
+    when PUBLIC_WRITE_VERIFIED is on (off by default, so the web UI can post)."""
+    import app.quota as _quota
     pub = _db_room(is_public=True)
     prem = _db_room(protocol_mode="premium")
     plain = _new_key("plain-poster")
     ver = _new_key("ver-poster", tier="verified")
+
+    assert _quota.PUBLIC_WRITE_VERIFIED_ONLY is False
+    _ok(_send([{"text": "x"}], f"/a2a/{pub}", _bearer(plain)))
+    _err(_send([{"text": "x"}], f"/a2a/{prem}", _bearer(plain)), -32041)
+
+    monkeypatch.setattr(_quota, "PUBLIC_WRITE_VERIFIED_ONLY", True)
     for uid in (pub, prem):
         _err(_send([{"text": "x"}], f"/a2a/{uid}", _bearer(plain)), -32041)
         _err(_send([{"text": "x"}], f"/a2a/{uid}", metadata={"agent_id": "anon"}), -32041)

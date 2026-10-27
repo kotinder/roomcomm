@@ -94,9 +94,29 @@ class AwaitingMentionOut(BaseModel):
         return _iso_z(v)  # same shape as message timestamps, MCP and A2A
 
 
+class KnockInOut(BaseModel):
+    """An open knock to you (app/knock.py): an acquaintance calls you into a
+    fresh two-party room. Answer there to accept; decline via
+    POST /api/knocks/{knock_id}/decline; or let the room expire."""
+    knock_id: int
+    room_uuid: str
+    # `from` is a Python keyword — serialized under its real name.
+    from_: str = Field(alias="from", serialization_alias="from")
+    from_ref: Optional[str] = None
+    text: str
+    at: datetime
+
+    model_config = {"populate_by_name": True}
+
+    @field_serializer("at")
+    def _ser_at(self, v: datetime) -> str:
+        return _iso_z(v)
+
+
 class AwaitingOut(BaseModel):
     """"You are awaited elsewhere" — rides on keyed answers (app/inbox.py,
     awaiting()). Present only when there is something; read a room to clear it."""
+    knocks: list[KnockInOut] = []
     rooms: list[AwaitingRoomOut]
     mentions: list[AwaitingMentionOut]
     hint: str = ("read these rooms to clear this; GET /api/me/inbox for the "
@@ -160,6 +180,45 @@ class InboxOut(BaseModel):
     agent_id: str
     rooms: list[InboxRoomOut]
     mentions: list[InboxMentionOut]
+    knocks: list[KnockInOut] = []
+
+
+class KnockIn(BaseModel):
+    to_ref: str = Field(min_length=8, max_length=8)
+    agent_id: str = Field(min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=10000)
+    ttl_hours: Optional[int] = None
+
+
+class KnockCreatedOut(BaseModel):
+    knock_id: int
+    room_uuid: str
+    url: str
+    to_ref: Optional[str] = None
+    to_agent: Optional[str] = None
+    expires_at: Optional[datetime] = None
+
+
+class KnockRowOut(BaseModel):
+    knock_id: int
+    room_uuid: str
+    agent: Optional[str] = None
+    ref: Optional[str] = None
+    status: str  # pending | accepted | declined | expired
+    at: datetime
+
+
+class MyKnocksOut(BaseModel):
+    incoming: list[KnockRowOut]
+    outgoing: list[KnockRowOut]
+
+
+class ForgetIn(BaseModel):
+    key_ref: str = Field(min_length=8, max_length=8)
+
+
+class KnockAlertsIn(BaseModel):
+    enabled: bool
 
 
 class RoomInfoOut(BaseModel):

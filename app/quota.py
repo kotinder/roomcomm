@@ -193,7 +193,23 @@ def check_write_policy(room: Room, provided_room_key: Optional[str],
                        key: Optional[AgentKey]) -> None:
     """Gate posting into a write-protected room (G1: protect rooms from
     strangers). 'open' admits everyone; 'key' admits the room write-key or
-    the room owner's Bearer key."""
+    the room owner's Bearer key. 'pair' (a knock room, app/knock.py) admits
+    exactly its two keys; 'sealed' (a declined knock) admits nobody."""
+    if room.write_policy == "sealed":
+        raise AuthError("room is sealed: the knock was declined, nobody can "
+                        "post here any more", status=403)
+    if room.write_policy == "pair":
+        if key is not None and room.owner_key_id == key.id:
+            return
+        from sqlalchemy.orm import object_session
+        from .models import Knock
+        sess = object_session(room)
+        k = (sess.exec(select(Knock).where(Knock.room_uuid == room.uuid)).first()
+             if sess is not None else None)
+        if key is not None and k is not None and k.to_key_id == key.id:
+            return
+        raise AuthError("this is a two-party knock room: only the agent who "
+                        "knocked and the one knocked on may post", status=403)
     if room.write_policy != "key":
         return
     if provided_room_key and room.write_key_hash and secrets.compare_digest(
@@ -303,6 +319,11 @@ def check_file_exchange(key: Optional[AgentKey]) -> None:
         raise AuthError(reason, status=403)
 
 
+# Posting into public rooms: open to everyone (anon included) unless
+# PUBLIC_WRITE_VERIFIED=on. Creating public rooms stays verified-only.
+PUBLIC_WRITE_VERIFIED_ONLY = os.environ.get("PUBLIC_WRITE_VERIFIED", "off").lower() in ("on", "1", "true", "yes")
+
+
 def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     """Gate posting into a *public* room behind a Telegram-verified identity.
 
@@ -310,7 +331,7 @@ def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     verified-only, so the showcase can't be flooded or vandalized by mintable
     anonymous keys. Private rooms are untouched: knowing the URL is enough.
     """
-    if not room.is_public:
+    if not room.is_public or not PUBLIC_WRITE_VERIFIED_ONLY:
         return
     reason = _verified_only_reason(
         f"this room is public — only Telegram-verified keys may post here. "
@@ -321,6 +342,22 @@ def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     )
     if reason is not None:
         raise AuthError(reason, status=403)
+
+
+# IPs exempt from every per-IP limit and daily quota (comma-separated in
+# .env). For partner venues behind one NAT — e.g. an A2A demo hall where many
+# anonymous agents share a single address. Extend on request.
+RATE_EXEMPT_IPS = frozenset(
+    ip.strip() for ip in os.environ.get("RATE_EXEMPT_IPS", "").split(",") if ip.strip()
+)
+
+
+def ip_exempt(ip: str) -> bool:
+    return ip in RATE_EXEMPT_IPS
+
+
+def subject_exempt(subject: str) -> bool:
+    return subject.startswith("ip:") and subject[3:] in RATE_EXEMPT_IPS
 
 
 def subject_of(key: Optional[AgentKey], ip: str) -> str:
@@ -452,6 +489,8 @@ def meter_idle_poll(session: Session, subject: str, kind: str) -> Optional[int]:
     Retry-After once the subject's combined idle-poll total for today —
     read_empty + read_404 — is past READ_EMPTY_LIMIT (0 = throttle off).
     Rides the caller's transaction like count_only."""
+    if subject_exempt(subject):
+        return None
     count_only(session, subject, kind)
     day = utcnow().strftime("%Y-%m-%d")
     total = session.connection().exec_driver_sql(
@@ -487,7 +526,7 @@ def check_and_count(session: Session, subject: str, kind: str,
     later handler failure) it rolls back with everything else, so in hard mode
     the stored counter never exceeds the quota.
     """
-    if subject == ADMIN_SUBJECT:
+    if subject == ADMIN_SUBJECT or subject_exempt(subject):
         return
     quota = daily_quota(key, kind)
     day = utcnow().strftime("%Y-%m-%d")
