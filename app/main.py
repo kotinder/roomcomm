@@ -406,6 +406,10 @@ def _hit_flush_loop() -> None:
         except Exception:
             log.exception("latency flush failed")
         try:
+            latency.maybe_alert()
+        except Exception:
+            log.exception("latency regression check failed")
+        try:
             wal_checkpoint()
         except Exception:
             log.exception("wal checkpoint failed")

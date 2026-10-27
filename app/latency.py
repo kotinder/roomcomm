@@ -21,14 +21,17 @@ no thread hop, no per-request row (the whole point of the 2026-10 write-path
 work was to stop paying a write transaction per request).
 """
 import logging
+import os
 import threading
+import time
 from bisect import bisect_left
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlmodel import Session, select
 
+from . import notify, shared
 from .database import engine
 from .models import RouteStat, utcnow
 
@@ -156,6 +159,28 @@ def percentiles(hist: list[int], qs=(0.5, 0.95)) -> list[Optional[int]]:
     return out
 
 
+def _scan(session: Session, days_back: int) -> tuple[
+        dict[str, list[int]], dict[str, list[int]], dict[str, int]]:
+    """Today's histogram per route, the earlier days' separately, and today's
+    5xx count. Kept apart because a baseline that includes today moves with
+    the very thing it is supposed to measure."""
+    today = utcnow().strftime("%Y-%m-%d")
+    since = (utcnow() - timedelta(days=days_back - 1)).strftime("%Y-%m-%d")
+    today_hist: dict[str, list[int]] = {}
+    prior_hist: dict[str, list[int]] = {}
+    today_err: dict[str, int] = defaultdict(int)
+    for row in session.exec(
+        select(RouteStat).where(RouteStat.day >= since)
+    ).all():
+        if row.bucket < 0 or row.bucket >= N_BUCKETS:
+            continue  # a row from an older build with different bounds
+        into = today_hist if row.day == today else prior_hist
+        into.setdefault(row.route, [0] * N_BUCKETS)[row.bucket] += row.count
+        if row.day == today:
+            today_err[row.route] += row.errors
+    return today_hist, prior_hist, today_err
+
+
 def route_table(session: Session, days_back: int = 7,
                 limit: int = 25) -> dict:
     """What /admin shows: today's p50/p95 per route, against the week's p95.
@@ -165,23 +190,12 @@ def route_table(session: Session, days_back: int = 7,
     baseline next to today's figure, and a regression reads as the gap
     between the two columns.
     """
-    today = utcnow().strftime("%Y-%m-%d")
-    since = (utcnow() - timedelta(days=days_back - 1)).strftime("%Y-%m-%d")
-    today_hist: dict[str, list[int]] = {}
-    week_hist: dict[str, list[int]] = {}
-    today_err: dict[str, int] = defaultdict(int)
-    for row in session.exec(
-        select(RouteStat).where(RouteStat.day >= since)
-    ).all():
-        if row.bucket < 0 or row.bucket >= N_BUCKETS:
-            continue  # a row from an older build with different bounds
-        week_hist.setdefault(row.route, [0] * N_BUCKETS)[row.bucket] += row.count
-        if row.day == today:
-            today_hist.setdefault(row.route, [0] * N_BUCKETS)[row.bucket] += row.count
-            today_err[row.route] += row.errors
+    today_hist, prior_hist, today_err = _scan(session, days_back)
     ranked = []
-    for route, week in week_hist.items():
+    for route in set(today_hist) | set(prior_hist):
         hist = today_hist.get(route) or [0] * N_BUCKETS
+        prior = prior_hist.get(route) or [0] * N_BUCKETS
+        week = [a + b for a, b in zip(hist, prior)]
         p50, p95 = percentiles(hist)
         count = sum(hist)
         ranked.append(((-count, -sum(week), route), {
@@ -212,3 +226,110 @@ def route_table(session: Session, days_back: int = 7,
 def prune(session: Session, cutoff_day: str) -> None:
     session.connection().exec_driver_sql(
         "DELETE FROM route_stats WHERE day < ?", (cutoff_day,))
+
+
+# ---------- the alert ----------
+# A table nobody opens is not a signal: a regression would sit in /admin until
+# somebody happened to look. So the flusher compares today's p95 against the
+# days before it and says so, once, in Telegram.
+#
+# Every number below exists to keep that message worth reading — an alert that
+# cries wolf gets muted, and then we are back to having no signal at all.
+# A route must have enough traffic today for a p95 to mean anything, enough
+# history to have a baseline, and be slow in absolute terms as well as
+# relative: three times 4 ms is still 12 ms and nobody's problem.
+ALERT_INTERVAL_S = 600
+ALERT_MIN_TODAY = 200
+ALERT_MIN_BASELINE = 500
+ALERT_FLOOR_MS = 150
+ALERT_RATIO = 3.0
+# Scanner noise and the overflow label are not routes anyone can fix.
+ALERT_SKIP = (UNROUTED, OTHER)
+
+PUBLIC_URL = os.environ.get("ROOMCOMM_PUBLIC_URL", "https://roomcomm.xyz").rstrip("/")
+
+# Start the clock at import so a crash-restart loop cannot turn the check into
+# a query per boot; the first comparison happens an interval after startup.
+_last_check = time.monotonic()
+_alerted: set[tuple[str, str]] = set()
+
+
+def _seconds_to_utc_midnight() -> int:
+    now = utcnow()
+    midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return max(60, int((midnight - now).total_seconds()))
+
+
+def regressions(session: Session, days_back: int = 7) -> list[dict]:
+    """Routes whose p95 today has pulled away from the days before it."""
+    today_hist, prior_hist, today_err = _scan(session, days_back)
+    ranked = []
+    for route, hist in today_hist.items():
+        if route in ALERT_SKIP:
+            continue
+        # A route first seen today has no baseline at all, which the same
+        # check covers: an empty history is not enough history.
+        prior = prior_hist.get(route) or [0] * N_BUCKETS
+        count, base_count = sum(hist), sum(prior)
+        if count < ALERT_MIN_TODAY or base_count < ALERT_MIN_BASELINE:
+            continue
+        p95 = percentiles(hist, (0.95,))[0]
+        baseline = percentiles(prior, (0.95,))[0]
+        if p95 is None or baseline is None:
+            continue
+        if p95 < ALERT_FLOOR_MS or p95 < baseline * ALERT_RATIO:
+            continue
+        ranked.append((-p95 / baseline, {
+            "route": route,
+            "p95": p95,
+            "baseline": baseline,
+            "count": count,
+            "errors": today_err[route],
+            "days": days_back - 1,
+        }))
+    return [item for _, item in sorted(ranked, key=lambda pair: pair[0])]
+
+
+def _claim(route: str) -> bool:
+    """True for the one worker that gets to send today's alert for this route.
+
+    Redis both deduplicates across workers and survives a restart, which an
+    in-process set does not — without it a container that restarts hourly
+    would send the same alert hourly. The fallback is that set anyway, so a
+    Redis outage costs at most one repeat per worker per day.
+    """
+    day = utcnow().strftime("%Y-%m-%d")
+    once = shared.first_time(f"latency:{day}:{route}", _seconds_to_utc_midnight())
+    if once is not None:
+        return once
+    if (day, route) in _alerted:
+        return False
+    _alerted.difference_update({e for e in _alerted if e[0] != day})
+    _alerted.add((day, route))
+    return True
+
+
+def alert(session: Session, days_back: int = 7) -> list[str]:
+    """Send one Telegram message per regressed route, at most once a day each.
+    Returns the routes alerted on. A no-op when Telegram is not configured."""
+    sent = []
+    for r in regressions(session, days_back):
+        if not _claim(r["route"]):
+            continue
+        notify.send_sync(notify.format_latency_regression(
+            admin_url=f"{PUBLIC_URL}/admin", **r))
+        log.warning("latency regression on %s: p95 %s ms vs %s ms baseline",
+                    r["route"], r["p95"], r["baseline"])
+        sent.append(r["route"])
+    return sent
+
+
+def maybe_alert() -> list[str]:
+    """Called from the flusher every few seconds; does the real work at most
+    once every ALERT_INTERVAL_S, because it costs a query over the window."""
+    global _last_check
+    if time.monotonic() - _last_check < ALERT_INTERVAL_S:
+        return []
+    _last_check = time.monotonic()
+    with Session(engine) as s:
+        return alert(s)

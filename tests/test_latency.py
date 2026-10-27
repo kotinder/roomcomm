@@ -50,6 +50,7 @@ def _own_db_and_empty_buffer(monkeypatch):
     with latency._lock:
         latency._buf.clear()
         latency._routes.clear()
+    latency._alerted.clear()
     yield
     fastapi_app.dependency_overrides.pop(get_session, None)
     with latency._lock:
@@ -64,6 +65,18 @@ def flush_db(tmp_path, monkeypatch):
     SQLModel.metadata.create_all(eng)
     monkeypatch.setattr(latency, "engine", eng)
     return eng
+
+
+@pytest.fixture
+def fake_redis(monkeypatch):
+    """A Redis the alert's dedupe can actually use. Only SET NX EX is needed
+    here, so no Lua and no lupa."""
+    fakeredis = pytest.importorskip("fakeredis")
+    client_ = fakeredis.FakeRedis()
+    monkeypatch.setattr(latency.shared, "REDIS_URL", "redis://fake")
+    monkeypatch.setattr(latency.shared, "_client", client_)
+    monkeypatch.setattr(latency.shared, "_down_until", 0.0)
+    return client_
 
 
 def _rows(eng) -> list:
@@ -251,3 +264,88 @@ def test_admin_shows_the_route_table():
     assert r.status_code == 200
     assert "Latency · today" in r.text
     assert "POST /api/rooms/{room_uuid}/messages" in r.text
+
+
+# ---------- the regression alert ----------
+# The baseline days and today, in the shape the alert compares them in.
+FAST = [7.0] * 1000                      # p95 lands in the 5-10 ms bucket
+SLOW = [7.0] * 900 + [900.0] * 100       # the tail moved into 600-1000 ms
+
+
+def _two_days(route="POST /api/rooms", prior=FAST, today=SLOW, errors=0):
+    with Session(engine) as s:
+        if prior:
+            _store(s, (utcnow() - timedelta(days=2)).strftime("%Y-%m-%d"),
+                   route, prior)
+        if today:
+            _store(s, utcnow().strftime("%Y-%m-%d"), route, today, errors=errors)
+        return latency.regressions(s)
+
+
+def test_a_route_that_slowed_down_is_reported_against_its_own_baseline():
+    (r,) = _two_days(errors=4)
+    assert r["route"] == "POST /api/rooms"
+    assert r["p95"] == 800
+    # The baseline is the earlier day alone. Were today folded into it, the
+    # number it is compared against would move with the regression itself.
+    assert r["baseline"] == 10
+    assert (r["count"], r["errors"], r["days"]) == (1000, 4, 6)
+
+
+def test_a_route_that_is_merely_relatively_slower_is_not_worth_a_message():
+    # Eight times the baseline, and still 39 ms: nobody's problem.
+    assert _two_days(prior=[1.0] * 1000, today=[30.0] * 1000) == []
+
+
+def test_a_route_without_enough_traffic_today_has_no_p95_to_trust():
+    # The same shape as SLOW, a tenth of the volume: at 100 requests a p95 is
+    # five slow ones, which is a hiccup and not a regression.
+    assert _two_days(today=[7.0] * 90 + [900.0] * 10) == []
+
+
+def test_a_route_without_enough_history_has_nothing_to_compare_against():
+    assert _two_days(prior=FAST[:100]) == []
+
+
+def test_a_route_first_seen_today_is_not_a_regression():
+    assert _two_days(prior=[]) == []
+
+
+def test_scanner_noise_is_never_alerted_on():
+    assert _two_days(route=latency.UNROUTED) == []
+
+
+def test_the_same_route_is_not_alerted_on_twice_in_a_day(monkeypatch):
+    sent = []
+    monkeypatch.setattr(latency.notify, "send_sync", sent.append)
+    _two_days()
+    with Session(engine) as s:
+        assert latency.alert(s) == ["POST /api/rooms"]
+        assert latency.alert(s) == []
+    assert len(sent) == 1
+    assert "POST /api/rooms" in sent[0] and "800" in sent[0] and "10 ms" in sent[0]
+
+
+def test_redis_keeps_the_second_worker_and_a_restart_quiet(fake_redis, monkeypatch):
+    sent = []
+    monkeypatch.setattr(latency.notify, "send_sync", sent.append)
+    _two_days()
+    with Session(engine) as s:
+        assert latency.alert(s) == ["POST /api/rooms"]
+        # Another worker, or this one after a restart: its in-process memory
+        # is empty, and only the Redis key stops the repeat.
+        latency._alerted.clear()
+        assert latency.alert(s) == []
+    assert len(sent) == 1
+
+
+def test_the_check_runs_at_most_once_an_interval(monkeypatch):
+    calls = []
+    monkeypatch.setattr(latency, "alert", lambda s, *a, **k: calls.append(1) or [])
+    monkeypatch.setattr(latency, "engine", engine)
+    assert latency.maybe_alert() == []        # too soon after import
+    assert calls == []
+    monkeypatch.setattr(latency, "_last_check",
+                        latency.time.monotonic() - latency.ALERT_INTERVAL_S - 1)
+    latency.maybe_alert()
+    assert calls == [1]
