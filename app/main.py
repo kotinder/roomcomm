@@ -594,7 +594,14 @@ async def healthz():
     """Liveness for the host watchdog. Runs on the event loop with its own
     sqlite3 connection — neither the threadpool nor the SQLAlchemy pool, which
     are exactly what is exhausted under overload — so a slow answer here means
-    the process itself is stuck, not merely busy."""
+    the process itself is stuck, not merely busy.
+
+    The latency figures come from app/latency.py's in-process window for the
+    same reason: a watchdog has to be able to read them precisely when the
+    database is the thing in trouble. They cover the last complete minute in
+    this worker alone — "are we answering quickly right now", next to the two
+    counters that say "are we past capacity". The measurement, across workers
+    and across the day, is the table in /admin."""
     try:
         con = sqlite3.connect(DB_PATH, timeout=2)
         try:
@@ -604,7 +611,7 @@ async def healthz():
     except sqlite3.Error as e:
         return JSONResponse({"ok": False, "db": repr(e)}, status_code=503)
     return {"ok": True, "inflight": _inflight, "shed_total": _shed_total,
-            "db_busy_total": _db_busy_total}
+            "db_busy_total": _db_busy_total, **latency.recent()}
 
 
 @app.exception_handler(SAOperationalError)

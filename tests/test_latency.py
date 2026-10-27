@@ -51,6 +51,10 @@ def _own_db_and_empty_buffer(monkeypatch):
         latency._buf.clear()
         latency._routes.clear()
     latency._alerted.clear()
+    with latency._lock:
+        latency._recent[:] = [0] * latency.N_BUCKETS
+        latency._recent_done[:] = [0] * latency.N_BUCKETS
+        latency._recent_started = latency.time.monotonic()
     yield
     fastapi_app.dependency_overrides.pop(get_session, None)
     with latency._lock:
@@ -349,3 +353,55 @@ def test_the_check_runs_at_most_once_an_interval(monkeypatch):
                         latency.time.monotonic() - latency.ALERT_INTERVAL_S - 1)
     latency.maybe_alert()
     assert calls == [1]
+
+
+# ---------- the one-minute window behind /healthz ----------
+
+def _age_the_window(seconds):
+    with latency._lock:
+        latency._recent_started = latency.time.monotonic() - seconds
+
+
+def test_a_fresh_worker_reports_no_numbers_rather_than_zeros():
+    assert latency.recent() == {"requests_1m": 0, "p50_ms": None, "p95_ms": None}
+
+
+def test_the_window_reports_the_last_complete_minute_not_the_one_filling():
+    for _ in range(90):
+        latency.record("GET /x", 7.0, 200)
+    for _ in range(10):
+        latency.record("GET /x", 900.0, 200)
+    # Still accumulating: a reader must not see a half-filled minute.
+    assert latency.recent()["requests_1m"] == 0
+    _age_the_window(latency.RECENT_WINDOW_S)
+    got = latency.recent()
+    assert got["requests_1m"] == 100 and got["p95_ms"] == 800
+
+
+def test_a_silent_worker_stops_reporting_its_last_busy_minute():
+    for _ in range(100):
+        latency.record("GET /x", 7.0, 200)
+    # Those 100 were served, then nothing happened for two windows: no later
+    # request rotated them out, and the read itself is the first thing to
+    # notice. They must not be reported as the last minute, or a watchdog
+    # reads a worker that has answered nobody in an hour as answering fast.
+    _age_the_window(latency.RECENT_WINDOW_S * 2.5)
+    assert latency.recent() == {"requests_1m": 0, "p50_ms": None, "p95_ms": None}
+
+
+def test_one_quiet_window_still_retires_the_minute_normally():
+    for _ in range(100):
+        latency.record("GET /x", 7.0, 200)
+    _age_the_window(latency.RECENT_WINDOW_S)
+    assert latency.recent()["requests_1m"] == 100
+
+
+def test_healthz_carries_the_window_next_to_the_capacity_counters():
+    for _ in range(100):
+        latency.record("GET /x", 7.0, 200)
+    _age_the_window(latency.RECENT_WINDOW_S)
+    body = client.get("/healthz").json()
+    assert body["ok"] is True
+    assert {"inflight", "shed_total", "db_busy_total"} <= set(body)
+    # The poll itself lands in the minute now filling, not in the one read.
+    assert body["requests_1m"] == 100 and body["p50_ms"] == 8

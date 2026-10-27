@@ -59,6 +59,16 @@ _lock = threading.Lock()
 _buf: dict[tuple[str, str, int], list[int]] = {}
 _routes: set[str] = set()
 
+# A second, much shorter window for /healthz, which must answer without the
+# database: under the overload this whole module exists to measure, the
+# connection pool is exactly what has run out. Two slots — the minute in
+# progress and the last complete one — so a reader never sees a half-filled
+# window and no sample is ever counted twice.
+RECENT_WINDOW_S = 60
+_recent = [0] * N_BUCKETS
+_recent_done = [0] * N_BUCKETS
+_recent_started = time.monotonic()
+
 
 def route_label(method: str, path: str, path_params: Optional[dict],
                 routed: bool) -> str:
@@ -84,10 +94,40 @@ def bucket_for(ms: float) -> int:
     return bisect_left(BOUNDS_MS, ms)
 
 
+def _rotate(now: float) -> None:
+    """Retire the minute in progress if it is over. Caller holds _lock."""
+    global _recent, _recent_done, _recent_started
+    if now - _recent_started < RECENT_WINDOW_S:
+        return
+    # Past two windows the slot in progress is itself stale — it belongs to a
+    # minute that ended long ago, and reporting it would tell a watchdog that
+    # a service which has served nothing for an hour is doing fine.
+    _recent_done = _recent if now - _recent_started < 2 * RECENT_WINDOW_S         else [0] * N_BUCKETS
+    _recent = [0] * N_BUCKETS
+    _recent_started = now
+
+
+def recent() -> dict:
+    """p50/p95 of the last complete minute in THIS worker, no DB involved.
+
+    Per worker and per minute, so it is a liveness signal — "are we answering
+    quickly right now" — not a measurement; /admin is where the measurement
+    lives. /healthz is itself a request, so a quiet service still reports the
+    watchdog's own polls.
+    """
+    with _lock:
+        _rotate(time.monotonic())
+        hist = list(_recent_done)
+    p50, p95 = percentiles(hist)
+    return {"requests_1m": sum(hist), "p50_ms": p50, "p95_ms": p95}
+
+
 def record(route: str, ms: float, status: int) -> None:
     day = utcnow().strftime("%Y-%m-%d")
     bucket = bucket_for(ms)
     with _lock:
+        _rotate(time.monotonic())
+        _recent[bucket] += 1
         if route not in _routes:
             if len(_routes) >= MAX_ROUTES:
                 route = OTHER
