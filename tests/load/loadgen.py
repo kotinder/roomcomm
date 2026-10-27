@@ -30,6 +30,14 @@ PHASES = {
     "mixed": {"rates": [10, 20, 40, 60, 80, 120, 160], "write_share": 0.2},
     "write": {"rates": [5, 10, 20, 40, 60, 80, 120], "write_share": 1.0},
     "a2a":   {"rates": [5, 10, 20, 40, 60, 80], "a2a": True},
+    # The heaviest write there is: a knock creates a room, its first message
+    # and a knock row in one transaction, after an acquaintance lookup. It is
+    # also the only room-creating path nginx does not shape per minute
+    # (zone=room_create covers /api/rooms, not /api/knocks), so the ceiling
+    # here is the app's, not the proxy's. Needs the generator IP in
+    # RATE_EXEMPT_IPS as well — otherwise main's own per-IP bucket cuts in at
+    # 30 rooms/hour and the phase measures that instead.
+    "knock": {"rates": [5, 10, 20, 40, 60], "knock": True},
 }
 # Several generators split one nominal rate: each runs RATE_MULT of it
 # (two machines -> 0.5), so the step labels stay the combined load.
@@ -76,6 +84,33 @@ def pick_write():
     r = random.choice(live[:8])  # concentrate: 8 hot rooms, like busy negotiations
     body = {"agent_id": f"loadtest-{random.randint(1, 30)}", "text": BODY}
     return "POST", f"/api/rooms/{r}/messages", AUTH, body, "post"
+
+
+# One knock per ordered pair of load-test keys. A second knock to the same
+# target answers 409 knock_pending until the first is answered, so repeating a
+# pair would measure the refusal path; the pool is shuffled and consumed, and a
+# step that exhausts it stops the phase instead of filling the results with
+# 409s. Size is len(KNOCKERS) * (len(KNOCKERS) - 1) — 180 keys is ~32k knocks.
+KNOCKERS = cfg.get("knock") or []
+KNOCK_PAIRS = [(i, j) for i in range(len(KNOCKERS))
+               for j in range(len(KNOCKERS)) if i != j]
+random.shuffle(KNOCK_PAIRS)
+
+
+def pick_knock():
+    """A knock from one load-test key to another, or None when the pool is
+    spent."""
+    if not KNOCK_PAIRS:
+        return None
+    i, j = KNOCK_PAIRS.pop()
+    me, target = KNOCKERS[i], KNOCKERS[j]
+    body = {"to_ref": target["ref"], "agent_id": f"loadtest-knock-{i}",
+            "text": "load test knock: measuring the two-party room path.",
+            # The floor the API allows, so the rooms this phase creates retire
+            # on their own even if teardown never runs.
+            "ttl_hours": 1}
+    return ("POST", "/api/knocks", {"Authorization": f"Bearer {me['key']}"},
+            body, "knock")
 
 
 def pick_a2a():
@@ -171,7 +206,12 @@ async def run_step(sess, canary, phase, rate):
     nxt = time.monotonic()
     abort = None
     while time.monotonic() < t_end:
-        if p.get("a2a"):
+        if p.get("knock"):
+            req = pick_knock()
+            if req is None:
+                abort = "knock pairs exhausted — add keys in setup_prod.py"
+                break
+        elif p.get("a2a"):
             req = pick_a2a()
         elif random.random() < p["write_share"]:
             req = pick_write()
@@ -208,6 +248,10 @@ async def run_step(sess, canary, phase, rate):
 
 async def main():
     phases = sys.argv[3:] or list(PHASES)
+    if "knock" in phases and not KNOCKERS:
+        log(event="skip", phase="knock",
+            reason="setup.json has no 'knock' keys — rerun setup_prod.py")
+        phases = [p for p in phases if p != "knock"]
     conn = aiohttp.TCPConnector(limit=MAX_INFLIGHT, ttl_dns_cache=300, family=2)  # IPv4
     async with aiohttp.ClientSession(connector=conn, timeout=TIMEOUT) as sess, \
             aiohttp.ClientSession(timeout=TIMEOUT,
