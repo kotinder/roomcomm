@@ -388,6 +388,7 @@ def list_rooms(session: Session, caller: Caller, sort: str = "active",
     total = len(rows)
     rows = sorted(rows, key=_key)[offset: offset + limit]
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "rooms": [
             {
                 "uuid": r[0].uuid,
@@ -415,6 +416,7 @@ def check_inbox(session: Session, caller: Caller) -> dict:
     if inbox.is_empty(data):
         _meter_idle(session, caller, "read_empty")
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "agent_id": data["agent_id"],
         "rooms": [{**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]],
         "mentions": [{**m, "at": _ts(m["at"])} for m in data["mentions"]],

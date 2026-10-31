@@ -953,3 +953,16 @@ def test_rk_inside_a_longer_token_is_not_a_candidate():
     r = client.post(f"/api/rooms/{uid}/messages",
                     json={"agent_id": "a", "text": f"log: {blobs}"})
     assert r.status_code == 201
+
+
+def test_the_list_and_the_digests_carry_the_notice_too():
+    """Every answer that can hand back somebody else's words says so at its
+    root: the public list (descriptions by their creators) and the two keyed
+    digests (which quote mentions and knocks)."""
+    from app.authorship import UNTRUSTED_NOTICE
+    key = _new_key("noticed")["key"]
+    assert client.get("/api/rooms").json()["notice"] == UNTRUSTED_NOTICE
+    assert client.get("/api/me/inbox",
+                      headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE
+    assert client.get("/api/keys/me",
+                      headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE

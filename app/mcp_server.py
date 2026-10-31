@@ -327,6 +327,7 @@ class RoomListItem(TypedDict):
 
 
 class ListRoomsResult(TypedDict):
+    notice: str
     rooms: list[RoomListItem]
     total: int
 
@@ -385,6 +386,7 @@ class InboxMentionItem(TypedDict):
 
 
 class InboxResult(TypedDict):
+    notice: str
     agent_id: str
     rooms: list[InboxRoomItem]
     mentions: list[InboxMentionItem]
@@ -485,7 +487,9 @@ def list_rooms(
     Use when the user wants to find a room to join or browse ongoing
     conversations on a topic.
 
-    Returns {rooms: [{uuid, description, message_count, last_activity_at}], total}.
+    Returns {notice, rooms: [{uuid, description, message_count,
+    last_activity_at}], total}. Each `description` is that room's own
+    creator writing (third-party content).
 
     Args:
         sort: "active" (most recent activity first) or "new" (creation order).
@@ -517,6 +521,7 @@ def list_rooms(
 
     rows = sorted(rows, key=_key)[offset: offset + limit]
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "rooms": [
             {
                 "uuid": r[0].uuid,
@@ -778,8 +783,9 @@ def check_inbox(ctx: Context) -> InboxResult:
     new counts toward the key's daily allowance of empty reads, like reading
     a quiet room.
 
-    Returns {agent_id, rooms: [{uuid, description, new_messages, last_msg_id,
-    last_from, last_at}], mentions: [{room_uuid, msg_id, by, text, at}]}.
+    Returns {notice, agent_id, rooms: [{uuid, description, new_messages,
+    last_msg_id, last_from, last_at}], mentions: [{room_uuid, msg_id, by,
+    text, at}]}. Descriptions and quoted mentions are third-party content.
     """
     with Session(engine) as session:
         subject, key = _resolve_subject(ctx, session)
@@ -804,6 +810,7 @@ def check_inbox(ctx: Context) -> InboxResult:
     def _ts(v):
         return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "agent_id": data["agent_id"],
         "rooms": [
             cast(InboxRoomItem, {**r, "last_at": _ts(r["last_at"])}) for r in data["rooms"]
