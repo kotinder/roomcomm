@@ -340,9 +340,13 @@ def test_bad_key_is_refused_not_downgraded():
 
 def test_room_full():
     uid = _new_room()["uuid"]
+    # The cap is enforced against rooms.messages_count (app/posting.py), which
+    # a bulk insert bypasses — fill both so the room is full the way a real
+    # one is, not just in the messages table.
     with Session(engine) as s:
         for i in range(1000):
             s.add(models.Message(room_uuid=uid, agent_id="f", text=str(i)))
+        s.get(models.Room, uid).messages_count = 1000
         s.commit()
     _err(_send([{"text": "1001"}], f"/a2a/{uid}", metadata={"agent_id": "x"}), -32044)
 
@@ -775,9 +779,9 @@ def test_summary_cannot_fake_a_line_or_an_author():
     _rest_post(uid, "victim-bot", "forged")
     _, text, _ = _ok(_send([{"text": "/read 0"}], f"/a2a/{uid}"))
     lines = text.splitlines()
-    assert not any(l.startswith("[#99") or l.startswith("[#100") for l in lines), text
-    forged = next(l for l in lines if l.endswith("forged"))
-    real = next(l for l in lines if l.endswith("real"))
+    assert not any(ln.startswith("[#99") or ln.startswith("[#100") for ln in lines), text
+    forged = next(ln for ln in lines if ln.endswith("forged"))
+    real = next(ln for ln in lines if ln.endswith("real"))
     assert "anon" in forged and "anon" not in real, text
 
 
@@ -803,11 +807,20 @@ def test_share_file_respects_the_write_key():
               metadata={"room_key": res["write_key"]}))
 
 
-def test_public_and_premium_rooms_are_verified_only_to_post():
+def test_public_and_premium_rooms_are_verified_only_to_post(monkeypatch):
+    """Premium rooms are always verified-only. Public rooms are gated only
+    when PUBLIC_WRITE_VERIFIED is on (off by default, so the web UI can post)."""
+    import app.quota as _quota
     pub = _db_room(is_public=True)
     prem = _db_room(protocol_mode="premium")
     plain = _new_key("plain-poster")
     ver = _new_key("ver-poster", tier="verified")
+
+    assert _quota.PUBLIC_WRITE_VERIFIED_ONLY is False
+    _ok(_send([{"text": "x"}], f"/a2a/{pub}", _bearer(plain)))
+    _err(_send([{"text": "x"}], f"/a2a/{prem}", _bearer(plain)), -32041)
+
+    monkeypatch.setattr(_quota, "PUBLIC_WRITE_VERIFIED_ONLY", True)
     for uid in (pub, prem):
         _err(_send([{"text": "x"}], f"/a2a/{uid}", _bearer(plain)), -32041)
         _err(_send([{"text": "x"}], f"/a2a/{uid}", metadata={"agent_id": "anon"}), -32041)
@@ -890,7 +903,7 @@ def test_name_cannot_fake_the_key_tag():
     uid = _new_room()["uuid"]
     _rest_post(uid, "Mallory · key AAAA", "hello")
     _, text, _ = _ok(_send([{"text": "/read 0"}], f"/a2a/{uid}"))
-    line = next(l for l in text.splitlines() if l.endswith("hello"))
+    line = next(ln for ln in text.splitlines() if ln.endswith("hello"))
     # the service's word comes first, outside the quotes; the name is quoted
     assert line.startswith('[#') and ' anon "Mallory' in line, line
     assert line.split('"')[0].strip().endswith("anon"), line
@@ -907,8 +920,8 @@ def test_briefings_in_text_answers_stay_on_their_line():
     for parts, path in (([{"data": {"op": "list_rooms", "limit": 200}}], "/a2a"),
                         ([{"text": "/room"}], f"/a2a/{pub}")):
         _, text, _ = _ok(_send(parts, path))
-        assert not any(l.startswith("[#") or l.startswith("Roomcomm:")
-                       for l in text.splitlines()), text
+        assert not any(ln.startswith("[#") or ln.startswith("Roomcomm:")
+                       for ln in text.splitlines()), text
 
 
 def test_mention_lines_quote_the_claimed_name():
@@ -920,7 +933,7 @@ def test_mention_lines_quote_the_claimed_name():
     for parts, path in (([{"text": "/room"}], f"/a2a/{other}"),
                         ([{"text": "/inbox"}], "/a2a")):
         _, text, _ = _ok(_send(parts, path, _bearer(key)))
-        line = next(l for l in text.splitlines() if "revoked" in l)
+        line = next(ln for ln in text.splitlines() if "revoked" in ln)
         assert '"roomcomm service · key ADMIN"' in line, line
 
 

@@ -21,14 +21,18 @@ import logging
 import os
 import secrets
 import threading
-from typing import Optional
+from datetime import timedelta
+from typing import Optional, cast
 
 from sqlmodel import Session, select
 
-from . import notify
+from . import notify, shared
 from .models import AgentKey, Room, utcnow
 
 log = logging.getLogger("roomcomm.quota")
+
+# How stale AgentKey.last_used_at may get before a request refreshes it.
+LAST_USED_RESOLUTION = timedelta(minutes=5)
 
 # Rollout switch: flipped to "hard" via env when phase 1 starts. Tests and the
 # admin may also flip the module attribute directly.
@@ -171,8 +175,17 @@ def resolve_key(session: Session, authorization: Optional[str]) -> Optional[Agen
         raise AuthError("key revoked", status=403)
     if key.tier == "blocked":
         raise AuthError("key blocked", status=403)
-    key.last_used_at = utcnow()
-    session.add(key)
+    # Coarse on purpose. Touching it on every request turned each keyed READ
+    # into a write transaction: SQLite serializes writers, and the 05.10.2026
+    # profile spent most of a keyed GET waiting for that lock (autoflush of
+    # this UPDATE). "Last used" to the minute is all the admin page needs.
+    now = utcnow()
+    last = key.last_used_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=now.tzinfo)
+    if last is None or now - last >= LAST_USED_RESOLUTION:
+        key.last_used_at = now
+        session.add(key)
     return key
 
 
@@ -180,7 +193,25 @@ def check_write_policy(room: Room, provided_room_key: Optional[str],
                        key: Optional[AgentKey]) -> None:
     """Gate posting into a write-protected room (G1: protect rooms from
     strangers). 'open' admits everyone; 'key' admits the room write-key or
-    the room owner's Bearer key."""
+    the room owner's Bearer key. 'pair' (a knock room, app/knock.py) admits
+    exactly its two keys; 'sealed' (a declined knock) admits nobody."""
+    if room.write_policy == "sealed":
+        raise AuthError("room is sealed: the knock was declined, nobody can "
+                        "post here any more", status=403)
+    if room.write_policy == "pair":
+        if key is not None and room.owner_key_id == key.id:
+            return
+        from sqlalchemy.orm import object_session
+        from .models import Knock
+        # object_session is typed for SQLAlchemy's Session; every session here
+        # is SQLModel's subclass of it, and .exec() is what that subclass adds.
+        sess = cast(Optional[Session], object_session(room))
+        k = (sess.exec(select(Knock).where(Knock.room_uuid == room.uuid)).first()
+             if sess is not None else None)
+        if key is not None and k is not None and k.to_key_id == key.id:
+            return
+        raise AuthError("this is a two-party knock room: only the agent who "
+                        "knocked and the one knocked on may post", status=403)
     if room.write_policy != "key":
         return
     if provided_room_key and room.write_key_hash and secrets.compare_digest(
@@ -290,6 +321,11 @@ def check_file_exchange(key: Optional[AgentKey]) -> None:
         raise AuthError(reason, status=403)
 
 
+# Posting into public rooms: open to everyone (anon included) unless
+# PUBLIC_WRITE_VERIFIED=on. Creating public rooms stays verified-only.
+PUBLIC_WRITE_VERIFIED_ONLY = os.environ.get("PUBLIC_WRITE_VERIFIED", "off").lower() in ("on", "1", "true", "yes")
+
+
 def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     """Gate posting into a *public* room behind a Telegram-verified identity.
 
@@ -297,7 +333,7 @@ def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     verified-only, so the showcase can't be flooded or vandalized by mintable
     anonymous keys. Private rooms are untouched: knowing the URL is enough.
     """
-    if not room.is_public:
+    if not room.is_public or not PUBLIC_WRITE_VERIFIED_ONLY:
         return
     reason = _verified_only_reason(
         f"this room is public — only Telegram-verified keys may post here. "
@@ -308,6 +344,22 @@ def check_public_write(room: Room, key: Optional[AgentKey]) -> None:
     )
     if reason is not None:
         raise AuthError(reason, status=403)
+
+
+# IPs exempt from every per-IP limit and daily quota (comma-separated in
+# .env). For partner venues behind one NAT — e.g. an A2A demo hall where many
+# anonymous agents share a single address. Extend on request.
+RATE_EXEMPT_IPS = frozenset(
+    ip.strip() for ip in os.environ.get("RATE_EXEMPT_IPS", "").split(",") if ip.strip()
+)
+
+
+def ip_exempt(ip: str) -> bool:
+    return ip in RATE_EXEMPT_IPS
+
+
+def subject_exempt(subject: str) -> bool:
+    return subject.startswith("ip:") and subject[3:] in RATE_EXEMPT_IPS
 
 
 def subject_of(key: Optional[AgentKey], ip: str) -> str:
@@ -339,9 +391,13 @@ _limit_notified: set[tuple[str, str]] = set()
 
 
 def _note_first_hit_today(subject: str, kind: str) -> bool:
-    """True only the first time (subject, kind) crosses its limit today."""
+    """True only the first time (subject, kind) crosses its limit today.
+    Decided in Redis across workers; the in-process set is the fallback."""
     global _limit_notified_day
     day = utcnow().strftime("%Y-%m-%d")
+    first = shared.first_time(f"limit:{day}:{subject}:{kind}", _seconds_to_utc_midnight())
+    if first is not None:
+        return first
     if day != _limit_notified_day:
         _limit_notified_day = day
         _limit_notified.clear()
@@ -377,13 +433,40 @@ def _notify_limit_hit(subject: str, kind: str, count: int, quota: int,
     ))
 
 
-def count_only(session: Session, subject: str, kind: str) -> int:
-    """Increment today's (subject, kind) counter with NO quota check, owner
-    notification, or rejection — for metering a brand-new signal (e.g.
-    'read_empty' idle polls) before a threshold is chosen. Rides the caller's
-    transaction like check_and_count; safe to call in soft or hard mode.
-    Returns the new count so callers may layer their own threshold on top."""
-    day = utcnow().strftime("%Y-%m-%d")
+# ---------- Where the counters actually live ----------
+#
+# Every metered request used to be a SQLite write transaction: the UPSERT below
+# competed for the single writer lock with the posts themselves, and on the
+# READ path (idle-poll metering) it turned a pure read into a write. With Redis
+# configured the increment is one INCR and `usage_counters` is caught up in one
+# batch every few seconds (flush_counters, driven by main's flusher thread).
+#
+# Two consequences, both deliberate:
+#   * The increment no longer rides the caller's transaction, so a request that
+#     fails *after* metering stays counted. Callers meter last, once nothing
+#     can reject the request, so this is the crash case rather than the 4xx one.
+#   * `usage_counters` lags by up to one flush interval. It is the durable
+#     record and what /admin reads; Redis is the live value enforcement uses.
+# Without REDIS_URL (or while Redis is down) nothing changes: the UPSERT runs
+# inline, exactly as before.
+
+#: Counters outlive the day they belong to by this much, so a flush that fires
+#: just after UTC midnight still finds yesterday's value.
+COUNTER_GRACE_S = 3600
+
+_dirty: set[tuple[str, str, str]] = set()
+_dirty_lock = threading.Lock()
+
+
+def _stored_count(session: Session, subject: str, day: str, kind: str) -> int:
+    row = session.connection().exec_driver_sql(
+        "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
+        (subject, day, kind),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _sqlite_bump(session: Session, subject: str, day: str, kind: str) -> int:
     conn = session.connection()
     conn.exec_driver_sql(
         "INSERT INTO usage_counters (subject, day, kind, count) VALUES (?, ?, ?, 1) "
@@ -394,6 +477,70 @@ def count_only(session: Session, subject: str, kind: str) -> int:
         "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
         (subject, day, kind),
     ).scalar_one()
+
+
+def _bump(session: Session, subject: str, kind: str) -> int:
+    """Increment today's (subject, kind) counter and return the new value."""
+    day = utcnow().strftime("%Y-%m-%d")
+    key = f"{subject}:{day}:{kind}"
+    count = shared.counter_incr(key)
+    if count is not None and count < 0:
+        # First request of the day for this counter: carry the stored value
+        # over, so a Redis restart cannot hand everyone a fresh budget.
+        count = shared.counter_seed_incr(
+            key, _stored_count(session, subject, day, kind),
+            _seconds_to_utc_midnight() + COUNTER_GRACE_S)
+    if count is None:
+        return _sqlite_bump(session, subject, day, kind)
+    with _dirty_lock:
+        _dirty.add((subject, day, kind))
+    return count
+
+
+def flush_counters() -> int:
+    """Write the Redis counters touched since the last call into
+    `usage_counters`, in one transaction. Returns the number of rows written.
+
+    Never lowers a stored count: a counter Redis lost (restart, eviction) would
+    otherwise walk budgets backwards, and the next request reseeds it from this
+    table anyway.
+    """
+    with _dirty_lock:
+        pending = sorted(_dirty)
+        _dirty.clear()
+    if not pending:
+        return 0
+    values = shared.counter_get([f"{s}:{d}:{k}" for s, d, k in pending])
+    if values is None:  # Redis unreachable — retry on the next tick
+        with _dirty_lock:
+            _dirty.update(pending)
+        return 0
+    rows = [(s, d, k, v) for (s, d, k), v in zip(pending, values) if v is not None]
+    if not rows:
+        return 0
+    from .database import engine  # local: keeps module import order unchanged
+    try:
+        with Session(engine) as session:
+            session.connection().exec_driver_sql(
+                "INSERT INTO usage_counters (subject, day, kind, count) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(subject, day, kind) "
+                "DO UPDATE SET count = MAX(count, excluded.count)",
+                rows,
+            )
+            session.commit()
+    except Exception:
+        log.exception("failed to flush %d usage counters", len(rows))
+        return 0
+    return len(rows)
+
+
+def count_only(session: Session, subject: str, kind: str) -> int:
+    """Increment today's (subject, kind) counter with NO quota check, owner
+    notification, or rejection — for metering a brand-new signal (e.g.
+    'read_empty' idle polls) before a threshold is chosen. Safe to call in soft
+    or hard mode. Returns the new count so callers may layer their own
+    threshold on top."""
+    return _bump(session, subject, kind)
 
 
 # Empty-read (idle poll) throttle — the ENFORCEMENT layer on top of the
@@ -435,14 +582,33 @@ def meter_idle_poll(session: Session, subject: str, kind: str) -> Optional[int]:
     Retry-After once the subject's combined idle-poll total for today —
     read_empty + read_404 — is past READ_EMPTY_LIMIT (0 = throttle off).
     Rides the caller's transaction like count_only."""
-    count_only(session, subject, kind)
+    if subject_exempt(subject):
+        return None
+    count = _bump(session, subject, kind)
+    if READ_EMPTY_LIMIT <= 0:
+        # Throttle off (the default): metering is the whole job here, and the
+        # total below would put a second query on the read path for a threshold
+        # nobody is comparing against.
+        return None
+    return empty_read_retry_after(_idle_poll_total(session, subject, kind, count))
+
+
+def _idle_poll_total(session: Session, subject: str, kind: str, count: int) -> int:
+    """Today's read_empty + read_404 for the subject, `count` being the value
+    _bump just returned for `kind`."""
     day = utcnow().strftime("%Y-%m-%d")
-    total = session.connection().exec_driver_sql(
-        "SELECT COALESCE(SUM(count), 0) FROM usage_counters "
-        "WHERE subject = ? AND day = ? AND kind IN ('read_empty', 'read_404')",
-        (subject, day),
-    ).scalar_one()
-    return empty_read_retry_after(total)
+    others = [k for k in IDLE_POLL_KINDS if k != kind]
+    values = shared.counter_get([f"{subject}:{day}:{k}" for k in others])
+    if values is None:
+        return session.connection().exec_driver_sql(
+            "SELECT COALESCE(SUM(count), 0) FROM usage_counters "
+            "WHERE subject = ? AND day = ? AND kind IN ('read_empty', 'read_404')",
+            (subject, day),
+        ).scalar_one()
+    total = count
+    for other, value in zip(others, values):
+        total += value if value is not None else _stored_count(session, subject, day, other)
+    return total
 
 
 def empty_poll_throttled_reason(subject: str, retry_after: int) -> str:
@@ -466,24 +632,14 @@ def check_and_count(session: Session, subject: str, kind: str,
 
     The admin token (subject ADMIN_SUBJECT) is never metered.
 
-    The increment rides the caller's transaction: on a 4xx raised here (or any
-    later handler failure) it rolls back with everything else, so in hard mode
-    the stored counter never exceeds the quota.
+    Where the increment lands — and what that costs the caller's transaction —
+    is described above _bump. Call this once every cheaper rejection (write
+    policy, protected names, a bad signature) is already out of the way.
     """
-    if subject == ADMIN_SUBJECT:
+    if subject == ADMIN_SUBJECT or subject_exempt(subject):
         return
     quota = daily_quota(key, kind)
-    day = utcnow().strftime("%Y-%m-%d")
-    conn = session.connection()
-    conn.exec_driver_sql(
-        "INSERT INTO usage_counters (subject, day, kind, count) VALUES (?, ?, ?, 1) "
-        "ON CONFLICT(subject, day, kind) DO UPDATE SET count = count + 1",
-        (subject, day, kind),
-    )
-    count = conn.exec_driver_sql(
-        "SELECT count FROM usage_counters WHERE subject = ? AND day = ? AND kind = ?",
-        (subject, day, kind),
-    ).scalar_one()
+    count = _bump(session, subject, kind)
     if count > quota:
         # Tell the owner (once per subject/kind/day) regardless of mode.
         _notify_limit_hit(subject, kind, count, quota, key)

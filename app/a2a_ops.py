@@ -18,10 +18,9 @@ from typing import Any, Callable, Optional
 
 from sqlmodel import Session, func, select
 
-from . import authorship, files, inbox, llm, quota, ttl
+from . import authorship, files, inbox, llm, posting, quota, ttl
 from .models import AgentKey, Message, Room, RoomSeen
 
-MAX_MESSAGES_PER_ROOM = 1000
 TEXT_MAX = 10_000
 AGENT_ID_MAX = 100
 DESCRIPTION_MAX = 500
@@ -210,21 +209,17 @@ def post(session: Session, caller: Caller, room: str, text: str,
     denied = authorship.protected_denied_reason(agent_id, caller.key, quota.PREMIUM_TIERS)
     if denied:
         raise OpError("forbidden", denied, 403)
+    # Metering and the slot claim last: from here on every statement writes,
+    # so SQLite's write lock is held for the insert burst only (see posting).
     _count(session, caller, "msg")
-    count = session.exec(
-        select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
-    ).one()
-    if count >= MAX_MESSAGES_PER_ROOM:
-        raise OpError("room_full", "room_full: room message limit reached (1000) — "
-                      "permanent for this room, not your quota. Ask the owner for a new room.", 429)
+    if not posting.claim_slot(session, r):
+        raise OpError("room_full", posting.ROOM_FULL_DETAIL, 429)
     msg = Message(room_uuid=room_uuid, agent_id=agent_id, text=text,
                   key_id=caller.key.id if caller.key else None)
     session.add(msg)
     session.flush()
     if caller.key is not None:
         inbox.advance_seen(session, caller.key.id, room_uuid, msg.id)
-    if ttl.extend_on_activity(r):
-        session.add(r)
     session.commit()
     session.refresh(msg)
     session.refresh(r)
@@ -417,6 +412,7 @@ def check_inbox(session: Session, caller: Caller) -> dict:
         "agent_id": data["agent_id"],
         "rooms": [{**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]],
         "mentions": [{**m, "at": _ts(m["at"])} for m in data["mentions"]],
+        "knocks": [{**k, "at": _ts(k["at"])} for k in data.get("knocks", [])],
     }
 
 

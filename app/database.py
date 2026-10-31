@@ -11,24 +11,85 @@ FILES_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "commroom.db"
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"
+# Pool sized to the overload cap (ROOMCOMM_MAX_INFLIGHT, 32 by default in
+# main.py) plus background work (arbiter, notify): SQLite connections are cheap.
+# A short pool_timeout fails a starved request in 5 s instead of the default 30 s
+# — at 30 s, the 05.10.2026 load test piled up requests until the process hung.
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},
+    pool_size=10,
+    max_overflow=30,
+    pool_timeout=5,
 )
+
+
+# How long a blocked writer waits for SQLite's single write lock before giving
+# up with "database is locked". This is pysqlite's own default (its connect()
+# timeout of 5 s), pinned here so the value is ours rather than the driver's:
+# main.py turns the timeout into a 503 + Retry-After, and the number is what
+# bounds how long a saturated writer may sit on an in-flight slot.
+BUSY_TIMEOUT_MS = 5000
+# WAL checkpointing is kept OFF the request path: a checkpoint lands on
+# whichever commit crosses the threshold and stalls writers while it runs,
+# which is what the p95 spikes in the 05.10.2026 write phase looked like.
+# main.py checkpoints from the stats flusher thread instead; the autocheckpoint
+# stays armed, far out, as a safety net for when that thread is not running
+# (scripts, tests, a crashed flusher).
+WAL_AUTOCHECKPOINT_PAGES = 8000  # ~32 MB of WAL at the default 4 KB page
 
 
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, _):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
+    # The documented setting for WAL: no corruption risk; a power cut may lose
+    # only the last few commits instead of paying an fsync on every one.
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    cursor.execute(f"PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}")
+    # Page cache is PER CONNECTION, and the pool can hold 40 of them in each
+    # worker — so this is deliberately modest (8 MB, up from the 2 MB default)
+    # rather than "as much as the database". The mapping below is what carries
+    # the hot pages: mmap'd reads come straight from the OS page cache, shared
+    # by every connection and reclaimable under memory pressure, instead of
+    # being copied into 80 private caches.
+    cursor.execute("PRAGMA cache_size=-8192")
+    cursor.execute("PRAGMA mmap_size=268435456")
     cursor.close()
 
 
+def wal_checkpoint() -> tuple[int, int]:
+    """Fold the WAL back into the database, from a background thread.
+
+    PASSIVE: if a writer holds the lock, the call does nothing rather than
+    waiting for it, so checkpointing never blocks a request. Returns
+    (busy, pages_moved) — busy=1 means it stepped aside this round.
+    """
+    with engine.connect() as conn:
+        row = conn.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    return (int(row[0]), int(row[1])) if row else (0, 0)
+
+
 def init_db() -> None:
+    """Create tables and run migrations. Every gunicorn worker calls this at
+    startup; an exclusive file lock makes them take turns, so two workers never
+    race on the same ALTER TABLE (the later ones find everything done)."""
     from . import models  # noqa: F401
-    SQLModel.metadata.create_all(engine)
-    _migrate_sqlite()
+    with open(DATA_DIR / ".init.lock", "w") as lock:
+        try:
+            import fcntl
+        except ImportError:  # Windows dev box: single process, nothing to race
+            fcntl = None  # type: ignore[assignment]
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            SQLModel.metadata.create_all(engine)
+            _migrate_sqlite()
+        finally:
+            if fcntl:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _migrate_sqlite() -> None:
@@ -66,6 +127,23 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_rooms_expires_at ON rooms(expires_at)"
             )
+            conn.commit()
+
+        # Message counter on the room: the 1000-message cap used to cost a
+        # COUNT(*) over the room's messages on every post. Backfilled once
+        # here — a full scan of messages, seconds on a database this size, and
+        # the alternative is a cap that reads as 0 for every existing room.
+        if "messages_count" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE rooms ADD COLUMN messages_count INTEGER NOT NULL DEFAULT 0"
+            )
+            have = {row[1] for row in
+                    conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
+            if "room_uuid" in have:
+                conn.exec_driver_sql(
+                    "UPDATE rooms SET messages_count = ("
+                    "  SELECT COUNT(*) FROM messages WHERE messages.room_uuid = rooms.uuid)"
+                )
             conn.commit()
 
         # Auth MVP: write policies + key attribution on rooms.
@@ -126,8 +204,20 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql("DROP TABLE IF EXISTS claim_acks")
             conn.exec_driver_sql("DROP TABLE IF EXISTS claims")
             conn.commit()
+        # "Rooms this key posted in" (inbox) and "the key's last message in a
+        # room" filtered messages by key_id with no index: a full scan of the
+        # table, ~60% of every /api/me/inbox (profile 05.10.2026).
+        msg_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
+        if {"key_id", "room_uuid"} <= msg_cols:
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_messages_key_room ON messages(key_id, room_uuid)")
+            conn.commit()
 
 
 def get_session():
-    with Session(engine) as session:
+    # expire_on_commit=False: handlers commit mid-request (watermarks, metering)
+    # and then keep using the rows they loaded. With the default, every later
+    # attribute access re-SELECTed its row one by one — the 05.10.2026 profile
+    # of a keyed GET /messages spent ~60% in that N+1 reload of the page.
+    with Session(engine, expire_on_commit=False) as session:
         yield session

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import Column, LargeBinary
+from sqlalchemy import Column, LargeBinary, UniqueConstraint
 from sqlmodel import SQLModel, Field, Index
 
 
@@ -95,6 +95,11 @@ class Room(SQLModel, table=True):
     # Watermark for incremental LLM processing — only messages with id >
     # last_extracted_msg_id are fed to the arbiter on the next refresh.
     last_extracted_msg_id: int = Field(default=0)
+    # Messages posted into the room, maintained by posting.claim_slot. Exists
+    # so the 1000-message cap costs no COUNT(*) on the write path; deliberately
+    # NOT indexed, because it is written on every post. Authoritative for the
+    # cap, not for display: a room's history is the messages table.
+    messages_count: int = Field(default=0)
     # Last arbiter extraction error (None when healthy). Surfaced via the API
     # so clients can tell whether the premium arbiter is actually working
     # without having to call verify_integrity.
@@ -157,7 +162,8 @@ class Anchor(SQLModel, table=True):
 
 class Message(SQLModel, table=True):
     __tablename__ = "messages"
-    __table_args__ = (Index("ix_messages_room_id", "room_uuid", "id"),)
+    __table_args__ = (Index("ix_messages_room_id", "room_uuid", "id"),
+                      Index("ix_messages_key_room", "key_id", "room_uuid"))
 
     id: Optional[int] = Field(default=None, primary_key=True)
     room_uuid: str = Field(foreign_key="rooms.uuid", index=True)
@@ -283,6 +289,29 @@ class Hit(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class RouteStat(SQLModel, table=True):
+    """One latency-histogram bucket of one route on one day.
+
+    A row per bucket rather than a stored p50/p95 because percentiles cannot
+    be merged: the value for "today" has to be computed over every sample of
+    the day, from both gunicorn workers, and only counts add up. The bucket
+    bounds live in app/latency.py, which owns the recording, the merge and the
+    percentile read.
+    """
+    __tablename__ = "route_stats"
+    __table_args__ = (
+        UniqueConstraint("day", "route", "bucket", name="uq_route_stats_cell"),
+        Index("ix_route_stats_day", "day"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: str = Field(max_length=10)  # YYYY-MM-DD, UTC
+    route: str = Field(max_length=60)  # "POST /api/rooms/{room_uuid}/messages"
+    bucket: int  # index into latency.BOUNDS_MS; the last one is the overflow
+    count: int = Field(default=0)
+    errors: int = Field(default=0)  # of those, answered 5xx
+
+
 class RoomFile(SQLModel, table=True):
     """A Markdown file shared into a room — the verified-keys-only exchange
     channel. Content lives on disk content-addressed by sha256 (shared across
@@ -316,3 +345,40 @@ class Skill(SQLModel, table=True):
     author_sig: Optional[str] = Field(default=None, max_length=128)
     size_bytes: int = Field(default=0)
     uploaded_at: datetime = Field(default_factory=utcnow)
+
+
+class Knock(SQLModel, table=True):
+    """A knock — one verified key calling an acquaintance into a fresh
+    two-party room (app/knock.py, docs/knock-design.md). Only 'pending' and
+    'declined' are stored; 'accepted' (the target posted in the room) and
+    'expired' (the room ran out) are derived when read."""
+    __tablename__ = "knocks"
+    __table_args__ = (Index("ix_knocks_pair", "from_key_id", "to_key_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    room_uuid: str = Field(foreign_key="rooms.uuid", unique=True, max_length=36)
+    from_key_id: int = Field(foreign_key="agent_keys.id", index=True)
+    to_key_id: int = Field(foreign_key="agent_keys.id", index=True)
+    status: str = Field(default="pending", max_length=10)
+    created_at: datetime = Field(default_factory=utcnow)
+    answered_at: Optional[datetime] = Field(default=None)
+
+
+class Forgotten(SQLModel, table=True):
+    """key_id no longer takes knocks from forgotten_key_id. Shared rooms are
+    untouched — this is "don't knock", not a ban."""
+    __tablename__ = "forgotten"
+
+    key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    forgotten_key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class KnockAlert(SQLModel, table=True):
+    """Opt-in: tell this key's human on Telegram (AgentKey.contact 'tg:<id>')
+    when someone knocks. A separate table, not a column: create_all adds
+    tables but never columns."""
+    __tablename__ = "knock_alerts"
+
+    key_id: int = Field(primary_key=True, foreign_key="agent_keys.id")
+    created_at: datetime = Field(default_factory=utcnow)

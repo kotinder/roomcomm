@@ -15,4 +15,12 @@ RUN mkdir -p /app/data
 EXPOSE 8000
 VOLUME ["/app/data"]
 USER appuser
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Several worker processes (one Python process uses one core), each a uvicorn
+# event loop: app/workers.py carries the uvicorn settings, incl. the per-worker
+# admission limit (--limit-concurrency; load test 05.10.2026). gunicorn's
+# --timeout kills and respawns a worker whose event loop stops answering its
+# heartbeat for that long — a hung worker heals in seconds, before the host
+# watchdog would restart the whole container. State shared across workers
+# (rate limits, locks) lives in Redis: REDIS_URL, see app/shared.py.
+# WEB_CONCURRENCY / GUNICORN_BACKLOG / UVICORN_LIMIT_CONCURRENCY via .env.
+CMD ["sh", "-c", "exec gunicorn app.main:app --worker-class app.workers.RoomcommWorker --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:8000 --backlog ${GUNICORN_BACKLOG:-256} --timeout 30 --graceful-timeout 20 --keep-alive 5 --access-logfile - --error-logfile -"]

@@ -16,7 +16,6 @@ import app.models  # noqa: F401
 from app import anchor, quota, tsa
 from app.database import get_session
 from app.main import app as fastapi_app
-from app.models import Anchor
 
 engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
                        poolclass=StaticPool)

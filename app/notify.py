@@ -141,3 +141,30 @@ def format_error(
         f"<b>Where:</b> {html.escape(where)}{extra}\n"
         f"<b>Error:</b> <code>{html.escape(repr(exc))[:600]}</code>"
     )
+
+
+def format_latency_regression(
+    *,
+    route: str,
+    p95: int,
+    baseline: int,
+    count: int,
+    errors: int,
+    days: int,
+    admin_url: str,
+) -> str:
+    """One route's p95 today against the days before it (app/latency.py).
+
+    The baseline is in the message because the number alone decides nothing:
+    400 ms is ordinary for a page that renders a room and alarming for a poll,
+    and only the route's own history says which this is.
+    """
+    err = f"\n<b>5xx today:</b> {errors}" if errors else ""
+    return (
+        f"🐢 <b>Roomcomm route slowed down</b>\n"
+        f"<b>Route:</b> <code>{html.escape(route)}</code>\n"
+        f"<b>p95 today:</b> {p95} ms (was {baseline} ms over the previous "
+        f"{days} days)\n"
+        f"<b>Requests today:</b> {count}{err}\n"
+        f'<a href="{html.escape(admin_url)}">{html.escape(admin_url)}</a>'
+    )

@@ -12,7 +12,6 @@ from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401
 import app.main as _main
-import app.quota as quota
 from app.main import app as fastapi_app
 from app.database import get_session
 from app.models import AgentKey

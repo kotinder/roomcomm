@@ -7,3 +7,7 @@ pynacl>=1.5
 pytest>=8.0
 httpx>=0.27
 mcp[cli]>=1.0,<2  # 2.0 = spec 2026-07-28 (stateless); migrate deliberately — mcp_server.py extracts streamable_http_app() internals
+# Multi-process serving (Dockerfile CMD) and state shared across workers (app/shared.py).
+gunicorn>=23
+uvicorn-worker>=0.3
+redis>=5

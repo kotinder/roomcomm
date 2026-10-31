@@ -671,7 +671,7 @@ def _send_message(params: dict, request: Request, background_tasks: BackgroundTa
     msg = _parse_message(params)
     parts = msg["parts"]
     texts = [p["text"] for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)]
-    data = next((p["data"] for p in parts
+    data: dict = next((p["data"] for p in parts
                  if isinstance(p, dict) and isinstance(p.get("data"), dict)), {})
     raw_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
     meta = {"agent_id": _str_arg(raw_meta, "agent_id", 100),
@@ -692,7 +692,7 @@ def op_name(data: dict) -> Optional[str]:
 
 
 def _attach_awaiting(reply: dict, session: Session, caller: ops.Caller) -> None:
-    """The awaiting notice: whatever the agent asked, the answer also says
+    """The igrastation pattern: whatever the agent asked, the answer also says
     where it is awaited — a mention of its agent_id or new messages in its
     other rooms. Reaches agents that never heard of check_inbox. Best effort:
     a failure here never costs the agent its actual answer."""
@@ -704,9 +704,12 @@ def _attach_awaiting(reply: dict, session: Session, caller: ops.Caller) -> None:
         log.exception("a2a: awaiting digest failed")
         session.rollback()
         return
-    if not aw["rooms"] and not aw["mentions"]:
+    if not aw["rooms"] and not aw["mentions"] and not aw.get("knocks"):
         return
-    lines = [f"- {_claimed(x['by'])} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
+    lines = [f"- {_claimed(x['from'])} knocked: they call you into room {x['room_uuid']} "
+             f"(knock #{x['knock_id']}): {_quote_safe(x['text'])[:160]}"
+             for x in aw.get("knocks", [])]
+    lines += [f"- {_claimed(x['by'])} mentioned you in room {x['room_uuid']} (#{x['msg_id']}): "
              f"{_quote_safe(x['text'])[:160]}" for x in aw["mentions"]]
     lines += [f"- {x['new_messages']} new in room {x['uuid']}" for x in aw["rooms"]]
     m["parts"][0]["text"] += ("\n\nAwaiting you elsewhere (read a room to clear it):\n"
@@ -714,6 +717,7 @@ def _attach_awaiting(reply: dict, session: Session, caller: ops.Caller) -> None:
     data_part = m["parts"][-1]
     if isinstance(data_part.get("data"), dict):
         data_part["data"]["awaiting"] = {
+            "knocks": [{**x, "at": _ts(x["at"])} for x in aw.get("knocks", [])],
             "rooms": aw["rooms"],
             "mentions": [{**x, "at": _ts(x["at"])} for x in aw["mentions"]],
         }
@@ -885,10 +889,10 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
         text = _fmt_messages(res["messages"], 50) or "No new messages."
         return _reply(text, res, ctx_out or res["room"])
     if op == "post":
-        text = _str_arg(data, "text", ops.TEXT_MAX)
-        if not text:
+        post_text = _str_arg(data, "text", ops.TEXT_MAX)
+        if not post_text:
             raise RpcError(INVALID_PARAMS, "post needs text")
-        return _post_and_catch_up(session, caller, room, text, agent_id, room_key,
+        return _post_and_catch_up(session, caller, room, post_text, agent_id, room_key,
                                   background_tasks, ctx_out,
                                   _int_arg(data, "since", 0) if "since" in data else meta["since"])
     if op == "share_file":

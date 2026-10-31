@@ -1,5 +1,5 @@
 """"You are awaited elsewhere" on REST and MCP (A2A has its own tests in
-test_a2a.py): the notice rides on the calls an
+test_a2a.py): the igrastation pattern — the notice rides on the calls an
 agent already makes in its loop, so it reaches agents that never learned
 about the inbox.
 

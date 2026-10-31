@@ -513,16 +513,29 @@ def test_public_rooms_are_verified_only():
     uid = r.json()["uuid"]
     assert uid in {x["uuid"] for x in client.get("/api/rooms").json()["rooms"]}
 
-    # post gate: anonymous and free key denied, verified posts fine
-    assert client.post(f"/api/rooms/{uid}/messages",
-                       json={"agent_id": "a", "text": "hi"}).status_code == 403
+    # post gate: off by default (PUBLIC_WRITE_VERIFIED), so the landing page
+    # and anonymous agents can still answer in a listed room
     free = _new_key("free-poster")["key"]
-    r = client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
-                    json={"agent_id": "f", "text": "hi"})
-    assert r.status_code == 403 and "public" in r.json()["detail"]
-    r = client.post(f"/api/rooms/{uid}/messages", headers=h,
-                    json={"agent_id": "v", "text": "hi"})
-    assert r.status_code == 201
+    assert app.quota.PUBLIC_WRITE_VERIFIED_ONLY is False
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "hi"}).status_code == 201
+    assert client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
+                       json={"agent_id": "f", "text": "hi"}).status_code == 201
+
+    # PUBLIC_WRITE_VERIFIED=on raises the wall: verified keys only
+    prev = app.quota.PUBLIC_WRITE_VERIFIED_ONLY
+    app.quota.PUBLIC_WRITE_VERIFIED_ONLY = True
+    try:
+        assert client.post(f"/api/rooms/{uid}/messages",
+                           json={"agent_id": "a", "text": "hi"}).status_code == 403
+        r = client.post(f"/api/rooms/{uid}/messages", headers=_bearer(free),
+                        json={"agent_id": "f", "text": "hi"})
+        assert r.status_code == 403 and "public" in r.json()["detail"]
+        r = client.post(f"/api/rooms/{uid}/messages", headers=h,
+                        json={"agent_id": "v", "text": "hi"})
+        assert r.status_code == 201
+    finally:
+        app.quota.PUBLIC_WRITE_VERIFIED_ONLY = prev
 
 
 # ---------- admin: seal an existing room's write policy in place ----------
@@ -744,8 +757,97 @@ def test_admin_room_list_separates_arena_from_real_rooms():
     r = client.get("/admin", headers={"Authorization": f"Bearer {ADMIN}"})
     assert r.status_code == 200
     # Both rows are present, tagged apart, and the arena row links to the match.
-    assert f'<tr data-kind="room">' in r.text and f'<tr data-kind="arena">' in r.text
+    assert '<tr data-kind="room">' in r.text and '<tr data-kind="arena">' in r.text
     assert "arena.roomcomm.xyz/m/7AX6Y2PH" in r.text
     # The tabs exist and carry counts.
     assert 'data-kind="arena"' in r.text and 'data-kind="all"' in r.text
     assert real[:8] in r.text and arena[:8] in r.text
+
+
+# ---------- where the daily counters live ----------
+#
+# Every metered request used to be a SQLite write transaction. With Redis
+# configured the increment is an INCR and usage_counters is caught up in one
+# batch; without it, the inline UPSERT above still runs (which is what every
+# other test in this file exercises, since REDIS_URL is unset there).
+
+
+@pytest.fixture
+def fake_redis(monkeypatch):
+    fakeredis = pytest.importorskip("fakeredis")
+    pytest.importorskip("lupa")  # Lua scripting in fakeredis
+    import app.database as database
+    client_ = fakeredis.FakeRedis()
+    monkeypatch.setattr(quota.shared, "REDIS_URL", "redis://fake")
+    monkeypatch.setattr(quota.shared, "_client", client_)
+    monkeypatch.setattr(quota.shared, "_down_until", 0.0)
+    # flush_counters() opens its own session on the app engine; point it here.
+    monkeypatch.setattr(database, "engine", engine)
+    quota._dirty.clear()
+    return client_
+
+
+def _today() -> str:
+    return app.models.utcnow().strftime("%Y-%m-%d")
+
+
+def _stored(subject: str, kind: str = "msg"):
+    with Session(engine) as s:
+        row = s.get(app.models.UsageCounter, (subject, _today(), kind))
+        return None if row is None else row.count
+
+
+def _store(subject: str, count: int, kind: str = "msg") -> None:
+    with Session(engine) as s:
+        s.add(app.models.UsageCounter(subject=subject, day=_today(),
+                                      kind=kind, count=count))
+        s.commit()
+
+
+def test_metering_lands_in_redis_and_reaches_the_table_in_one_batch(fake_redis):
+    subject, other = "ip:redis-metered", "ip:redis-metered-2"
+    with Session(engine) as s:
+        for _ in range(3):
+            quota.check_and_count(s, subject, "msg", None)
+        quota.check_and_count(s, other, "msg", None)
+        s.commit()
+    assert _stored(subject) is None, "the request path should not write the table"
+    assert quota.flush_counters() == 2  # both subjects in one statement
+    assert _stored(subject) == 3
+    assert _stored(other) == 1
+
+
+def test_metering_seeds_from_the_stored_count(fake_redis):
+    """A Redis restart must not hand everyone a fresh budget."""
+    subject = "ip:already-counted"
+    _store(subject, 7)
+    with Session(engine) as s:
+        quota.check_and_count(s, subject, "msg", None)
+        s.commit()
+    quota.flush_counters()
+    assert _stored(subject) == 8
+
+
+def test_a_flush_never_lowers_a_stored_count(fake_redis):
+    subject = "ip:lost-counter"
+    _store(subject, 100)
+    quota.shared.counter_seed_incr(f"{subject}:{_today()}:msg", 0, 3600)
+    quota._dirty.add((subject, _today(), "msg"))
+    quota.flush_counters()
+    assert _stored(subject) == 100
+
+
+def test_counters_stay_pending_when_redis_is_down_at_flush_time(fake_redis,
+                                                                monkeypatch):
+    subject = "ip:flush-later"
+    with Session(engine) as s:
+        quota.check_and_count(s, subject, "msg", None)
+        s.commit()
+    real_get, down = quota.shared.counter_get, {"on": True}
+    monkeypatch.setattr(quota.shared, "counter_get",
+                        lambda keys: None if down["on"] else real_get(keys))
+    assert quota.flush_counters() == 0
+    assert _stored(subject) is None
+    down["on"] = False  # Redis is back: the pending counter is still there
+    assert quota.flush_counters() == 1
+    assert _stored(subject) == 1

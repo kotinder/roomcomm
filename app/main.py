@@ -6,16 +6,18 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
+import threading
 import tarfile
 import time
 import uuid as uuid_lib
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Optional, cast
 from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -24,6 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.exc import OperationalError as SAOperationalError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlmodel import Session, delete, select, func
 
 ADMIN_TOKEN = os.environ.get("ROOMCOMM_ADMIN_TOKEN", "")
@@ -111,8 +115,21 @@ def _client_ip(request: Request) -> str:
 
 def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
                        limit: int, window: int, what: str) -> None:
-    """Raise 429 if the IP exceeded `limit` events in the sliding `window`."""
+    """Raise 429 if the IP exceeded `limit` events in the sliding `window`.
+    Counted in Redis across all workers; the in-process bucket is the
+    fallback while Redis is unavailable (see app/shared.py)."""
     ip = _client_ip(request)
+    if quota.ip_exempt(ip):
+        return
+    retry = shared.rate_hit(what.replace(" ", "_"), ip, limit, window)
+    if retry is not None:
+        if retry > 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many {what} from this IP. Try again in {retry}s.",
+                headers={"Retry-After": str(retry)},
+            )
+        return
     now = time.monotonic()
     with lock:
         bucket = buckets[ip]
@@ -165,11 +182,12 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, llm, notify, pcis, quota,
-               tg_bot, ttl)
-from .database import SKILLS_DIR, engine, get_session, init_db
+from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, notify,
+               pcis, posting, quota, shared, tg_bot, ttl)
+from .database import (SKILLS_DIR, engine, get_session, init_db, wal_checkpoint,
+                       DB_PATH)
 from .models import (
-    AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Message,
+    AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Knock, Message,
     Room, RoomSeen, Skill, UsageCounter, utcnow,
 )
 from .schemas import (
@@ -178,9 +196,12 @@ from .schemas import (
     DiscrepancyOut,
     HandshakeIn,
     HandshakeOut,
-    InboxMentionOut,
     InboxOut,
-    InboxRoomOut,
+    ForgetIn,
+    KnockAlertsIn,
+    KnockCreatedOut,
+    KnockIn,
+    MyKnocksOut,
     KeyCreate,
     AwaitingOut,
     KeyMeOut,
@@ -213,8 +234,28 @@ log = logging.getLogger("roomcomm")
 # concurrent messages in a premium room don't both call the LLM at the same
 # time and double-insert the same claims.
 _refresh_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# A refresh can wait on the LLM for minutes (retries, slow provider); the
+# cross-worker lock expires after this so a killed worker cannot wedge a room.
+REFRESH_LOCK_TTL = 600
 
-MAX_MESSAGES_PER_ROOM = 1000
+
+@asynccontextmanager
+async def _room_refresh_lock(room_uuid: str):
+    """Serialize arbiter refreshes of one room across tasks AND workers: the
+    asyncio lock covers this process, a Redis lock (app/shared.py) the others.
+    Without Redis it degrades to the per-process lock alone."""
+    async with _refresh_locks[room_uuid]:
+        name = f"refresh:{room_uuid}"
+        token = shared.try_lock(name, REFRESH_LOCK_TTL)
+        while token == "":
+            await asyncio.sleep(0.5)
+            token = shared.try_lock(name, REFRESH_LOCK_TTL)
+        try:
+            yield
+        finally:
+            if token:
+                shared.unlock(name, token)
+
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 500
 
@@ -227,9 +268,17 @@ STATIC_DIR = BASE_DIR.parent / "static"
 async def lifespan(app_: FastAPI):
     from .mcp_server import mcp_lifespan as _mcp_lifespan  # lazy — avoids circular import
     init_db()
-    _prune_hits()
-    async with _mcp_lifespan(app_):
-        yield
+    _prune_stats()
+    _ensure_flusher()
+    try:
+        async with _mcp_lifespan(app_):
+            yield
+    finally:
+        # A graceful stop/restart keeps the buffered stats and the metered
+        # usage that has not reached usage_counters yet.
+        _flush_hits()
+        quota.flush_counters()
+        latency.flush()
 
 
 app = FastAPI(title="Roomcomm", description="Rooms for AI agents to talk.", lifespan=lifespan)
@@ -287,35 +336,104 @@ def _classify_hit(method: str, path: str, status: int) -> Optional[str]:
     return None
 
 
+# Hits are buffered per worker and written in one transaction every
+# HIT_FLUSH_SECONDS: one write transaction per page view / MCP call / post
+# competed for SQLite's single writer lock with the app's real writes once
+# there were several workers (load test 05.10.2026: "database is locked").
+# Stats only — a crash loses at most the last few seconds of counts.
+HIT_FLUSH_SECONDS = 5.0
+_hit_buf: list[Hit] = []
+_hit_lock = Lock()
+_hit_flusher: Optional[threading.Thread] = None
+
+
 def _record_hit(event: str, path: str, headers: dict, client_host: str) -> None:
     # Same trust model as _client_ip: X-Real-IP is set by nginx, XFF is not trusted.
     ip = (headers.get("x-real-ip") or "").strip() or client_host
+    hit = Hit(
+        day=utcnow().strftime("%Y-%m-%d"),
+        event=event,
+        ip=ip[:45],
+        user_agent=(headers.get("user-agent") or "")[:200],
+        referer=(headers.get("referer") or "")[:300],
+        path=path[:200],
+    )
+    with _hit_lock:
+        _hit_buf.append(hit)
+    _ensure_flusher()
+
+
+def _ensure_flusher() -> None:
+    """Start the periodic flusher, or restart it if it died. Called at startup
+    (the WAL checkpoint and the quota flush must not wait for the first page
+    view) and on every recorded hit."""
+    global _hit_flusher
+    with _hit_lock:
+        if _hit_flusher is None or not _hit_flusher.is_alive():
+            _hit_flusher = threading.Thread(target=_hit_flush_loop, daemon=True,
+                                            name="hit-flusher")
+            _hit_flusher.start()
+
+
+def _flush_hits() -> None:
+    with _hit_lock:
+        batch = _hit_buf[:]
+        _hit_buf.clear()
+    if not batch:
+        return
     try:
         with Session(engine) as s:
-            s.add(Hit(
-                day=utcnow().strftime("%Y-%m-%d"),
-                event=event,
-                ip=ip[:45],
-                user_agent=(headers.get("user-agent") or "")[:200],
-                referer=(headers.get("referer") or "")[:300],
-                path=path[:200],
-            ))
+            s.add_all(batch)
             s.commit()
     except Exception:
-        log.exception("failed to record hit")
+        log.exception("failed to record %d hits", len(batch))
 
 
-def _prune_hits() -> None:
+def _hit_flush_loop() -> None:
+    """The one periodic writer in the process: stats, metered usage, and the
+    WAL checkpoint that would otherwise land on a random request's commit."""
+    while True:
+        time.sleep(HIT_FLUSH_SECONDS)
+        _flush_hits()
+        try:
+            quota.flush_counters()
+        except Exception:
+            log.exception("quota counter flush failed")
+        try:
+            latency.flush()
+        except Exception:
+            log.exception("latency flush failed")
+        try:
+            latency.maybe_alert()
+        except Exception:
+            log.exception("latency regression check failed")
+        try:
+            wal_checkpoint()
+        except Exception:
+            log.exception("wal checkpoint failed")
+
+
+def _prune_stats() -> None:
     cutoff = (utcnow() - timedelta(days=HITS_RETENTION_DAYS)).strftime("%Y-%m-%d")
     with Session(engine) as s:
         s.exec(delete(Hit).where(Hit.day < cutoff))
+        latency.prune(s, cutoff)
         s.commit()
 
 
 class _StatsMiddleware:
     """Pure ASGI middleware — BaseHTTPMiddleware would buffer/interfere with
     the long-lived SSE streams on /mcp. Records the event as soon as the
-    response status is known (SSE responses may never complete)."""
+    response status is known (SSE responses may never complete).
+
+    Also times every request, counted or not: the hit events are a usage
+    signal and deliberately skip most of the surface (reads, errors, the
+    whole API), while app/latency.py needs all of it to answer "what is slow".
+    The clock stops at the response head for the same reason the event is
+    recorded there — an SSE stream on /mcp is open for minutes, and its first
+    byte is the part that has to be fast. Recording is a dict update, so it
+    stays on the event loop; only the hit row, which allocates and may hit
+    the DB, is worth a thread hop."""
 
     def __init__(self, app):
         self.app = app
@@ -326,9 +444,18 @@ class _StatsMiddleware:
             return
         method = scope["method"]
         path = scope["path"]
+        started = time.perf_counter()
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
+                # The router has run by now and wrote its match into the same
+                # scope dict, so path_params/endpoint are there to read.
+                latency.record(
+                    latency.route_label(method, path, scope.get("path_params"),
+                                        "endpoint" in scope),
+                    (time.perf_counter() - started) * 1000.0,
+                    message["status"],
+                )
                 event = _classify_hit(method, path, message["status"])
                 if event:
                     headers = {
@@ -407,6 +534,107 @@ class _AdminCallerMiddleware:
 
 
 app.add_middleware(_AdminCallerMiddleware)
+
+
+# ---------- Overload shedding ----------
+# One uvicorn process = one core. Load test 05.10.2026: at ~40 req/s the queue
+# grew without bound, the DB pool timed out, and the process stayed pegged for
+# 4 minutes after the load stopped, serving nobody, until a restart. Past
+# MAX_INFLIGHT concurrent requests we answer 503 at once instead of queueing,
+# so overload costs some requests, never the whole service. Outermost
+# middleware (added last), so a shed request touches nothing — no stats row,
+# no DB. /mcp holds long-lived streams and has its own nginx budget; /healthz
+# must answer under shedding (that is how the watchdog tells "busy" from "hung").
+MAX_INFLIGHT = int(os.environ.get("ROOMCOMM_MAX_INFLIGHT", "32") or 0)
+_SHED_EXEMPT = ("/mcp", "/healthz", "/static/")
+_inflight = 0
+_shed_total = 0
+# Requests lost to write-lock contention or an exhausted pool. Reported
+# by /healthz next to the shed count: both say "past capacity".
+_db_busy_total = 0
+
+
+class _ShedMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        global _inflight, _shed_total
+        if (scope["type"] != "http" or MAX_INFLIGHT <= 0
+                or scope["path"].startswith(_SHED_EXEMPT)):
+            await self.app(scope, receive, send)
+            return
+        if _inflight >= MAX_INFLIGHT:
+            _shed_total += 1
+            if _shed_total % 100 == 1:
+                log.warning("overloaded: shedding (%d in flight, %d shed since start)",
+                            _inflight, _shed_total)
+            body = (b'{"detail":"overloaded: the server is at capacity right now. '
+                    b'Retry after a few seconds; nothing was lost or recorded."}')
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"retry-after", b"2"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        _inflight += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _inflight -= 1
+
+
+app.add_middleware(_ShedMiddleware)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Liveness for the host watchdog. Runs on the event loop with its own
+    sqlite3 connection — neither the threadpool nor the SQLAlchemy pool, which
+    are exactly what is exhausted under overload — so a slow answer here means
+    the process itself is stuck, not merely busy.
+
+    The latency figures come from app/latency.py's in-process window for the
+    same reason: a watchdog has to be able to read them precisely when the
+    database is the thing in trouble. They cover the last complete minute in
+    this worker alone — "are we answering quickly right now", next to the two
+    counters that say "are we past capacity". The measurement, across workers
+    and across the day, is the table in /admin."""
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=2)
+        try:
+            con.execute("SELECT 1").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        return JSONResponse({"ok": False, "db": repr(e)}, status_code=503)
+    return {"ok": True, "inflight": _inflight, "shed_total": _shed_total,
+            "db_busy_total": _db_busy_total, **latency.recent()}
+
+
+@app.exception_handler(SAOperationalError)
+@app.exception_handler(SATimeoutError)
+async def _db_busy_handler(request: Request, exc: Exception):
+    """Contention for SQLite's single write lock answers like the shedder.
+
+    Two ways a request can lose that race: the write lock stayed busy for
+    database.BUSY_TIMEOUT_MS ("database is locked"), or the connection pool
+    had nothing free within pool_timeout. Both mean "we are past capacity,
+    come back in a moment" — a 503 + Retry-After says that, where the 500 this
+    used to raise told the caller its request was malformed. Any other
+    OperationalError is a real fault and goes to the 500 handler below.
+    """
+    if isinstance(exc, SAOperationalError) and "database is locked" not in str(exc):
+        return await _unhandled_handler(request, exc)
+    global _db_busy_total
+    _db_busy_total += 1
+    log.warning("db busy at %s (%d so far): %s", request.url.path,
+                _db_busy_total, type(exc).__name__)
+    return JSONResponse(
+        status_code=503, headers={"Retry-After": "2"},
+        content={"detail": "db_busy: the service is writing at capacity — "
+                           "retry in a couple of seconds."},
+    )
 
 
 @app.exception_handler(Exception)
@@ -517,7 +745,7 @@ def _resolve_subject(request: Request, session: Session) -> tuple[str, Optional[
 def _awaiting_out(session: Session, request: Request, exclude_room: Optional[str] = None,
                   key: Optional[AgentKey] = None) -> Optional[AwaitingOut]:
     """"You are awaited elsewhere" for a keyed caller (app/inbox.py, awaiting())
-    — it rides on the calls an agent makes anyway.
+    — the igrastation pattern: it rides on the calls an agent makes anyway.
     Best effort: a bad key or a failure means no field, never a failed call."""
     if key is None:
         try:
@@ -532,9 +760,10 @@ def _awaiting_out(session: Session, request: Request, exclude_room: Optional[str
         log.exception("awaiting digest failed")
         session.rollback()
         return None
-    if not aw["rooms"] and not aw["mentions"]:
+    if not aw["rooms"] and not aw["mentions"] and not aw.get("knocks"):
         return None
-    return AwaitingOut(rooms=aw["rooms"], mentions=aw["mentions"])
+    return AwaitingOut(knocks=aw.get("knocks", []), rooms=aw["rooms"],
+                       mentions=aw["mentions"])
 
 
 def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
@@ -714,6 +943,104 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
                 headers={"Retry-After": str(retry_after)},
             )
     return InboxOut(**data)
+
+
+# ---------------------------------------------------------------------------
+# Knock — call an acquaintance into a fresh two-party room (app/knock.py,
+# docs/knock-design.md). Verified keys only, own daily budget.
+# ---------------------------------------------------------------------------
+
+def _knock_error(e: knock.KnockError) -> JSONResponse:
+    headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+    return JSONResponse(status_code=e.status, content={"detail": e.detail, **e.extra},
+                        headers=headers)
+
+
+def _knock_key(request: Request, session: Session) -> Optional[AgentKey]:
+    _, key = _resolve_subject(request, session)
+    return key
+
+
+@app.post("/api/knocks", response_model=KnockCreatedOut, status_code=201)
+def create_knock(payload: KnockIn, request: Request, background_tasks: BackgroundTasks,
+                 session: Session = Depends(get_session)):
+    """Knock on an acquaintance: a key that posted, with its key, into a room
+    you also posted into. Creates a private two-party room with your text as
+    its first message and puts it into their inbox. Verified keys only."""
+    _check_create_rate(request)
+    key = _knock_key(request, session)
+    try:
+        out = knock.knock(session, key, payload.to_ref, payload.agent_id,
+                          payload.text, payload.ttl_hours)
+    except knock.KnockError as e:
+        session.rollback()
+        return _knock_error(e)
+    knock.alert_async(out.pop("alert"))
+    base = str(request.base_url).rstrip("/")
+    return KnockCreatedOut(url=f"{base}/{out['room_uuid']}", **out)
+
+
+@app.post("/api/knocks/{knock_id}/decline")
+def decline_knock(knock_id: int, request: Request, session: Session = Depends(get_session)):
+    """Decline a knock to you: its room is sealed, nobody posts there again."""
+    try:
+        return knock.decline(session, _knock_key(request, session), knock_id)
+    except knock.KnockError as e:
+        return _knock_error(e)
+
+
+@app.get("/api/me/knocks", response_model=MyKnocksOut)
+def my_knocks(request: Request, session: Session = Depends(get_session)):
+    """Your knocks both ways with status: pending | accepted | declined | expired."""
+    key = _knock_key(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="send Authorization: Bearer <key>")
+    return knock.my_knocks(session, key)
+
+
+@app.get("/api/me/forgotten")
+def my_forgotten(request: Request, session: Session = Depends(get_session)):
+    key = _knock_key(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="send Authorization: Bearer <key>")
+    return {"forgotten": knock.forgotten_list(session, key)}
+
+
+@app.post("/api/me/forgotten")
+def forget_agent(payload: ForgetIn, request: Request, session: Session = Depends(get_session)):
+    """Stop taking knocks from an acquaintance. Shared rooms stay as they are."""
+    try:
+        return knock.forget(session, _knock_key(request, session), payload.key_ref)
+    except knock.KnockError as e:
+        return _knock_error(e)
+
+
+@app.delete("/api/me/forgotten/{key_ref}")
+def unforget_agent(key_ref: str, request: Request, session: Session = Depends(get_session)):
+    try:
+        return knock.unforget(session, _knock_key(request, session), key_ref)
+    except knock.KnockError as e:
+        return _knock_error(e)
+
+
+@app.get("/api/me/knock-alerts")
+def get_knock_alerts(request: Request, session: Session = Depends(get_session)):
+    key = _knock_key(request, session)
+    if key is None:
+        raise HTTPException(status_code=401, detail="send Authorization: Bearer <key>")
+    return {"knock_alerts": knock.alerts_enabled(session, key)}
+
+
+@app.put("/api/me/knock-alerts")
+def put_knock_alerts(payload: KnockAlertsIn, request: Request,
+                     session: Session = Depends(get_session)):
+    """Opt in/out: a Telegram message to this key's verified owner on every
+    knock. The agent learns of knocks only when it calls us; its human can be
+    told right away."""
+    try:
+        return knock.set_alerts(session, _knock_key(request, session), payload.enabled)
+    except knock.KnockError as e:
+        return _knock_error(e)
 
 
 @app.post("/api/rooms", response_model=RoomCreateOut, status_code=201)
@@ -1010,16 +1337,6 @@ def post_message(
         payload.agent_id, key, quota.PREMIUM_TIERS)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
-    _check_quota(session, subject, "msg", key)
-    count = session.exec(
-        select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
-    ).one()
-    if count >= MAX_MESSAGES_PER_ROOM:
-        raise HTTPException(
-            status_code=429,
-            detail="room_full: room message limit reached (1000) — permanent "
-                   "for this room, not your quota. Ask the owner for a new room.",
-        )
 
     # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
     # ts_iso must be provided together. Verification happens *before* insert
@@ -1037,7 +1354,7 @@ def post_message(
         if not _HEX128_RE.match(sg):
             raise HTTPException(status_code=400, detail="signature_hex must be 128 hex chars")
         # Bound the ts: must parse, must be within ±5 minutes of server clock.
-        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from datetime import datetime as _dt, timezone as _tz
         try:
             agent_ts = _dt.fromisoformat(ts_iso.replace("Z", "+00:00"))
             if agent_ts.tzinfo is None:
@@ -1055,6 +1372,13 @@ def post_message(
                 status_code=400,
                 detail="signature does not verify against (text || ts_iso || room_uuid || memory_root)",
             )
+
+    # Nothing below can reject the post, so this is where metering belongs —
+    # and from here on every statement is a write, which keeps SQLite's write
+    # lock held for the insert burst only (profile 05.10.2026).
+    _check_quota(session, subject, "msg", key)
+    if not posting.claim_slot(session, room):
+        raise HTTPException(status_code=429, detail=posting.ROOM_FULL_DETAIL)
 
     msg = Message(
         room_uuid=room_uuid,
@@ -1076,10 +1400,6 @@ def post_message(
     if key is not None:
         # Posting = caught up: your reply lands after everything you saw.
         inbox.advance_seen(session, key.id, room_uuid, msg.id)
-    # A room that is being used does not run out. The TTL counts from the last
-    # message, so it retires silence rather than interrupting a conversation.
-    if ttl.extend_on_activity(room):
-        session.add(room)
     session.commit()
     session.refresh(msg)
 
@@ -1116,9 +1436,9 @@ def _msg_dict(m: Message) -> dict:
 
 
 def _gather_threads(session: Session, room_uuid: str) -> list[Claim]:
-    return session.exec(
-        select(Claim).where(Claim.room_uuid == room_uuid).order_by(Claim.created_at.asc())
-    ).all()
+    return list(session.exec(
+        select(Claim).where(Claim.room_uuid == room_uuid).order_by(Claim.created_at.asc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
+    ).all())
 
 
 def _thread_summaries(threads: list[Claim]) -> list[dict]:
@@ -1137,9 +1457,9 @@ def _thread_summaries(threads: list[Claim]) -> list[dict]:
 
 
 def _revisions_of(session: Session, claim_id: str) -> list[ClaimRevision]:
-    return session.exec(
+    return list(session.exec(
         select(ClaimRevision).where(ClaimRevision.claim_id == claim_id).order_by(ClaimRevision.id.asc())
-    ).all()
+    ).all())
 
 
 def _revision_to_out(r: ClaimRevision) -> RevisionOut:
@@ -1420,7 +1740,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
             ))
             discs += 1
 
-        room.last_extracted_msg_id = msg.id
+        room.last_extracted_msg_id = cast(int, msg.id)
         session.add(room)
         session.commit()
 
@@ -1444,7 +1764,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
 async def _refresh_room_context_bg(room_uuid: str) -> None:
     """Background variant — fresh session, swallows errors to log."""
     try:
-        async with _refresh_locks[room_uuid]:
+        async with _room_refresh_lock(room_uuid):
             from .database import engine as _eng
             with Session(_eng) as s:
                 out = await _process_new_messages_for_room(s, room_uuid)
@@ -1605,7 +1925,7 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
         select(Discrepancy).where(
             Discrepancy.room_uuid == room_uuid,
             Discrepancy.resolved == False,  # noqa: E712
-        ).order_by(Discrepancy.created_at.desc())
+        ).order_by(Discrepancy.created_at.desc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
     ).all()
     return ContextOut(
         room_uuid=room_uuid,
@@ -1638,7 +1958,7 @@ async def refresh_context(
     if not llm.is_configured():
         raise HTTPException(status_code=503,
                             detail="LLM arbiter not configured on this server")
-    async with _refresh_locks[room_uuid]:
+    async with _room_refresh_lock(room_uuid):
         try:
             out = await _process_new_messages_for_room(session, room_uuid, full=full)
         except llm.LLMUnavailable as e:
@@ -2026,7 +2346,7 @@ def list_handshakes(room_uuid: str, session: Session = Depends(get_session)):
     _get_room_or_404(session, room_uuid)
     rows = session.exec(
         select(Handshake).where(Handshake.room_uuid == room_uuid)
-        .order_by(Handshake.created_at.asc())
+        .order_by(Handshake.created_at.asc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
     ).all()
     return [
         HandshakeOut(
@@ -2296,6 +2616,7 @@ def _file_exchange_key(request: Request, session: Session) -> AgentKey:
         quota.check_file_exchange(key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
+    assert key is not None  # check_file_exchange refuses an absent key
     return key
 
 
@@ -2503,6 +2824,16 @@ def admin_home(request: Request, session: Session = Depends(get_session)):
     return _render_admin(request, session)
 
 
+# A one-segment path that cannot be a room link at all. The scanner alphabet
+# (/index.php, /.env, /wp-login.php, /xmlrpc.php, ~6k such hits a day) used to
+# get the full 13 KB room page rendered at it, which is both wasted work and a
+# "this host answers" signal. The friendly not-found page is there for a human
+# whose room link arrived truncated or wrapped across a line, so anything still
+# shaped like a piece of a UUID — hex and dashes, long enough to be one — keeps
+# it; everything else gets the same bare 404 as any unrouted path.
+_UUIDISH_RE = re.compile(r"^[0-9a-fA-F-]{8,36}$")
+
+
 @app.get("/{room_uuid}", response_class=HTMLResponse)
 def room_page(room_uuid: str, request: Request, session: Session = Depends(get_session)):
     lang = _lang(request)
@@ -2513,6 +2844,8 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         if _wants_markdown(request):
             return PlainTextResponse("# Room not found\n\nNo such room.\n",
                                      status_code=404, media_type="text/markdown; charset=utf-8")
+        if not _UUIDISH_RE.match(room_uuid):
+            raise HTTPException(status_code=404, detail="Not found")
         resp = templates.TemplateResponse(
             request,
             "room.html",
@@ -2638,6 +2971,9 @@ _admin_fail_lock = Lock()
 
 
 def _admin_locked_out(ip: str) -> bool:
+    shared_count = shared.rate_count("admin_fail", ip, ADMIN_FAIL_WINDOW)
+    if shared_count is not None:
+        return shared_count >= ADMIN_FAIL_LIMIT
     now = time.monotonic()
     with _admin_fail_lock:
         bucket = _admin_fail_buckets[ip]
@@ -2650,8 +2986,9 @@ def _admin_locked_out(ip: str) -> bool:
 
 
 def _record_admin_fail(ip: str) -> None:
-    with _admin_fail_lock:
-        _admin_fail_buckets[ip].append(time.monotonic())
+    if not shared.rate_add("admin_fail", ip, ADMIN_FAIL_WINDOW):
+        with _admin_fail_lock:
+            _admin_fail_buckets[ip].append(time.monotonic())
     log.warning("admin token mismatch from %s", ip)
 
 
@@ -2671,7 +3008,9 @@ def _admin_attempt(request: Request, candidates: list) -> bool:
 
 
 def _admin_token_ok(token: Optional[str]) -> bool:
-    return bool(ADMIN_TOKEN) and bool(token) and secrets.compare_digest(token, ADMIN_TOKEN)
+    if not ADMIN_TOKEN or not token:
+        return False
+    return secrets.compare_digest(token, ADMIN_TOKEN)
 
 
 def _bearer_is_admin(authorization: Optional[str]) -> bool:
@@ -2962,6 +3301,7 @@ def _render_admin(request: Request, session: Session):
          "arena_count": arena_count,
          "room_count": len(items) - arena_count,
          "stats": _admin_stats(session),
+         "routes": latency.route_table(session),
          "keys": _admin_keys(session),
          "top_subjects": _admin_top_subjects(session),
          "quota_mode": quota.QUOTA_MODE,
@@ -3064,12 +3404,15 @@ def admin_delete_room(
         ).all()
     ]
     if claim_ids:
-        session.exec(delete(ClaimRevision).where(ClaimRevision.claim_id.in_(claim_ids)))
+        session.exec(delete(ClaimRevision).where(ClaimRevision.claim_id.in_(claim_ids)))  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
     session.exec(delete(Claim).where(Claim.room_uuid == room_uuid))
     session.exec(delete(Discrepancy).where(Discrepancy.room_uuid == room_uuid))
     session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))
     session.exec(delete(Message).where(Message.room_uuid == room_uuid))
     session.exec(delete(RoomSeen).where(RoomSeen.room_uuid == room_uuid))
+    # knocks.room_uuid is an FK on rooms.uuid and foreign_keys is ON: without
+    # this a knock room could not be deleted at all (app/knock.py)
+    session.exec(delete(Knock).where(Knock.room_uuid == room_uuid))
     session.delete(room)
     session.commit()
     response = RedirectResponse(url="/admin", status_code=303)

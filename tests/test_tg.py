@@ -8,7 +8,6 @@ import app.models as models
 import app.main as _main
 import app.notify as notify
 import app.quota as quota
-import app.tg_bot as tg_bot
 from app.main import app as fastapi_app
 from app.database import get_session
 

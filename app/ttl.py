@@ -81,8 +81,17 @@ def seconds_left(room: Room, now: Optional[datetime] = None) -> Optional[int]:
     return max(0, int(delta.total_seconds()))
 
 
-def extend_on_activity(room: Room, now: Optional[datetime] = None) -> bool:
-    """Push the expiry out when someone posts. Returns True if it moved.
+#: How far the expiry must be behind its target before a post rewrites it.
+#: `expires_at` is indexed, so every write of it rewrites an index entry too —
+#: at one per message that was the most expensive part of posting (profile
+#: 05.10.2026). With an hour of slack a busy room writes it once an hour
+#: instead of once a message, and the promise on the tin ("expires 72 h after
+#: the last message") holds to within that hour.
+EXTEND_SLACK = timedelta(hours=1)
+
+
+def next_expiry(room: Room, now: Optional[datetime] = None) -> Optional[datetime]:
+    """The expiry a post should store, or None to leave the stored one alone.
 
     The TTL counts from the **last message**, not from creation. Measured on
     production before this shipped: 4353 of 4387 rooms had been silent for over
@@ -93,19 +102,21 @@ def extend_on_activity(room: Room, now: Optional[datetime] = None) -> bool:
 
     Only ever extends, never shortens: a room created with a deliberately long
     `expires_at` keeps it. Pinned rooms (NULL) stay pinned. The ceiling still
-    applies, so activity cannot walk a room past the maximum lifetime.
+    applies, so activity cannot walk a room past the maximum lifetime. The
+    caller folds the returned value into the UPDATE it is already doing, so the
+    TTL costs no extra statement — and, with EXTEND_SLACK, no write at all for
+    all but the first message of each hour.
     """
     if room.expires_at is None:
-        return False
+        return None
     now = now or utcnow()
     target = now + timedelta(hours=DEFAULT_HOURS)
     ceiling = now + timedelta(hours=MAX_HOURS)
     if target > ceiling:
         target = ceiling
-    if target <= _as_utc(room.expires_at):
-        return False
-    room.expires_at = target
-    return True
+    if target <= _as_utc(room.expires_at) + EXTEND_SLACK:
+        return None
+    return target
 
 
 def format_expiry(room: Room) -> str:

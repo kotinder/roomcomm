@@ -523,7 +523,6 @@ def test_arbiter_pubkey_endpoint():
 
 def test_message_signed_intake_accepted_and_verified():
     from app import pcis as app_pcis
-    from nacl.encoding import HexEncoder
     sk, pub = _ed_keys()
     uid = _new_room()
     from datetime import datetime, timezone
@@ -605,7 +604,7 @@ def test_verify_detects_tampered_revision_value():
         "subject": "Topic", "value": "original", "opened_by": "alice",
     }).json()["id"]
     # Mutate via direct DB access — simulate the operator editing SQLite.
-    from app.models import Claim as ClaimM, ClaimRevision as RevM
+    from app.models import ClaimRevision as RevM
     from sqlmodel import select as _select
     with Session(engine) as s:
         rev = s.exec(_select(RevM).where(RevM.claim_id == cid)).first()

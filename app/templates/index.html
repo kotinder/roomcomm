@@ -483,7 +483,9 @@
   .case-rooms li { padding: 6px 0; }
   .case-rooms a { color: var(--green); text-decoration: underline; text-underline-offset: 2px; font-size: 15px; }
   .case-note { color: var(--muted); font-size: 13.5px; margin-top: 12px; }
-  .case-inc { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid oklch(0.62 0.17 30); border-radius: 12px; padding: 22px 24px; }
+  .case-inc { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 22px 24px; }
+  /* the incident reads as one by its heading, not by a coloured tab on the side */
+  .case-inc h3 { color: var(--red); }
   .case-inc p { color: var(--ink-2); font-size: 15px; margin-top: 10px; }
   .case-inc .case-inc-bank { color: var(--muted); font-size: 14px; }
   @media (max-width: 760px) {
@@ -679,6 +681,10 @@
       <div class="cap">
         <h3><span class="ico">▤</span>{{ t.cap_files_h }}</h3>
         <p>{{ t.cap_files_p }}</p>
+      </div>
+      <div class="cap">
+        <h3><span class="ico">⚐</span>{{ t.cap_knock_h }}</h3>
+        <p>{{ t.cap_knock_p }}</p>
       </div>
     </div>
     <div class="premium">

@@ -189,6 +189,33 @@ def test_posting_extends_the_expiry():
     assert abs(after["expires_in_seconds"] - ttl.DEFAULT_HOURS * 3600) < 60
 
 
+def test_a_second_post_within_the_slack_does_not_rewrite_the_expiry():
+    """`expires_at` is indexed, so writing it costs an index write too. Posting
+    only moves it when it is more than ttl.EXTEND_SLACK behind the target, so a
+    busy room pays that once an hour instead of once a message."""
+    room = _create(description="busy room", ttl_hours=2)
+    uid = room["uuid"]
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "first"}).status_code == 201
+    with Session(engine) as s:
+        after_first = s.get(Room, uid).expires_at
+    for i in range(3):
+        assert client.post(f"/api/rooms/{uid}/messages",
+                           json={"agent_id": "a", "text": f"m{i}"}).status_code == 201
+    with Session(engine) as s:
+        assert s.get(Room, uid).expires_at == after_first
+    # Walk the stored expiry back past the slack: the next post moves it again.
+    with Session(engine) as s:
+        r = s.get(Room, uid)
+        r.expires_at = utcnow() + timedelta(hours=ttl.DEFAULT_HOURS) - timedelta(hours=2)
+        s.add(r)
+        s.commit()
+    assert client.post(f"/api/rooms/{uid}/messages",
+                       json={"agent_id": "a", "text": "much later"}).status_code == 201
+    with Session(engine) as s:
+        assert s.get(Room, uid).expires_at > after_first - timedelta(hours=2)
+
+
 def test_activity_never_shortens_a_longer_expiry():
     # A room deliberately created with a month of runway keeps it.
     room = _create(description="long-lived", ttl_hours=ttl.MAX_HOURS)
@@ -223,8 +250,6 @@ def test_activity_leaves_pinned_rooms_pinned():
 
 
 def test_activity_cannot_walk_past_the_ceiling():
-    from app.models import utcnow as _now
-    from datetime import timedelta as _td
     room = _create(description="at the ceiling", ttl_hours=ttl.MAX_HOURS)
     client.post(f"/api/rooms/{room['uuid']}/messages",
                 json={"agent_id": "a", "text": "ping"})
@@ -382,7 +407,7 @@ def _mcp_call(c, tool: str, args: dict, headers: dict) -> dict:
     assert r.status_code == 200, r.text
     body = r.text
     if body.lstrip().startswith("event:") or "data:" in body[:20]:
-        body = [l[5:].strip() for l in body.splitlines() if l.startswith("data:")][-1]
+        body = [ln[5:].strip() for ln in body.splitlines() if ln.startswith("data:")][-1]
     import json as _json
     return _json.loads(body)["result"]
 

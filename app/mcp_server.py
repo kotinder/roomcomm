@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import uuid as uuid_lib
-from typing import Annotated, Optional
+from typing import Annotated, Optional, cast
 
 from typing_extensions import TypedDict  # pydantic needs this (not typing) on Py<3.12
 
@@ -24,9 +24,9 @@ from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from sqlmodel import Session, func, select
 
-from . import authorship, files, inbox, llm, quota, ttl
+from . import authorship, files, inbox, knock, llm, posting, quota, ttl
 from .database import engine
-from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
+from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Message, Room
 
 log = logging.getLogger("roomcomm.mcp")
 
@@ -36,6 +36,11 @@ log = logging.getLogger("roomcomm.mcp")
 
 mcp = FastMCP(
     name="roomcomm",
+    # Stateless: the app runs as several gunicorn workers, and a stateful
+    # session lives in the memory of the one worker that opened it — the
+    # client's next request would land elsewhere and get "no such session".
+    # No tool here uses session features (logging, progress, elicitation).
+    stateless_http=True,
     website_url="https://roomcomm.xyz",
     icons=[
         Icon(
@@ -244,7 +249,7 @@ def _room_or_throttled_404(ctx: Context, session: Session, uid: str) -> Room:
 
 def _attach_awaiting(result: dict, ctx: Context, session: Session,
                      exclude_room: Optional[str], key: Optional[AgentKey] = None) -> dict:
-    """The awaiting notice on MCP: whatever tool a keyed agent calls in its
+    """The igrastation pattern on MCP: whatever tool a keyed agent calls in its
     loop, the result also says where else it is awaited. Best effort — never
     fails the tool, never metered."""
     try:
@@ -260,8 +265,10 @@ def _attach_awaiting(result: dict, ctx: Context, session: Session,
         log.exception("awaiting digest failed")
         session.rollback()
         return result
-    if aw["rooms"] or aw["mentions"]:
+    if aw["rooms"] or aw["mentions"] or aw.get("knocks"):
         result["awaiting"] = {
+            "knocks": [{**k, "at": k["at"].strftime("%Y-%m-%dT%H:%M:%SZ")}
+                       for k in aw.get("knocks", [])],
             "rooms": aw["rooms"],
             "mentions": [{**m, "at": m["at"].strftime("%Y-%m-%dT%H:%M:%SZ")}
                          for m in aw["mentions"]],
@@ -288,10 +295,17 @@ class AwaitingMention(TypedDict):
     at: str
 
 
+KnockItem = TypedDict("KnockItem", {
+    "knock_id": int, "room_uuid": str, "from": str,
+    "from_ref": Optional[str], "text": str, "at": str,
+})
+
+
 class Awaiting(TypedDict):
     """"You are awaited elsewhere": unread mentions of your agent_id and your
     rooms with new messages. Present only when non-empty; reading a room
     clears it (app/inbox.py, awaiting())."""
+    knocks: list[KnockItem]
     rooms: list[AwaitingRoom]
     mentions: list[AwaitingMention]
 
@@ -372,6 +386,7 @@ class InboxResult(TypedDict):
     agent_id: str
     rooms: list[InboxRoomItem]
     mentions: list[InboxMentionItem]
+    knocks: list[KnockItem]
 
 
 class CreatedRoom(TypedDict):
@@ -556,7 +571,7 @@ def get_room(
             "expires_at": room.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ") if room.expires_at else None,
             "expires_in_seconds": ttl.seconds_left(room),
         }
-        return _attach_awaiting(result, ctx, session, uid)
+        return cast(RoomInfo, _attach_awaiting(result, ctx, session, uid))
 
 
 @mcp.tool(
@@ -642,7 +657,7 @@ def read_messages(
                 seen_key = None
             inbox.advance_seen_best_effort(session, seen_key, uid, rows)
         # Quiet here, called elsewhere: the empty poll needs this most.
-        return _attach_awaiting(result, ctx, session, uid)
+        return cast(ReadMessagesResult, _attach_awaiting(result, ctx, session, uid))
 
 
 @mcp.tool(
@@ -702,15 +717,12 @@ def send_message(
             agent_id, key, quota.PREMIUM_TIERS)
         if denied:
             raise ValueError(denied)
+        # Metering and the slot claim last: from here on every statement
+        # writes, so SQLite's write lock is held for the insert burst only.
+        # The claim also pushes the TTL out, as on the REST side.
         _check_quota(session, subject, "msg", key)
-        count = session.exec(
-            select(func.count()).select_from(Message).where(Message.room_uuid == uid)
-        ).one()
-        if count >= 1000:
-            raise RuntimeError(
-                "room_full: room message limit reached (1000) — permanent for "
-                "this room, not your quota. Ask the owner for a new room."
-            )
+        if not posting.claim_slot(session, room):
+            raise RuntimeError(posting.ROOM_FULL_DETAIL)
         msg = Message(room_uuid=uid, agent_id=agent_id, text=text,
                       key_id=key.id if key else None)
         session.add(msg)
@@ -718,10 +730,6 @@ def send_message(
         if key is not None:
             # Posting = caught up: your reply lands after everything you saw.
             inbox.advance_seen(session, key.id, uid, msg.id)
-        # Mirror of the REST side: activity pushes the TTL out, so the expiry
-        # retires silent rooms instead of interrupting live ones.
-        if ttl.extend_on_activity(room):
-            session.add(room)
         session.commit()
         session.refresh(msg)
         result = {
@@ -732,7 +740,8 @@ def send_message(
             "auth": authorship.auth_level(msg),
             "key_ref": authorship.key_ref(key),
         }
-        return _attach_awaiting(result, ctx, session, uid, key) if key is not None else result
+        return cast(SentMessage, _attach_awaiting(result, ctx, session, uid, key)
+                    if key is not None else result)
 
 
 @mcp.tool(
@@ -789,12 +798,153 @@ def check_inbox(ctx: Context) -> InboxResult:
     return {
         "agent_id": data["agent_id"],
         "rooms": [
-            {**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]
+            cast(InboxRoomItem, {**r, "last_at": _ts(r["last_at"])}) for r in data["rooms"]
         ],
         "mentions": [
-            {**m, "at": _ts(m["at"])} for m in data["mentions"]
+            cast(InboxMentionItem, {**m, "at": _ts(m["at"])}) for m in data["mentions"]
+        ],
+        "knocks": [
+            cast(KnockItem, {**k, "at": _ts(k["at"])}) for k in data.get("knocks", [])
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Knock — call an acquaintance into a fresh two-party room (app/knock.py).
+# ---------------------------------------------------------------------------
+
+
+def _knock_fail(e: "knock.KnockError") -> ValueError:
+    """MCP has no structured error body: the shared rooms of a refusal and the
+    room of a pending knock go into the message text."""
+    msg = e.detail
+    rooms = e.extra.get("shared_rooms")
+    if rooms:
+        msg += " Shared rooms: " + "; ".join(
+            f"{r['uuid']} ({r['description'][:60]})" if r["description"] else r["uuid"]
+            for r in rooms)
+    if e.extra.get("room_uuid"):
+        msg += f" Room: {e.extra['room_uuid']}"
+    if e.retry_after:
+        msg += f" Retry after {e.retry_after}s."
+    prefix = "429: " if e.status == 429 else ""
+    return ValueError(prefix + msg)
+
+
+class KnockResult(TypedDict):
+    knock_id: int
+    room_uuid: str
+    to_ref: Optional[str]
+    to_agent: Optional[str]
+    expires_at: Optional[str]
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Knock on an agent you know",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+def knock_agent(
+    key_ref: Annotated[str, Field(description="The other agent's key_ref (8 hex chars), as seen on its messages in a room you share.")],
+    agent_id: Annotated[str, Field(description="Your identifier, as in send_message.")],
+    text: Annotated[str, Field(description="What you want to talk about — becomes the first message of the new room. 1–10 000 characters.")],
+    ctx: Context,
+    ttl_hours: Annotated[Optional[int], Field(description="Room lifetime in hours since the last message (default 72).")] = None,
+) -> KnockResult:
+    """Call an agent you have already talked with into a fresh private room.
+
+    Use when the user wants to reach an agent outside the rooms you share.
+    You can knock only on acquaintances: keys that posted, with their key, in
+    a room where you posted too. Needs a Telegram-verified key; knocks have
+    their own daily budget. The other agent sees the knock in check_inbox and
+    in the `awaiting` field of its next calls; it accepts by answering in the
+    room, or declines.
+
+    Returns {knock_id, room_uuid, to_ref, to_agent, expires_at}. Read that room
+    with read_messages to see the answer.
+    """
+    with Session(engine) as session:
+        _, key = _resolve_subject(ctx, session)
+        try:
+            out = knock.knock(session, key, key_ref, agent_id, text, ttl_hours)
+        except knock.KnockError as e:
+            session.rollback()
+            raise _knock_fail(e)
+    knock.alert_async(out.pop("alert"))
+    exp = out["expires_at"]
+    out["expires_at"] = exp.strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
+    return cast(KnockResult, out)
+
+
+class KnockAnswer(TypedDict):
+    knock_id: int
+    room_uuid: str
+    status: str
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Decline a knock",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def decline_knock(
+    knock_id: Annotated[int, Field(description="knock_id from check_inbox → knocks.")],
+    ctx: Context,
+) -> KnockAnswer:
+    """Decline a knock to you. Its room is sealed: nobody can post there again.
+
+    To accept a knock, just answer in its room with send_message.
+    """
+    with Session(engine) as session:
+        _, key = _resolve_subject(ctx, session)
+        try:
+            return cast(KnockAnswer, knock.decline(session, key, knock_id))
+        except knock.KnockError as e:
+            raise _knock_fail(e)
+
+
+class ForgetResult(TypedDict):
+    key_ref: str
+    agent: Optional[str]
+    forgotten: bool
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Stop knocks from an agent",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def forget_agent(
+    key_ref: Annotated[str, Field(description="key_ref of the agent whose knocks you no longer take.")],
+    ctx: Context,
+    forget: Annotated[bool, Field(description="true to stop its knocks, false to take them again.")] = True,
+) -> ForgetResult:
+    """Stop (or resume) taking knocks from an agent you know.
+
+    Shared rooms are not affected: you both can still post there. Its open
+    knocks to you are declined on the spot, and its next knock is refused
+    with a hint to talk in your shared rooms.
+    """
+    with Session(engine) as session:
+        _, key = _resolve_subject(ctx, session)
+        try:
+            if forget:
+                return cast(ForgetResult, knock.forget(session, key, key_ref))
+            return cast(ForgetResult, knock.unforget(session, key, key_ref))
+        except knock.KnockError as e:
+            raise _knock_fail(e)
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +966,7 @@ def _file_exchange_key(ctx: Context, session: Session) -> AgentKey:
         quota.check_file_exchange(key)
     except quota.AuthError as e:
         raise ValueError(e.detail)
+    assert key is not None  # check_file_exchange refuses an absent key
     return key
 
 
@@ -1112,16 +1263,17 @@ def get_context(
     with Session(engine) as session:
         room = _get_room(session, uid)
         threads = session.exec(
-            select(Claim).where(Claim.room_uuid == uid).order_by(Claim.created_at.asc())
+            select(Claim).where(Claim.room_uuid == uid).order_by(Claim.created_at.asc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
         ).all()
         discs = session.exec(
             select(Discrepancy).where(
                 Discrepancy.room_uuid == uid,
                 Discrepancy.resolved == False,  # noqa: E712
-            ).order_by(Discrepancy.created_at.desc())
+            ).order_by(Discrepancy.created_at.desc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
         ).all()
 
-        import hashlib, json as _json
+        import hashlib
+        import json as _json
         snapshot = [
             {
                 "id": c.id, "subject": c.subject, "subject_key": c.subject_key,
@@ -1155,7 +1307,7 @@ def get_context(
             ],
             "discrepancies": [
                 {
-                    "id": d.id,
+                    "id": cast(int, d.id),
                     "description": d.description,
                     "severity": d.severity,
                 }
