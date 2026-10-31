@@ -81,6 +81,7 @@ DOMAIN_CODES = {
     "quota_exceeded": -32045,
     "file_rejected": -32046,
     "unavailable": -32047,
+    "leaked_key": -32048,
 }
 
 _ERROR_DOMAIN = "roomcomm.xyz"

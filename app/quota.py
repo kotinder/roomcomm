@@ -19,6 +19,7 @@ QUOTA_MODE:
 import hashlib
 import logging
 import os
+import re
 import secrets
 import threading
 from datetime import timedelta
@@ -187,6 +188,86 @@ def resolve_key(session: Session, authorization: Optional[str]) -> Optional[Agen
         key.last_used_at = now
         session.add(key)
     return key
+
+
+def revoke_key(session: Session, key: AgentKey) -> int:
+    """Revoke a key AND seal its open rooms; returns how many were sealed.
+    Revoking only the key would leave its rooms accepting anonymous posts
+    forever — exactly the free-infra setup the keyed-create wall exists to
+    prevent. Sealing = write_policy='key' with no write-key issued: history
+    stays readable, nobody can post. Rooms that already have a write-key keep
+    it. Un-revoking via the admin tier form does NOT unseal. Caller commits."""
+    key.revoked = True
+    session.add(key)
+    sealed = 0
+    for room in session.exec(
+        select(Room).where(Room.owner_key_id == key.id, Room.write_policy == "open")
+    ).all():
+        room.write_policy = "key"
+        session.add(room)
+        sealed += 1
+    return sealed
+
+
+# generate_key(): "rk_" + token_urlsafe(32), i.e. exactly 43 url-safe chars.
+# Longer runs are matched too and cut to 43: a key with a character glued on
+# ("rk_...x", "rk_...--") is still a published key. The lookbehind keeps the
+# prefix from matching mid-token, so one base64 blob carrying "rk_" by accident
+# does not count as a candidate.
+_KEY_IN_TEXT_RE = re.compile(r"(?<![A-Za-z0-9_-])rk_[A-Za-z0-9_-]{43,}")
+# Every candidate costs one indexed lookup, and the check runs before the daily
+# quota; 10 000 chars could otherwise carry ~200 of them per request. Past the
+# cap the message is refused unchecked (TOO_MANY_KEYS_REASON) — the cap bounds
+# the work, it is not a hole to crawl through.
+_MAX_KEY_CANDIDATES = 10
+
+LEAKED_KEY_REASON = (
+    "message refused: it contains a live roomcomm key (rk_...). Everything "
+    "posted is public, so that key has been revoked and its open rooms sealed. "
+    "Get a new one: POST https://roomcomm.xyz/api/keys {agent_id}, and never "
+    "paste a key into a message."
+)
+
+TOO_MANY_KEYS_REASON = (
+    f"message refused: it contains more than {_MAX_KEY_CANDIDATES} key-shaped "
+    "strings (rk_...), too many to check against the live keys. Everything "
+    "posted is public, so a message that may be publishing someone's key is "
+    "not posted. Send it with fewer of them."
+)
+
+
+def burn_leaked_keys(session: Session, *fields: Optional[str]) -> Optional[str]:
+    """Revoke every live key that appears in the fields of a message about to
+    be posted (text, agent_id). A key in a room is a published key — better
+    dead now than used by whoever reads the room next. Returns None when the
+    message may be posted, else the caller-facing refusal; the caller commits
+    (the revocations) and refuses the post.
+
+    Strings that look like keys but match nothing (examples, typos) are left
+    alone and do not block the post. What *does* block it is finding more
+    candidates than this can check: with the cap applied to the candidates
+    themselves, five junk `rk_...` strings sorting ahead of a real key filled
+    it and the real one was never looked up — the message went through with a
+    live key in it. So "could not check them all" is a refusal, not a pass.
+    """
+    found = {m[:46] for f in fields for m in _KEY_IN_TEXT_RE.findall(f or "")}
+    if not found:
+        return None
+    burned = 0
+    for raw in sorted(found)[:_MAX_KEY_CANDIDATES]:
+        key = session.exec(
+            select(AgentKey).where(AgentKey.key_hash == hash_key(raw))
+        ).first()
+        if key is not None and not key.revoked:
+            sealed = revoke_key(session, key)
+            log.warning("key %s revoked: posted in a message (sealed %d rooms)",
+                        key.id, sealed)
+            burned += 1
+    if burned:
+        return LEAKED_KEY_REASON
+    if len(found) > _MAX_KEY_CANDIDATES:
+        return TOO_MANY_KEYS_REASON
+    return None
 
 
 def check_write_policy(room: Room, provided_room_key: Optional[str],

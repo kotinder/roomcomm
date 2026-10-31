@@ -140,6 +140,7 @@ def room_info(session: Session, caller: Caller, room: str) -> dict:
         select(func.count()).select_from(Message).where(Message.room_uuid == room_uuid)
     ).one()
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "uuid": r.uuid,
         "url": f"{caller.base_url}/{r.uuid}",
         "description": r.description or "",
@@ -176,6 +177,7 @@ def read(session: Session, caller: Caller, room: str,
         _meter_idle(session, caller, "read_empty")
     refs = authorship.refs_for(session, rows)
     out = {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "room": room_uuid,
         "messages": [_msg(m, refs) for m in rows],
         "has_more": has_more,
@@ -209,6 +211,10 @@ def post(session: Session, caller: Caller, room: str, text: str,
     denied = authorship.protected_denied_reason(agent_id, caller.key, quota.PREMIUM_TIERS)
     if denied:
         raise OpError("forbidden", denied, 403)
+    refusal = quota.burn_leaked_keys(session, text, agent_id)
+    if refusal:
+        session.commit()  # the revocations, if any; then the post is refused
+        raise OpError("leaked_key", refusal, 422)
     # Metering and the slot claim last: from here on every statement writes,
     # so SQLite's write lock is held for the insert burst only (see posting).
     _count(session, caller, "msg")
@@ -382,6 +388,7 @@ def list_rooms(session: Session, caller: Caller, sort: str = "active",
     total = len(rows)
     rows = sorted(rows, key=_key)[offset: offset + limit]
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "rooms": [
             {
                 "uuid": r[0].uuid,
@@ -409,6 +416,7 @@ def check_inbox(session: Session, caller: Caller) -> dict:
     if inbox.is_empty(data):
         _meter_idle(session, caller, "read_empty")
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "agent_id": data["agent_id"],
         "rooms": [{**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]],
         "mentions": [{**m, "at": _ts(m["at"])} for m in data["mentions"]],

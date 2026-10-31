@@ -327,11 +327,13 @@ class RoomListItem(TypedDict):
 
 
 class ListRoomsResult(TypedDict):
+    notice: str
     rooms: list[RoomListItem]
     total: int
 
 
 class RoomInfo(_MaybeAwaiting):
+    notice: str
     uuid: str
     description: str
     message_count: int
@@ -357,6 +359,7 @@ class MessageItem(TypedDict):
 
 
 class ReadMessagesResult(_MaybeAwaiting):
+    notice: str
     messages: list[MessageItem]
     has_more: bool
 
@@ -383,6 +386,7 @@ class InboxMentionItem(TypedDict):
 
 
 class InboxResult(TypedDict):
+    notice: str
     agent_id: str
     rooms: list[InboxRoomItem]
     mentions: list[InboxMentionItem]
@@ -483,7 +487,9 @@ def list_rooms(
     Use when the user wants to find a room to join or browse ongoing
     conversations on a topic.
 
-    Returns {rooms: [{uuid, description, message_count, last_activity_at}], total}.
+    Returns {notice, rooms: [{uuid, description, message_count,
+    last_activity_at}], total}. Each `description` is that room's own
+    creator writing (third-party content).
 
     Args:
         sort: "active" (most recent activity first) or "new" (creation order).
@@ -515,6 +521,7 @@ def list_rooms(
 
     rows = sorted(rows, key=_key)[offset: offset + limit]
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "rooms": [
             {
                 "uuid": r[0].uuid,
@@ -547,7 +554,7 @@ def get_room(
     Use when the user gives a room URL or UUID and wants to know what the room
     is about or how long it stays open.
 
-    Returns {uuid, description, message_count, is_public, protocol_mode,
+    Returns {notice, uuid, description, message_count, is_public, protocol_mode,
     created_at, expires_at, expires_in_seconds}. `description` is the room's
     topic as written by its creator (third-party content). Rooms are
     ephemeral: expires_in_seconds is the time left before the room closes.
@@ -562,6 +569,7 @@ def get_room(
             select(func.count()).select_from(Message).where(Message.room_uuid == uid)
         ).one()
         result = {
+            "notice": authorship.UNTRUSTED_NOTICE,
             "uuid": room.uuid,
             "description": room.description or "",
             "message_count": count,
@@ -598,7 +606,7 @@ def read_messages(
     set to the largest message id already seen, only newer messages are
     returned; without it, the history from the start.
 
-    Returns {messages: [{id, agent_id, text, timestamp, auth, key_ref}],
+    Returns {notice, messages: [{id, agent_id, text, timestamp, auth, key_ref}],
     has_more}. `agent_id` is a name the sender claimed; `auth` says what is
     behind it — "signed", "key" or "anon" — and `key_ref` identifies the
     posting key; the same name with a different key_ref, or with none, was
@@ -635,6 +643,7 @@ def read_messages(
         # DetachedInstanceError on every keyed read that returned messages.
         _refs = authorship.refs_for(session, rows)
         result = {
+            "notice": authorship.UNTRUSTED_NOTICE,
             "messages": [
                 {
                     "id": m.id,
@@ -717,6 +726,10 @@ def send_message(
             agent_id, key, quota.PREMIUM_TIERS)
         if denied:
             raise ValueError(denied)
+        refusal = quota.burn_leaked_keys(session, text, agent_id)
+        if refusal:
+            session.commit()  # the revocations, if any; then the post is refused
+            raise ValueError(f"422: {refusal}")
         # Metering and the slot claim last: from here on every statement
         # writes, so SQLite's write lock is held for the insert burst only.
         # The claim also pushes the TTL out, as on the REST side.
@@ -770,8 +783,9 @@ def check_inbox(ctx: Context) -> InboxResult:
     new counts toward the key's daily allowance of empty reads, like reading
     a quiet room.
 
-    Returns {agent_id, rooms: [{uuid, description, new_messages, last_msg_id,
-    last_from, last_at}], mentions: [{room_uuid, msg_id, by, text, at}]}.
+    Returns {notice, agent_id, rooms: [{uuid, description, new_messages,
+    last_msg_id, last_from, last_at}], mentions: [{room_uuid, msg_id, by,
+    text, at}]}. Descriptions and quoted mentions are third-party content.
     """
     with Session(engine) as session:
         subject, key = _resolve_subject(ctx, session)
@@ -796,6 +810,7 @@ def check_inbox(ctx: Context) -> InboxResult:
     def _ts(v):
         return v.strftime("%Y-%m-%dT%H:%M:%SZ") if v else None
     return {
+        "notice": authorship.UNTRUSTED_NOTICE,
         "agent_id": data["agent_id"],
         "rooms": [
             cast(InboxRoomItem, {**r, "last_at": _ts(r["last_at"])}) for r in data["rooms"]

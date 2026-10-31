@@ -851,3 +851,118 @@ def test_counters_stay_pending_when_redis_is_down_at_flush_time(fake_redis,
     down["on"] = False  # Redis is back: the pending counter is still there
     assert quota.flush_counters() == 1
     assert _stored(subject) == 1
+
+
+# ---------- untrusted-text notice, holder's stop button, leaked keys ----------
+
+def test_reads_carry_untrusted_notice():
+    from app.authorship import UNTRUSTED_NOTICE
+    uid = _new_room()["uuid"]
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "hi"})
+    assert client.get(f"/api/rooms/{uid}/messages").json()["notice"] == UNTRUSTED_NOTICE
+    assert client.get(f"/api/rooms/{uid}").json()["notice"] == UNTRUSTED_NOTICE
+
+
+
+
+def test_holder_can_revoke_own_key_and_seal_rooms():
+    key = _new_key("quitter")["key"]
+    uid = _new_room(headers=_bearer(key))["uuid"]
+    r = client.post("/api/keys/me/revoke", headers=_bearer(key))
+    assert r.status_code == 200
+    assert r.json() == {"revoked": True, "sealed_rooms": 1}
+    assert client.get("/api/keys/me", headers=_bearer(key)).status_code == 403
+    r = client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "x"})
+    assert r.status_code == 403
+    assert client.post("/api/keys/me/revoke").status_code == 401
+
+
+def test_message_with_live_key_is_refused_and_key_burned():
+    victim = _new_key("leaky")["key"]
+    uid = _new_room()["uuid"]
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"my key is {victim} ok"})
+    assert r.status_code == 422
+    assert "revoked" in r.json()["detail"]
+    assert client.get("/api/keys/me", headers=_bearer(victim)).status_code == 403
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"] == []
+    # key-shaped strings that match no key pass: docs and examples quote them
+    fake = "rk_" + "A" * 43
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"example: Bearer {fake}"})
+    assert r.status_code == 201
+
+
+def test_room_page_shows_provenance():
+    key = _new_key("badged")["key"]
+    uid = _new_room()["uuid"]
+    client.post(f"/api/rooms/{uid}/messages", headers=_bearer(key),
+                json={"agent_id": "named", "text": "with key"})
+    client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "named", "text": "no key"})
+    ref = client.get(f"/api/rooms/{uid}/messages").json()["messages"][0]["key_ref"]
+    html = client.get(f"/{uid}", headers={"accept": "text/html"}).text
+    assert f"🔑 {ref}" in html
+    assert 'class="auth-badge anon"' in html
+
+
+def test_leaked_key_with_suffix_or_in_name_is_burned():
+    uid = _new_room()["uuid"]
+    glued = _new_key("glued")["key"]
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"token={glued}xyz"})
+    assert r.status_code == 422
+    assert client.get("/api/keys/me", headers=_bearer(glued)).status_code == 403
+    named = _new_key("named")["key"]
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": named, "text": "hello"})
+    assert r.status_code == 422
+    assert client.get("/api/keys/me", headers=_bearer(named)).status_code == 403
+
+
+def test_more_key_shaped_strings_than_the_check_can_look_up_are_refused():
+    """The candidate cap bounds the lookups, so past it the message is refused
+    rather than passed. With the cap applied to the sorted candidates, eleven
+    junk `rk_...` strings filled it and a real key next to them was never
+    looked up: the post went through with a live key in it (review 01.11.2026).
+    """
+    uid = _new_room()["uuid"]
+    junk = " ".join("rk_" + c * 43 for c in "-0123456789")  # 11 > the cap
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": junk})
+    assert r.status_code == 422 and "too many to check" in r.json()["detail"]
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"] == []
+
+
+def test_a_live_key_among_junk_is_still_burned():
+    victim = _new_key("among-junk")["key"]
+    uid = _new_room()["uuid"]
+    junk = " ".join("rk_" + c * 43 for c in "-012")
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"{junk} and {victim}"})
+    assert r.status_code == 422 and "revoked" in r.json()["detail"]
+    assert client.get("/api/keys/me", headers=_bearer(victim)).status_code == 403
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"] == []
+
+
+def test_rk_inside_a_longer_token_is_not_a_candidate():
+    """A base64 blob that happens to carry "rk_" is not a published key, and
+    must not eat a candidate slot either — eleven of them in a log line would
+    otherwise refuse the message (or hide a real key)."""
+    uid = _new_room()["uuid"]
+    blobs = " ".join(f"x{c}rk_" + "Q" * 50 for c in "-0123456789")
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"log: {blobs}"})
+    assert r.status_code == 201
+
+
+def test_the_list_and_the_digests_carry_the_notice_too():
+    """Every answer that can hand back somebody else's words says so at its
+    root: the public list (descriptions by their creators) and the two keyed
+    digests (which quote mentions and knocks)."""
+    from app.authorship import UNTRUSTED_NOTICE
+    key = _new_key("noticed")["key"]
+    assert client.get("/api/rooms").json()["notice"] == UNTRUSTED_NOTICE
+    assert client.get("/api/me/inbox",
+                      headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE
+    assert client.get("/api/keys/me",
+                      headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE

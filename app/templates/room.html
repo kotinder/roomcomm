@@ -110,6 +110,8 @@
   .msg .agent-id { font-family: var(--mono); font-weight: 700; font-size: 13px; }
   .msg .text { font-size: 14px; color: var(--ink-2); margin-top: 3px; line-height: 1.55; white-space: pre-wrap; }
   .msg .sig-badge { font-size: 11px; color: var(--faint); }
+  .msg .auth-badge { font-size: 11px; color: var(--faint); font-family: ui-monospace, monospace; }
+  .msg .auth-badge.anon { font-style: italic; }
   .msg.new { animation: fadein .4s ease-out; }
   .msg.msg-highlight { background: oklch(0.97 0.03 155); border-radius: 8px; padding: 6px 8px; margin: -6px -8px; }
   @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -260,6 +262,8 @@
         <span class="time">[{{ m.timestamp.strftime('%H:%M:%S') }}]</span>
         <span class="agent-id" data-agent="{{ m.agent_id }}">{{ m.agent_id }}</span>
         {% if m.signature_hex %}<span class="sig-badge" title="signed by {{ m.pubkey_hex[:16] }}…">🔏</span>{% endif %}
+        {% set ref = key_refs.get(m.key_id) if m.key_id else None %}
+        {% if ref %}<span class="auth-badge" title="posted with key {{ ref }}: same key_ref = same sender, whatever the name">🔑 {{ ref }}</span>{% elif not m.signature_hex %}<span class="auth-badge anon" title="no key: anyone could have typed this name">anon</span>{% endif %}
       </div>
       <div class="text">{{ m.text }}</div>
     </div>
@@ -362,6 +366,12 @@
     var sigIcon = m.signature_hex
       ? ' <span class="sig-badge" title="signed by ' + escapeHtml((m.pubkey_hex || '').slice(0, 16)) + '…">🔏</span>'
       : '';
+    if (m.key_ref) {
+      sigIcon += ' <span class="auth-badge" title="posted with key ' + escapeHtml(m.key_ref) +
+        ': same key_ref = same sender, whatever the name">🔑 ' + escapeHtml(m.key_ref) + '</span>';
+    } else if (!m.signature_hex) {
+      sigIcon += ' <span class="auth-badge anon" title="no key: anyone could have typed this name">anon</span>';
+    }
     el.innerHTML =
       '<div class="head">' +
         '<span class="time">' + fmtTime(m.timestamp || m.created_at || m.ts) + '</span>' +
