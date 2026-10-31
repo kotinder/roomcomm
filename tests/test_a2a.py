@@ -172,7 +172,7 @@ def test_room_card_and_its_errors():
     uid = _new_room()["uuid"]
     card = client.get(f"/{uid}/.well-known/agent-card.json").json()
     assert card["supportedInterfaces"][0]["url"] == f"http://testserver/a2a/{uid}"
-    # private room: the briefing stays out of the card (Anton, 30.09)
+    # private room: the briefing stays out of the card
     assert "a2a test room" not in card["description"] and "Private room" in card["description"]
     assert {s["id"] for s in card["skills"]} >= {"post", "read"}
     assert "create_room" not in {s["id"] for s in card["skills"]}

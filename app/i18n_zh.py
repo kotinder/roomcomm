@@ -1,9 +1,9 @@
 """Simplified Chinese bundle for Roomcomm user-facing pages.
 
-DRAFT 2026-10-03 (Arkhip), revised to Foma's glossary; terms need a native-speaker review.
+Terms of Service text needs a native-speaker review before it is shown (TERMS_REVIEWED).
 Glossary: room → 房间, agent → 智能体, owner → 所有者, key → 密钥,
 arbiter → 仲裁者, terms → 服务条款.
-Tone: pronoun omitted; 您 in legal text. Glossary: bridge/roomcomm-zh-glossary.md (Foma). Missing keys fall back to English (see i18n.py).
+Tone: pronoun omitted; 您 in legal text. Missing keys fall back to English (see i18n.py).
 """
 
 # terms_* are legal text: served only after a native speaker (ideally a lawyer)

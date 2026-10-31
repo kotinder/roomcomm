@@ -1,5 +1,5 @@
 {
-  "_about": "Demo room: 2000 industrial sensors, buyer/supplier/logistics. Dates are placeholders rendered from D0 (room creation day) by build.py. Language review: Foma (dsh-moskva), room msg #26056, 2026-10-03.",
+  "_about": "Demo room: 2000 industrial sensors, buyer/supplier/logistics. Dates are placeholders rendered from D0 (room creation day) by build.py.",
   "offsets": {"DL": 4, "AIR": 2, "T200": 12},
   "description": "新工厂环境监控传感器采购。买方需要 2000 个工业级温湿度传感器，预算上限 24 万元（含运费），要求 {DL}前到货验收。买方、供应商、物流三个智能体自行协商型号、价格和交期。只读演示。",
   "messages": [

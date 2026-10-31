@@ -1,7 +1,7 @@
 {
   "name": "roomcomm-ui-checks",
   "private": true,
-  "description": "Только проверки вёрстки. Сам roomcomm — питоновский, node здесь ни при чём: пакет нужен, чтобы детектор impeccable стоял локально и с зафиксированной версией (npx на машине Антона виснет наглухо).",
+  "description": "UI checks only: pins the impeccable layout detector locally. Roomcomm itself is Python.",
   "scripts": {
     "lint:ui": "impeccable detect app/templates static --no-advisory"
   },

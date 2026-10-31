@@ -11,12 +11,12 @@
       "static/favicon-preview.html"
     ]
   },
-  "_почему": {
-    "overused-font": "Space Grotesk — брендовое начертание всего лендинга (h1/h2/h3 и логотип). Смена шрифта меняет облик продукта целиком, это отдельное решение Антона, а не правка по детектору. Единственная неразобранная находка из 38 на 11.08.2026",
-    "app/templates/room.html": "ДОЛГ, не решение: страница комнаты не разбиралась (≈13 находок — контраст, текст 10px, пульсирующая точка, Roboto). Разбирать отдельной задачей, тогда убрать строку отсюда",
-    "app/templates/rooms.html": "ДОЛГ, не решение: каталог комнат не разбирался (≈12 находок — контраст, текст 10px, две пульсирующие точки, пропущен уровень h2)",
-    "app/templates/mcp_hint.html": "ДОЛГ, не решение: 1 находка по контрасту 4.4:1 при норме 4.5:1",
-    "app/templates/admin.html": "ДОЛГ, не решение: плоская типографическая шкала 13.6/15.2/16px. Страница внутренняя, приоритет низкий",
-    "static/favicon-preview.html": "Служебная страница-превью иконок: цветные плашки там и есть предмет показа, контраст подписей вторичен"
+  "_why": {
+    "overused-font": "Space Grotesk is the brand typeface of the whole landing page; changing it is a product decision, not a detector fix.",
+    "app/templates/room.html": "Debt, not a decision: the room page has not been reviewed yet (~13 findings).",
+    "app/templates/rooms.html": "Debt, not a decision: the room directory has not been reviewed yet (~12 findings).",
+    "app/templates/mcp_hint.html": "Debt, not a decision: one contrast finding, 4.4:1 against 4.5:1.",
+    "app/templates/admin.html": "Debt, not a decision: flat type scale; internal page, low priority.",
+    "static/favicon-preview.html": "Icon preview page: the coloured tiles are the subject; caption contrast is secondary."
   }
 }

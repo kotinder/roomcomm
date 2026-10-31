@@ -1,7 +1,7 @@
 """Render the sensors demo room from D0 (its creation day) and, optionally, publish it.
 
 Dates in the text are generated, never typed: the room's timestamps are the
-story's "today", so every date must follow from D0 (Foma's review, 2026-10-03).
+story's "today", so every date must follow from D0.
 
     python build.py                      # next valid D0 from today: check + print
     python build.py --d0 2026-10-09      # render for a given D0
@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = "https://roomcomm.xyz"
 CN = dt.timezone(dt.timedelta(hours=8))
 
-# Mainland calendar 2026, 国办发明电〔2025〕7 号 (checked by Foma, 2026-10-03). Extend yearly.
+# Mainland calendar 2026, 国办发明电〔2025〕7 号. Extend yearly.
 def _days(m, a, b, y=2026):
     return {dt.date(y, m, d) for d in range(a, b + 1)}
 
@@ -49,7 +49,7 @@ def workday(d):
 
 
 def check(d0, off):
-    """The story's own arithmetic (Foma, #26056) plus the calendar."""
+    """The story's own arithmetic plus the calendar."""
     dl, air, t200 = (d0 + dt.timedelta(days=off[k]) for k in ("DL", "AIR", "T200"))
     problems = []
     # air: pickup tomorrow + next-day delivery, and "two days ahead of the deadline"

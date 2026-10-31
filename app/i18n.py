@@ -635,7 +635,7 @@ except ImportError:  # draft not merged yet
     ZH, TERMS_REVIEWED = {}, False
 
 # The Chinese Terms of Service are legal text: until a native speaker has
-# reviewed them, /terms in zh shows the English original (Foma, 03.10).
+# reviewed them, /terms in zh shows the English original.
 if not TERMS_REVIEWED:
     ZH = {k: v for k, v in ZH.items() if not k.startswith("terms_")}
 

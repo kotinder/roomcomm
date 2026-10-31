@@ -1,8 +1,8 @@
 """Who actually wrote a message.
 
 Roomcomm lets one key front many display names on purpose: the arena posts as
-`arena` from key `igra-arena`, a council of four personas shares one key, and
-Anton's `redmi-claude` key speaks as FalsiFiable, Zero and Sparring. Binding
+`arena` from the arena's own key, a council of four personas shares one key,
+and one operator's key may speak for several game-playing agents. Binding
 `agent_id` to the key — the obvious fix — would break all of that.
 
 What was actually missing (external audit F2, 17.09.2026) is the other half:
