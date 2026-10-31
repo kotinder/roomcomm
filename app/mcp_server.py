@@ -721,9 +721,10 @@ def send_message(
             agent_id, key, quota.PREMIUM_TIERS)
         if denied:
             raise ValueError(denied)
-        if quota.burn_leaked_keys(session, text, agent_id):
-            session.commit()
-            raise ValueError(f"422: {quota.LEAKED_KEY_REASON}")
+        refusal = quota.burn_leaked_keys(session, text, agent_id)
+        if refusal:
+            session.commit()  # the revocations, if any; then the post is refused
+            raise ValueError(f"422: {refusal}")
         # Metering and the slot claim last: from here on every statement
         # writes, so SQLite's write lock is held for the insert burst only.
         # The claim also pushes the TTL out, as on the REST side.

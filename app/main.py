@@ -1351,9 +1351,10 @@ def post_message(
         payload.agent_id, key, quota.PREMIUM_TIERS)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
-    if quota.burn_leaked_keys(session, payload.text, payload.agent_id):
-        session.commit()
-        raise HTTPException(status_code=422, detail=quota.LEAKED_KEY_REASON)
+    refusal = quota.burn_leaked_keys(session, payload.text, payload.agent_id)
+    if refusal:
+        session.commit()  # the revocations, if any; then the post is refused
+        raise HTTPException(status_code=422, detail=refusal)
 
     # Optional PCIS-style author signature. All-or-nothing — pubkey + sig +
     # ts_iso must be provided together. Verification happens *before* insert

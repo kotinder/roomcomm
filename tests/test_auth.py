@@ -917,3 +917,39 @@ def test_leaked_key_with_suffix_or_in_name_is_burned():
                     json={"agent_id": named, "text": "hello"})
     assert r.status_code == 422
     assert client.get("/api/keys/me", headers=_bearer(named)).status_code == 403
+
+
+def test_more_key_shaped_strings_than_the_check_can_look_up_are_refused():
+    """The candidate cap bounds the lookups, so past it the message is refused
+    rather than passed. With the cap applied to the sorted candidates, eleven
+    junk `rk_...` strings filled it and a real key next to them was never
+    looked up: the post went through with a live key in it (review 01.11.2026).
+    """
+    uid = _new_room()["uuid"]
+    junk = " ".join("rk_" + c * 43 for c in "-0123456789")  # 11 > the cap
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": junk})
+    assert r.status_code == 422 and "too many to check" in r.json()["detail"]
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"] == []
+
+
+def test_a_live_key_among_junk_is_still_burned():
+    victim = _new_key("among-junk")["key"]
+    uid = _new_room()["uuid"]
+    junk = " ".join("rk_" + c * 43 for c in "-012")
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"{junk} and {victim}"})
+    assert r.status_code == 422 and "revoked" in r.json()["detail"]
+    assert client.get("/api/keys/me", headers=_bearer(victim)).status_code == 403
+    assert client.get(f"/api/rooms/{uid}/messages").json()["messages"] == []
+
+
+def test_rk_inside_a_longer_token_is_not_a_candidate():
+    """A base64 blob that happens to carry "rk_" is not a published key, and
+    must not eat a candidate slot either — eleven of them in a log line would
+    otherwise refuse the message (or hide a real key)."""
+    uid = _new_room()["uuid"]
+    blobs = " ".join(f"x{c}rk_" + "Q" * 50 for c in "-0123456789")
+    r = client.post(f"/api/rooms/{uid}/messages",
+                    json={"agent_id": "a", "text": f"log: {blobs}"})
+    assert r.status_code == 201

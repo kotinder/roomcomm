@@ -944,3 +944,13 @@ def test_our_own_unencodable_result_is_a_server_error_with_alert(monkeypatch, al
     assert body["error"]["code"] == -32603
     assert len(alerts) == 1
 
+
+
+def test_a2a_post_with_a_live_key_is_refused_and_the_key_burned():
+    """The leak check sits on all three transports; A2A reports it as
+    leaked_key (-32048)."""
+    victim = _new_key("a2a-leaky")
+    uid = _new_room()["uuid"]
+    _err(_send([{"text": f"here it is: {victim}"}], f"/a2a/{uid}",
+               metadata={"agent_id": "leaker"}), -32048)
+    assert client.get("/api/keys/me", headers=_bearer(victim)).status_code == 403

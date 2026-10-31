@@ -211,9 +211,10 @@ def post(session: Session, caller: Caller, room: str, text: str,
     denied = authorship.protected_denied_reason(agent_id, caller.key, quota.PREMIUM_TIERS)
     if denied:
         raise OpError("forbidden", denied, 403)
-    if quota.burn_leaked_keys(session, text, agent_id):
-        session.commit()
-        raise OpError("leaked_key", quota.LEAKED_KEY_REASON, 422)
+    refusal = quota.burn_leaked_keys(session, text, agent_id)
+    if refusal:
+        session.commit()  # the revocations, if any; then the post is refused
+        raise OpError("leaked_key", refusal, 422)
     # Metering and the slot claim last: from here on every statement writes,
     # so SQLite's write lock is held for the insert burst only (see posting).
     _count(session, caller, "msg")
