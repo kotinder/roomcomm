@@ -2824,6 +2824,16 @@ def admin_home(request: Request, session: Session = Depends(get_session)):
     return _render_admin(request, session)
 
 
+# A one-segment path that cannot be a room link at all. The scanner alphabet
+# (/index.php, /.env, /wp-login.php, /xmlrpc.php, ~6k such hits a day) used to
+# get the full 13 KB room page rendered at it, which is both wasted work and a
+# "this host answers" signal. The friendly not-found page is there for a human
+# whose room link arrived truncated or wrapped across a line, so anything still
+# shaped like a piece of a UUID — hex and dashes, long enough to be one — keeps
+# it; everything else gets the same bare 404 as any unrouted path.
+_UUIDISH_RE = re.compile(r"^[0-9a-fA-F-]{8,36}$")
+
+
 @app.get("/{room_uuid}", response_class=HTMLResponse)
 def room_page(room_uuid: str, request: Request, session: Session = Depends(get_session)):
     lang = _lang(request)
@@ -2834,6 +2844,8 @@ def room_page(room_uuid: str, request: Request, session: Session = Depends(get_s
         if _wants_markdown(request):
             return PlainTextResponse("# Room not found\n\nNo such room.\n",
                                      status_code=404, media_type="text/markdown; charset=utf-8")
+        if not _UUIDISH_RE.match(room_uuid):
+            raise HTTPException(status_code=404, detail="Not found")
         resp = templates.TemplateResponse(
             request,
             "room.html",
