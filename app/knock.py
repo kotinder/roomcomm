@@ -276,7 +276,7 @@ def knock(session: Session, key: Optional[AgentKey], to_ref: str, agent_id: str,
     session.refresh(k)
     alert = None
     if session.get(KnockAlert, target.id) is not None and _alertable(target):
-        alert = (target.contact[3:], format_alert(
+        alert = ((target.contact or "")[3:], format_alert(
             from_agent=agent_id, from_ref=authorship.key_ref(me),
             to_agent=to_name, text=text, room_uuid=room.uuid))
     return {
@@ -337,7 +337,7 @@ def my_knocks(session: Session, key: AgentKey, limit: int = 50) -> dict:
     def _rows(col):
         return session.exec(select(Knock).where(col == key.id)
                             .order_by(Knock.id.desc()).limit(limit)).all()
-    keys: dict[int, AgentKey] = {}
+    keys: dict[int, Optional[AgentKey]] = {}
     names: dict[int, Optional[str]] = {}
 
     def _who(kid: int) -> dict:
@@ -440,7 +440,7 @@ def unforget(session: Session, key: Optional[AgentKey], ref: str) -> dict:
 def forgotten_list(session: Session, key: AgentKey) -> list[dict]:
     out = []
     for row in session.exec(select(Forgotten).where(Forgotten.key_id == key.id)
-                            .order_by(Forgotten.created_at.desc())).all():
+                            .order_by(Forgotten.created_at.desc())).all():  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
         other = session.get(AgentKey, row.forgotten_key_id)
         out.append({"key_ref": authorship.key_ref(other), "since": row.created_at,
                     "agent": display_name(session, key.id, other) if other else None})

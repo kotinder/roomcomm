@@ -81,7 +81,7 @@ def init_db() -> None:
         try:
             import fcntl
         except ImportError:  # Windows dev box: single process, nothing to race
-            fcntl = None
+            fcntl = None  # type: ignore[assignment]
         if fcntl:
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:

@@ -14,7 +14,7 @@ import uuid
 import httpx
 from google.protobuf import json_format
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-from a2a.types.a2a_pb2 import GetTaskRequest, Message, Part, Role, SendMessageRequest
+from a2a.types.a2a_pb2 import GetTaskRequest, Message, SendMessageRequest
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000").rstrip("/")
 results = []

@@ -14,10 +14,10 @@ import uuid as uuid_lib
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Optional, cast
 from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -196,9 +196,7 @@ from .schemas import (
     DiscrepancyOut,
     HandshakeIn,
     HandshakeOut,
-    InboxMentionOut,
     InboxOut,
-    InboxRoomOut,
     ForgetIn,
     KnockAlertsIn,
     KnockCreatedOut,
@@ -1356,7 +1354,7 @@ def post_message(
         if not _HEX128_RE.match(sg):
             raise HTTPException(status_code=400, detail="signature_hex must be 128 hex chars")
         # Bound the ts: must parse, must be within ±5 minutes of server clock.
-        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from datetime import datetime as _dt, timezone as _tz
         try:
             agent_ts = _dt.fromisoformat(ts_iso.replace("Z", "+00:00"))
             if agent_ts.tzinfo is None:
@@ -1438,9 +1436,9 @@ def _msg_dict(m: Message) -> dict:
 
 
 def _gather_threads(session: Session, room_uuid: str) -> list[Claim]:
-    return session.exec(
-        select(Claim).where(Claim.room_uuid == room_uuid).order_by(Claim.created_at.asc())
-    ).all()
+    return list(session.exec(
+        select(Claim).where(Claim.room_uuid == room_uuid).order_by(Claim.created_at.asc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
+    ).all())
 
 
 def _thread_summaries(threads: list[Claim]) -> list[dict]:
@@ -1459,9 +1457,9 @@ def _thread_summaries(threads: list[Claim]) -> list[dict]:
 
 
 def _revisions_of(session: Session, claim_id: str) -> list[ClaimRevision]:
-    return session.exec(
+    return list(session.exec(
         select(ClaimRevision).where(ClaimRevision.claim_id == claim_id).order_by(ClaimRevision.id.asc())
-    ).all()
+    ).all())
 
 
 def _revision_to_out(r: ClaimRevision) -> RevisionOut:
@@ -1742,7 +1740,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
             ))
             discs += 1
 
-        room.last_extracted_msg_id = msg.id
+        room.last_extracted_msg_id = cast(int, msg.id)
         session.add(room)
         session.commit()
 
@@ -1927,7 +1925,7 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
         select(Discrepancy).where(
             Discrepancy.room_uuid == room_uuid,
             Discrepancy.resolved == False,  # noqa: E712
-        ).order_by(Discrepancy.created_at.desc())
+        ).order_by(Discrepancy.created_at.desc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
     ).all()
     return ContextOut(
         room_uuid=room_uuid,
@@ -2348,7 +2346,7 @@ def list_handshakes(room_uuid: str, session: Session = Depends(get_session)):
     _get_room_or_404(session, room_uuid)
     rows = session.exec(
         select(Handshake).where(Handshake.room_uuid == room_uuid)
-        .order_by(Handshake.created_at.asc())
+        .order_by(Handshake.created_at.asc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
     ).all()
     return [
         HandshakeOut(
@@ -2618,6 +2616,7 @@ def _file_exchange_key(request: Request, session: Session) -> AgentKey:
         quota.check_file_exchange(key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
+    assert key is not None  # check_file_exchange refuses an absent key
     return key
 
 
@@ -2997,7 +2996,9 @@ def _admin_attempt(request: Request, candidates: list) -> bool:
 
 
 def _admin_token_ok(token: Optional[str]) -> bool:
-    return bool(ADMIN_TOKEN) and bool(token) and secrets.compare_digest(token, ADMIN_TOKEN)
+    if not ADMIN_TOKEN or not token:
+        return False
+    return secrets.compare_digest(token, ADMIN_TOKEN)
 
 
 def _bearer_is_admin(authorization: Optional[str]) -> bool:
@@ -3391,7 +3392,7 @@ def admin_delete_room(
         ).all()
     ]
     if claim_ids:
-        session.exec(delete(ClaimRevision).where(ClaimRevision.claim_id.in_(claim_ids)))
+        session.exec(delete(ClaimRevision).where(ClaimRevision.claim_id.in_(claim_ids)))  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
     session.exec(delete(Claim).where(Claim.room_uuid == room_uuid))
     session.exec(delete(Discrepancy).where(Discrepancy.room_uuid == room_uuid))
     session.exec(delete(Handshake).where(Handshake.room_uuid == room_uuid))

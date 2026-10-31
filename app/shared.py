@@ -11,7 +11,7 @@ for DOWN_FOR seconds so a dead Redis costs one short timeout, not one per reques
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 log = logging.getLogger("roomcomm.shared")
 
@@ -37,7 +37,7 @@ redis.call('ZADD', KEYS[1], now, member)
 redis.call('EXPIRE', KEYS[1], math.ceil(window))
 return 0
 """
-_hit_script = None
+_hit_script: Any = None
 
 
 def _r():

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import uuid as uuid_lib
-from typing import Annotated, Optional
+from typing import Annotated, Optional, cast
 
 from typing_extensions import TypedDict  # pydantic needs this (not typing) on Py<3.12
 
@@ -26,7 +26,7 @@ from sqlmodel import Session, func, select
 
 from . import authorship, files, inbox, knock, llm, posting, quota, ttl
 from .database import engine
-from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Handshake, Message, Room
+from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Message, Room
 
 log = logging.getLogger("roomcomm.mcp")
 
@@ -571,7 +571,7 @@ def get_room(
             "expires_at": room.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ") if room.expires_at else None,
             "expires_in_seconds": ttl.seconds_left(room),
         }
-        return _attach_awaiting(result, ctx, session, uid)
+        return cast(RoomInfo, _attach_awaiting(result, ctx, session, uid))
 
 
 @mcp.tool(
@@ -657,7 +657,7 @@ def read_messages(
                 seen_key = None
             inbox.advance_seen_best_effort(session, seen_key, uid, rows)
         # Quiet here, called elsewhere: the empty poll needs this most.
-        return _attach_awaiting(result, ctx, session, uid)
+        return cast(ReadMessagesResult, _attach_awaiting(result, ctx, session, uid))
 
 
 @mcp.tool(
@@ -740,7 +740,8 @@ def send_message(
             "auth": authorship.auth_level(msg),
             "key_ref": authorship.key_ref(key),
         }
-        return _attach_awaiting(result, ctx, session, uid, key) if key is not None else result
+        return cast(SentMessage, _attach_awaiting(result, ctx, session, uid, key)
+                    if key is not None else result)
 
 
 @mcp.tool(
@@ -797,13 +798,13 @@ def check_inbox(ctx: Context) -> InboxResult:
     return {
         "agent_id": data["agent_id"],
         "rooms": [
-            {**r, "last_at": _ts(r["last_at"])} for r in data["rooms"]
+            cast(InboxRoomItem, {**r, "last_at": _ts(r["last_at"])}) for r in data["rooms"]
         ],
         "mentions": [
-            {**m, "at": _ts(m["at"])} for m in data["mentions"]
+            cast(InboxMentionItem, {**m, "at": _ts(m["at"])}) for m in data["mentions"]
         ],
         "knocks": [
-            {**k, "at": _ts(k["at"])} for k in data.get("knocks", [])
+            cast(KnockItem, {**k, "at": _ts(k["at"])}) for k in data.get("knocks", [])
         ],
     }
 
@@ -876,7 +877,7 @@ def knock_agent(
     knock.alert_async(out.pop("alert"))
     exp = out["expires_at"]
     out["expires_at"] = exp.strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
-    return out
+    return cast(KnockResult, out)
 
 
 class KnockAnswer(TypedDict):
@@ -905,7 +906,7 @@ def decline_knock(
     with Session(engine) as session:
         _, key = _resolve_subject(ctx, session)
         try:
-            return knock.decline(session, key, knock_id)
+            return cast(KnockAnswer, knock.decline(session, key, knock_id))
         except knock.KnockError as e:
             raise _knock_fail(e)
 
@@ -940,8 +941,8 @@ def forget_agent(
         _, key = _resolve_subject(ctx, session)
         try:
             if forget:
-                return knock.forget(session, key, key_ref)
-            return knock.unforget(session, key, key_ref)
+                return cast(ForgetResult, knock.forget(session, key, key_ref))
+            return cast(ForgetResult, knock.unforget(session, key, key_ref))
         except knock.KnockError as e:
             raise _knock_fail(e)
 
@@ -965,6 +966,7 @@ def _file_exchange_key(ctx: Context, session: Session) -> AgentKey:
         quota.check_file_exchange(key)
     except quota.AuthError as e:
         raise ValueError(e.detail)
+    assert key is not None  # check_file_exchange refuses an absent key
     return key
 
 
@@ -1261,16 +1263,17 @@ def get_context(
     with Session(engine) as session:
         room = _get_room(session, uid)
         threads = session.exec(
-            select(Claim).where(Claim.room_uuid == uid).order_by(Claim.created_at.asc())
+            select(Claim).where(Claim.room_uuid == uid).order_by(Claim.created_at.asc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
         ).all()
         discs = session.exec(
             select(Discrepancy).where(
                 Discrepancy.room_uuid == uid,
                 Discrepancy.resolved == False,  # noqa: E712
-            ).order_by(Discrepancy.created_at.desc())
+            ).order_by(Discrepancy.created_at.desc())  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
         ).all()
 
-        import hashlib, json as _json
+        import hashlib
+        import json as _json
         snapshot = [
             {
                 "id": c.id, "subject": c.subject, "subject_key": c.subject_key,
@@ -1304,7 +1307,7 @@ def get_context(
             ],
             "discrepancies": [
                 {
-                    "id": d.id,
+                    "id": cast(int, d.id),
                     "description": d.description,
                     "severity": d.severity,
                 }

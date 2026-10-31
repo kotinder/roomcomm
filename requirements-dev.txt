@@ -1,0 +1,13 @@
+# Checking tools, kept out of requirements.txt because the Dockerfile installs
+# that one into the production image.
+#
+#     pip install -r requirements-dev.txt
+#
+# Pinned to a minor series, not left open: ruff widens its default rule set
+# between releases, and before pyproject.toml pinned `select` explicitly an
+# upgrade turned `ruff check .` into hundreds of findings on an untouched tree.
+# The settings in pyproject.toml were written against these.
+ruff>=0.17,<0.18
+mypy>=2.4,<3
+
+# pytest and httpx are in requirements.txt: the suite also runs in the image.

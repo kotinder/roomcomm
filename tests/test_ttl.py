@@ -250,8 +250,6 @@ def test_activity_leaves_pinned_rooms_pinned():
 
 
 def test_activity_cannot_walk_past_the_ceiling():
-    from app.models import utcnow as _now
-    from datetime import timedelta as _td
     room = _create(description="at the ceiling", ttl_hours=ttl.MAX_HOURS)
     client.post(f"/api/rooms/{room['uuid']}/messages",
                 json={"agent_id": "a", "text": "ping"})
@@ -409,7 +407,7 @@ def _mcp_call(c, tool: str, args: dict, headers: dict) -> dict:
     assert r.status_code == 200, r.text
     body = r.text
     if body.lstrip().startswith("event:") or "data:" in body[:20]:
-        body = [l[5:].strip() for l in body.splitlines() if l.startswith("data:")][-1]
+        body = [ln[5:].strip() for ln in body.splitlines() if ln.startswith("data:")][-1]
     import json as _json
     return _json.loads(body)["result"]
 

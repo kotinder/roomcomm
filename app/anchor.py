@@ -124,7 +124,7 @@ def merkle_root(leaves: list[tuple[str, str]]) -> str:
     if not level:
         return _sha256_hex(b"empty:" + DIGEST_VERSION.encode("utf-8"))
     while len(level) > 1:
-        nxt = []
+        nxt: list[str] = []
         for i in range(0, len(level), 2):
             left = level[i]
             # Odd node out is carried up unchanged rather than duplicated —
@@ -149,7 +149,7 @@ def inclusion_proof(leaves: list[tuple[str, str]], room_uuid: str) -> Optional[l
     level = [leaf_hash(u, d) for u, d in leaves]
     path: list[dict] = []
     while len(level) > 1:
-        nxt = []
+        nxt: list[str] = []
         for i in range(0, len(level), 2):
             left = level[i]
             right = level[i + 1] if i + 1 < len(level) else None

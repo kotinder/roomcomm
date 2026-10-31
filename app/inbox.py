@@ -63,7 +63,8 @@ def advance_seen_best_effort(session: Session, key: Optional[AgentKey],
     if key is None or not rows:
         return
     try:
-        advance_seen(session, key.id, room_uuid, max(m.id for m in rows))
+        advance_seen(session, key.id, room_uuid,
+                     max(m.id for m in rows if m.id is not None))
         session.commit()
     except Exception:
         session.rollback()
@@ -147,7 +148,7 @@ def _mentions(session: Session, key: AgentKey, rooms: set[str],
     cutoff = utcnow() - timedelta(days=MENTION_WINDOW_DAYS)
     candidates = session.exec(
         select(Message).where(
-            Message.room_uuid.in_(rooms),
+            Message.room_uuid.in_(rooms),  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
             func.instr(func.lower(Message.text), name) > 0,
             Message.timestamp >= cutoff,
         ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)
@@ -180,7 +181,7 @@ AWAITING_LIMIT = 3
 # polling a quiet server pays one primary-key lookup.
 AWAITING_SCAN = 5000
 AWAITING_TTL = 30.0
-_await_cache: dict[tuple[int, str, Optional[str], int], tuple[float, dict]] = {}
+_await_cache: dict[tuple[Optional[int], str, Optional[str], int], tuple[float, dict]] = {}
 _await_lock = Lock()
 
 
@@ -251,7 +252,7 @@ def _awaiting_uncached(session: Session, key: AgentKey, exclude_room: Optional[s
         candidates = session.exec(
             select(Message).where(
                 Message.id > top - AWAITING_SCAN,
-                Message.room_uuid.in_(list(seen)),
+                Message.room_uuid.in_(list(seen)),  # type: ignore[attr-defined]  # SQLModel column, see pyproject.toml
                 Message.timestamp >= cutoff,
                 func.instr(func.lower(Message.text), name) > 0,
             ).order_by(Message.id.desc()).limit(MENTION_SCAN_LIMIT)

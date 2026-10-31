@@ -671,7 +671,7 @@ def _send_message(params: dict, request: Request, background_tasks: BackgroundTa
     msg = _parse_message(params)
     parts = msg["parts"]
     texts = [p["text"] for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)]
-    data = next((p["data"] for p in parts
+    data: dict = next((p["data"] for p in parts
                  if isinstance(p, dict) and isinstance(p.get("data"), dict)), {})
     raw_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
     meta = {"agent_id": _str_arg(raw_meta, "agent_id", 100),
@@ -889,10 +889,10 @@ def _run_op(op: str, data: dict, meta: dict, session: Session, caller: ops.Calle
         text = _fmt_messages(res["messages"], 50) or "No new messages."
         return _reply(text, res, ctx_out or res["room"])
     if op == "post":
-        text = _str_arg(data, "text", ops.TEXT_MAX)
-        if not text:
+        post_text = _str_arg(data, "text", ops.TEXT_MAX)
+        if not post_text:
             raise RpcError(INVALID_PARAMS, "post needs text")
-        return _post_and_catch_up(session, caller, room, text, agent_id, room_key,
+        return _post_and_catch_up(session, caller, room, post_text, agent_id, room_key,
                                   background_tasks, ctx_out,
                                   _int_arg(data, "since", 0) if "since" in data else meta["since"])
     if op == "share_file":

@@ -65,7 +65,12 @@ def refs_for(session, messages) -> dict[int, str]:
     if not ids:
         return {}
     rows = session.exec(select(AgentKey).where(AgentKey.id.in_(ids))).all()
-    return {k.id: key_ref(k) for k in rows if key_ref(k)}
+    out: dict[int, str] = {}
+    for k in rows:
+        ref = key_ref(k)
+        if ref:
+            out[k.id] = ref
+    return out
 
 
 def protected_denied_reason(agent_id: str, key: Optional[AgentKey],

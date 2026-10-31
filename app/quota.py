@@ -22,7 +22,7 @@ import os
 import secrets
 import threading
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, cast
 
 from sqlmodel import Session, select
 
@@ -203,7 +203,9 @@ def check_write_policy(room: Room, provided_room_key: Optional[str],
             return
         from sqlalchemy.orm import object_session
         from .models import Knock
-        sess = object_session(room)
+        # object_session is typed for SQLAlchemy's Session; every session here
+        # is SQLModel's subclass of it, and .exec() is what that subclass adds.
+        sess = cast(Optional[Session], object_session(room))
         k = (sess.exec(select(Knock).where(Knock.room_uuid == room.uuid)).first()
              if sess is not None else None)
         if key is not None and k is not None and k.to_key_id == key.id:

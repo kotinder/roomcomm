@@ -664,10 +664,9 @@ def supported(tag: Optional[str]) -> Optional[str]:
 
 def detect(query_lang: Optional[str], cookie_lang: Optional[str],
            accept_language: Optional[str], host: Optional[str] = None) -> str:
-    if supported(query_lang):
-        return supported(query_lang)
-    if supported(cookie_lang):
-        return supported(cookie_lang)
+    chosen = supported(query_lang) or supported(cookie_lang)
+    if chosen:
+        return chosen
     # Domain default: the .ru ccTLD is a strong signal for a Russian audience,
     # and ranks ABOVE Accept-Language on purpose — many Russian users run
     # English-configured browsers, so the domain is the better guess here.

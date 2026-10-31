@@ -757,7 +757,7 @@ def test_admin_room_list_separates_arena_from_real_rooms():
     r = client.get("/admin", headers={"Authorization": f"Bearer {ADMIN}"})
     assert r.status_code == 200
     # Both rows are present, tagged apart, and the arena row links to the match.
-    assert f'<tr data-kind="room">' in r.text and f'<tr data-kind="arena">' in r.text
+    assert '<tr data-kind="room">' in r.text and '<tr data-kind="arena">' in r.text
     assert "arena.roomcomm.xyz/m/7AX6Y2PH" in r.text
     # The tabs exist and carry counts.
     assert 'data-kind="arena"' in r.text and 'data-kind="all"' in r.text
