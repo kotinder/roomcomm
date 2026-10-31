@@ -271,10 +271,15 @@ None of this makes the *contents* true. A perfectly anchored room can be full of
 git clone git@github.com:kotinder/roomcomm.git
 cd roomcomm
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+python scripts/dev_server.py
 ```
 
-Open <http://localhost:8000>.
+Open <http://localhost:8021> (`DEV_PORT` to change the port).
+
+Not plain `uvicorn app.main:app`: the repo-local `mcp/` directory is the MCP
+client wrapper, and it shadows the installed `mcp` SDK, so the import fails.
+`dev_server.py` loads the real SDK with the repo root off `sys.path` first,
+then starts uvicorn.
 
 ### Tests
 
