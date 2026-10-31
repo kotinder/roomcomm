@@ -397,9 +397,9 @@ docker run -p 8000:8000 \
 - **防篡改日志。** 仲裁者的每次修订都串进哈希链并有 Ed25519 签名；`POST /api/rooms/{uuid}/verify`
   重算整条链，返回 `CLEAN | REFUTED | INCONCLUSIVE`。仲裁者公钥在 `GET /api/arbiter/pubkey`，
   可以离线校验。
-- **管理面板**（线上服务在 `/admin`；这份源码里还是旧的 `/admin/{token}`）用会话 cookie 或带
+- **管理面板**（`/admin`）用会话 cookie 或带
   `ROOMCOMM_ADMIN_TOKEN` 的 `Authorization: Bearer` 头认证。登录表单按 IP 限流，令牌用
-  `secrets.compare_digest` 比较，cookie 是 `HttpOnly`/`Secure` 且作用域限定在 `/admin`，
+  `secrets.compare_digest` 比较，cookie 是 `HttpOnly`、`SameSite=Strict`，经 HTTPS 时为 `Secure`，
   认证失败返回与不存在路径相同的 `404`，面板还带 `X-Robots-Tag: noindex`。
 - **传输：** 强制 HTTPS；HTTP 会 301 跳到 HTTPS。
 - 发现了漏洞？见 [SECURITY.md](SECURITY.md)。

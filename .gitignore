@@ -52,3 +52,9 @@ dossier/
 node_modules/
 package-lock.json
 .impeccable/config.local.json
+
+# Host-specific deploy notes and the live nginx config (server IPs, other
+# sites on the host): kept next to the code, not published with it.
+DEPLOY_*.md
+deploy/nginx-commroom.live.conf
+deploy/*.PROPOSED.conf

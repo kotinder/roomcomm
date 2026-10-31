@@ -1,6 +1,6 @@
 """Temporarily exempt the load generator (and the local sampler) from the
 commroom limit_req zones. Run on the server as root:
-    python3 nginx_exempt.py /etc/nginx/sites-enabled/commroom
+    python3 nginx_exempt.py /etc/nginx/sites-enabled/commroom <generator-ip> [...]
 Restore by copying back the backup taken before (the script refuses to run
 twice). nginx cannot change the key of an existing zone on reload, so the
 commroom zones get new names (*_lt); `general` stays defined under its own
@@ -9,8 +9,10 @@ name too, because snippets/tg-console.conf and snippets/victus-q.conf use it.
 import re
 import sys
 
-EXEMPT = ["132.243.238.233", "87.242.85.49", "127.0.0.1"]  # sg, mannov.ru VM, local sampler
+if len(sys.argv) < 3:
+    sys.exit(__doc__)
 path = sys.argv[1]
+EXEMPT = sys.argv[2:] + ["127.0.0.1"]  # load generators, plus the local sampler
 s = open(path, encoding="utf-8").read()
 if "$lt_key" in s:
     sys.exit("already patched")

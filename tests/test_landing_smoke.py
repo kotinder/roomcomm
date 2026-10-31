@@ -21,6 +21,8 @@ def test_landing_renders_both_locales_with_tg_hint():
 @pytest.mark.parametrize("path", [
     "/index.php", "/.env", "/wp-login.php", "/xmlrpc.php", "/config",
     "/.well-known", "/backup.zip", "/feed",
+    "/--------",                                 # dashes alone are no UUID
+    "/0e8f1c2",                                  # seven hex digits: too short to tell
 ])
 def test_scanner_paths_get_a_bare_404(path):
     r = client.get(path)
@@ -33,6 +35,10 @@ def test_scanner_paths_get_a_bare_404(path):
     "/0e8f1c2a-4b6d",                           # link cut off mid-UUID
     "/0e8f1c2a4b6d47f98e1a2b3c4d5e6f70",        # dashes stripped by a chat client
     "/0e8f1c2a-4b6d-47f9-8e1a-2b3c4d5e6f7",     # last character lost
+    "/0E8F1C2A-4B6D",                           # upper case
+    "/0e8f1c2a-4b6d-47f9-8e1a-2b3c4d5e6f70.",   # sentence punctuation stuck on
+    "/0e8f1c2a-4b6d-47f9-8e1a-2b3c4d5e6f70)",   # closing bracket from the chat
+    "/%200e8f1c2a-4b6d-47f9-8e1a-2b3c4d5e6f70", # leading space
 ])
 def test_truncated_room_link_still_gets_the_page(path):
     r = client.get(path)
