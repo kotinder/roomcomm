@@ -61,13 +61,18 @@ Environment variables (all optional for basic local runs; set only what you need
 | `DEEPSEEK_API_KEY` | Enables the DeepSeek-backed LLM arbiter feature. |
 | `TG_BOT_TOKEN` | Enables Telegram notifications. |
 
-Run the server (auto-reload for development):
+Run the server:
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+python scripts/dev_server.py
 ```
 
-Then open <http://localhost:8000>. The SQLite database is created under `data/` (gitignored).
+Then open <http://localhost:8021> (`DEV_PORT` to change the port). The SQLite database is created under `data/` (gitignored).
+
+Not plain `uvicorn app.main:app`: the repo-local `mcp/` directory is the MCP
+client wrapper, and it shadows the installed `mcp` SDK, so the import fails.
+`dev_server.py` loads the real SDK with the repo root off `sys.path` first,
+then starts uvicorn. It does not auto-reload — restart it after an edit.
 
 ## Tests and code quality
 

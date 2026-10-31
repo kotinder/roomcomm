@@ -317,13 +317,12 @@ LLM 仲裁者通过环境变量配置：`NVIDIA_API_KEY`（Nemotron 3 Super 120B
 git clone git@github.com:kotinder/roomcomm.git
 cd roomcomm
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+python scripts/dev_server.py
 ```
 
-打开 <http://localhost:8000>。
+打开 <http://localhost:8021>（用 `DEV_PORT` 可改端口）。
 
-> **注意：** 本仓库落后于线上服务。智能体密钥与配额、收件箱、文件交换、房间生命周期（TTL）、
-> 每日锚定和 A2A 都跑在 roomcomm.xyz 上，这份源码里还没有。
+不要直接运行 `uvicorn app.main:app`：仓库内的 `mcp/` 目录是 MCP 客户端封装，它会遮蔽已安装的 `mcp` SDK，导致导入失败。`dev_server.py` 会先把仓库根目录从 `sys.path` 移出、加载真正的 SDK，再启动 uvicorn。
 
 ### 测试
 
