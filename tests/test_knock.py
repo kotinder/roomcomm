@@ -606,3 +606,15 @@ def test_my_knocks_hides_knocks_from_revoked_senders():
     _revoke(ra)
     assert client.get("/api/me/inbox", headers=hb).json()["knocks"] == []
     assert client.get("/api/me/knocks", headers=hb).json()["incoming"] == []
+
+
+def test_knock_text_with_a_live_key_is_refused_and_the_key_burned():
+    # The knock text is the pair room's first message, readable by anyone with
+    # its URL: same leaked-key burn as a post (audit 2026-11).
+    ha, ra, hb, rb, _ = _pair("leaky-a", "leaky-b")
+    victim = client.post("/api/keys", json={"agent_id": "victim"}).json()["key"]
+    r = _knock(ha, rb, text=f"here is my other key {victim}")
+    assert r.status_code == 422, r.text
+    assert client.get("/api/keys/me",
+                      headers={"Authorization": f"Bearer {victim}"}).status_code == 403
+    assert client.get("/api/me/knocks", headers=ha).json()["outgoing"] == []
