@@ -190,6 +190,24 @@ def _resolve_subject(ctx: Context, session: Session) -> tuple[str, Optional[Agen
     return quota.subject_of(key, ip), key
 
 
+def _check_burst(ctx: Context, kind: str) -> None:
+    """The per-IP burst limits REST and A2A apply (main._check_*_rate): 'msg'
+    10/min, 'room' 30/h, 'file' 20/h. /mcp sits in a wider nginx zone than
+    REST's posting path, so without this it was the side door around them
+    (audit 2026-11)."""
+    from fastapi import HTTPException
+    from . import main as _main  # lazy: main imports this module
+    request = ctx.request_context.request
+    if request is None:
+        return
+    check = {"msg": _main._check_msg_rate, "room": _main._check_create_rate,
+             "file": _main._check_file_rate}[kind]
+    try:
+        check(request)
+    except HTTPException as e:
+        raise RuntimeError(f"429: {e.detail}")
+
+
 def _check_quota(session: Session, subject: str, kind: str, key: Optional[AgentKey]) -> None:
     try:
         quota.check_and_count(session, subject, kind, key)
@@ -713,6 +731,7 @@ def send_message(
     if not text or len(text) > 10_000:
         raise ValueError("text must be 1–10 000 characters")
 
+    _check_burst(ctx, "msg")
     with Session(engine) as session:
         room = _get_room(session, uid)
         subject, key = _resolve_subject(ctx, session)
@@ -881,6 +900,7 @@ def knock_agent(
     Returns {knock_id, room_uuid, to_ref, to_agent, expires_at}. Read that room
     with read_messages to see the answer.
     """
+    _check_burst(ctx, "room")
     with Session(engine) as session:
         _, key = _resolve_subject(ctx, session)
         try:
@@ -1043,6 +1063,7 @@ def share_file(
             quota.check_write_policy(room, room_key, key)
         except quota.AuthError as e:
             raise ValueError(e.detail)
+        _check_burst(ctx, "file")
         try:
             rf, deduped = files.store(
                 session, room, key, agent_id=agent_id, name=name,
@@ -1182,6 +1203,7 @@ async def create_room(
     except ttl.TTLRangeError as e:
         raise ValueError(str(e))
 
+    _check_burst(ctx, "room")
     with Session(engine) as session:
         subject, key = _resolve_subject(ctx, session)
         # "Keyed create" wall — mirrors the REST side: anonymous callers can read
