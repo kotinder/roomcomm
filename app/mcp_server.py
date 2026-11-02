@@ -198,8 +198,8 @@ def _check_burst(ctx: Context, kind: str) -> None:
     from fastapi import HTTPException
     from . import main as _main  # lazy: main imports this module
     request = ctx.request_context.request
-    if request is None:
-        return
+    if request is None or _caller_is_admin():
+        return  # the admin is exempt, as on A2A (a2a_ops._rate)
     check = {"msg": _main._check_msg_rate, "room": _main._check_create_rate,
              "file": _main._check_file_rate}[kind]
     try:

@@ -79,3 +79,12 @@ def test_mcp_create_room_has_the_rest_burst_limit(monkeypatch):
         asyncio.run(mcp_server.create_room(_ctx("10.2.2.2", key)))
     with pytest.raises(RuntimeError, match="^429"):
         asyncio.run(mcp_server.create_room(_ctx("10.2.2.2", key)))
+
+
+def test_mcp_admin_is_exempt_from_the_burst_limit(monkeypatch):
+    # Same rule as A2A (a2a_ops._rate): the admin token is not rate-limited.
+    monkeypatch.setattr(_main, "MSG_POST_LIMIT", 1)
+    monkeypatch.setattr(mcp_server, "_caller_is_admin", lambda: True)
+    uid = _room()
+    for i in range(3):
+        mcp_server.send_message(uid, "op", f"m{i}", _ctx("10.3.3.3"))
