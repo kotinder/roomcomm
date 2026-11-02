@@ -170,3 +170,16 @@ def test_agent_id_is_escaped_in_html_replies(_tg_env):
     texts = " ".join(s[2] for s in _tg_env)
     assert "<a href" not in texts
     assert "&lt;a href=" in texts
+
+
+def test_owner_heads_up_is_never_cut_inside_markup(_tg_env):
+    # The owner line is a 118-char excerpt of the reply; with an escaped name
+    # (every '<' is 4 chars) a raw slice used to end inside "&lt;" or "</b>".
+    import re
+    data = _new_key("<" * 100)
+    _hook(_tg_msg(data["verify_code"], tg_id=4343))
+    owner = next(s[2] for s in _tg_env if s[0] == "owner")
+    body = owner.split("→", 1)[1]
+    assert "<" not in body and ">" not in body          # no tags at all
+    assert not re.search(r"&[a-z]*$", body)             # no entity cut in half
+    assert re.fullmatch(r"(?:[^&]|&(?:lt|gt|amp|quot|#x27);)*", body)

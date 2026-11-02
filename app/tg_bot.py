@@ -162,9 +162,13 @@ async def handle_update(update: dict, session: Session) -> None:
             reply = _bind(session, code, from_id)
             if reply.startswith("✅"):
                 # Owner heads-up on the notification channel.
+                # Cut the plain text, then escape: slicing the HTML reply
+                # could split a tag or an entity (&lt;) and make Telegram
+                # refuse the whole message.
+                plain = html.unescape(re.sub(r"<[^>]+>", "", reply[2:]))
                 await notify.send(
                     f"🔑 <b>Key verified via Telegram</b>\n"
-                    f"tg:<code>{from_id}</code> → {reply[2:120]}"
+                    f"tg:<code>{from_id}</code> → {html.escape(plain[:118])}"
                 )
         else:
             reply = (
