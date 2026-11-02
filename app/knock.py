@@ -219,7 +219,7 @@ def knock(session: Session, key: Optional[AgentKey], to_ref: str, agent_id: str,
         raise KnockError("invalid_params", f"agent_id is required (max {AGENT_ID_MAX})", 400)
     if not text.strip() or len(text) > TEXT_MAX:
         raise KnockError("invalid_params", f"text is required (max {TEXT_MAX})", 400)
-    denied = authorship.protected_denied_reason(agent_id, me, quota.PREMIUM_TIERS)
+    denied = authorship.protected_denied_reason(agent_id, me)
     if denied:
         raise KnockError("forbidden", denied, 403)
 

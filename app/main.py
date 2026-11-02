@@ -1347,8 +1347,7 @@ def post_message(
         raise HTTPException(status_code=e.status, detail=e.detail)
     # A handful of names speak for the service itself; borrowing one is the
     # forgery with consequences (audit F2). Every other name stays free.
-    denied = authorship.protected_denied_reason(
-        payload.agent_id, key, quota.PREMIUM_TIERS)
+    denied = authorship.protected_denied_reason(payload.agent_id, key)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
     refusal = quota.burn_leaked_keys(session, payload.text, payload.agent_id)

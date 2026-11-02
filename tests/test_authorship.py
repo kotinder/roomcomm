@@ -98,6 +98,14 @@ def test_protected_name_refuses_anonymous_and_free_keys():
     assert _say(uid, "arena", "nor does a free key", key=_key("nobody")).status_code == 403
 
 
+def test_protected_name_refuses_a_verified_key():
+    # 'verified' is self-service (any Telegram account), so it is not enough to
+    # speak as the service itself — audit 2026-11.
+    uid = _room()
+    k = _key("someone-verified", tier="verified")
+    assert _say(uid, "arena", "your match is void", key=k).status_code == 403
+
+
 def test_protected_name_works_for_a_trusted_key():
     uid = _room()
     k = _key("igra-arena", tier="trusted")

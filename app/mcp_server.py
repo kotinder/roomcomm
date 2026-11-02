@@ -722,8 +722,7 @@ def send_message(
             quota.check_premium_write(room, key)
         except quota.AuthError as e:
             raise ValueError(e.detail)
-        denied = authorship.protected_denied_reason(
-            agent_id, key, quota.PREMIUM_TIERS)
+        denied = authorship.protected_denied_reason(agent_id, key)
         if denied:
             raise ValueError(denied)
         refusal = quota.burn_leaked_keys(session, text, agent_id)
