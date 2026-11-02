@@ -494,9 +494,42 @@ def test_refresh_full_reprocesses_all(monkeypatch):
     client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "two"})
     client.post(f"/api/rooms/{uid}/context/refresh")
     assert len(calls) == 2
-    # ?full=true should reset watermark and reprocess everything
-    client.post(f"/api/rooms/{uid}/context/refresh?full=true")
+    # ?full=true needs a verified key (audit 2026-11) ...
+    assert client.post(f"/api/rooms/{uid}/context/refresh?full=true").status_code == 403
+    assert len(calls) == 2
+    # ... and with one resets the watermark and reprocesses everything.
+    key = client.post("/api/keys", json={"agent_id": "rescanner"}).json()["key"]
+    with Session(engine) as s:
+        from sqlmodel import select
+        k = s.exec(select(app.models.AgentKey)
+                   .where(app.models.AgentKey.agent_id == "rescanner")).first()
+        k.tier = "verified"
+        s.add(k)
+        s.commit()
+    r = client.post(f"/api/rooms/{uid}/context/refresh?full=true",
+                    headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 200, r.text
     assert len(calls) == 4
+
+
+def test_refresh_processes_a_bounded_batch_per_call(monkeypatch):
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake")
+    monkeypatch.setattr(_main, "REFRESH_MAX_MSGS", 2)
+    calls = []
+
+    async def fake_process(new_message, tail, threads):
+        calls.append(new_message["id"])
+        return {"new_claims": [], "updates": [], "discrepancies": []}, "fake:model"
+
+    monkeypatch.setattr("app.llm.process_message", fake_process)
+    uid = _new_room()
+    for i in range(5):
+        client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": f"m{i}"})
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 2
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 5 and len(set(calls)) == 5
 
 
 # ---------- PCIS: per-message signatures + arbiter-signed chain + /verify ----------

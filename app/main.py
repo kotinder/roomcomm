@@ -1655,7 +1655,8 @@ def _open_thread(
 
 # ----- LLM processing -----
 
-async def _process_new_messages_for_room(session: Session, room_uuid: str, *, full: bool = False) -> dict:
+async def _process_new_messages_for_room(session: Session, room_uuid: str, *, full: bool = False,
+                                         max_msgs: Optional[int] = None) -> dict:
     """Incrementally feed new messages to the arbiter, applying its output.
 
     Returns counters {processed_msgs, new_threads, revisions, discrepancies,
@@ -1680,7 +1681,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
         select(Message).where(
             Message.room_uuid == room_uuid,
             Message.id > room.last_extracted_msg_id,
-        ).order_by(Message.id.asc())
+        ).order_by(Message.id.asc()).limit(max_msgs)
     ).all()
     if not new_msgs:
         return {
@@ -2006,21 +2007,39 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
     )
 
 
+# One anonymous call used to buy as many LLM calls as the room had unread
+# messages — up to 1000, and 1000 again on every `?full=true` (audit 2026-11).
+# Now a call processes at most this many; the watermark advances, so calling
+# again continues where the last one stopped.
+REFRESH_MAX_MSGS = int(os.environ.get("ROOMCOMM_REFRESH_MAX_MSGS", "20") or 20)
+
+
 @app.post("/api/rooms/{room_uuid}/context/refresh", response_model=RefreshOut)
 async def refresh_context(
     room_uuid: str,
+    request: Request,
     full: bool = Query(default=False),
     session: Session = Depends(get_session),
 ):
-    """Run the LLM arbiter against new messages (or all, with `?full=true`)."""
+    """Run the LLM arbiter against new messages (or all, with `?full=true`).
+
+    At most REFRESH_MAX_MSGS messages per call. A full rescan throws the
+    arbiter's work away and pays for it again, so it needs a verified key."""
     room_uuid = _validate_uuid(room_uuid)
     _get_room_or_404(session, room_uuid)
     if not llm.is_configured():
         raise HTTPException(status_code=503,
                             detail="LLM arbiter not configured on this server")
+    if full:
+        subject, key = _resolve_subject(request, session)
+        if subject != quota.ADMIN_SUBJECT and (key is None or key.tier not in quota.PREMIUM_TIERS):
+            raise HTTPException(status_code=403,
+                                detail="full=true (rescan from the start) needs a "
+                                       "Telegram-verified key; omit it to process new messages")
     async with _room_refresh_lock(room_uuid):
         try:
-            out = await _process_new_messages_for_room(session, room_uuid, full=full)
+            out = await _process_new_messages_for_room(session, room_uuid, full=full,
+                                                       max_msgs=REFRESH_MAX_MSGS)
         except llm.LLMUnavailable as e:
             raise HTTPException(status_code=502, detail=f"LLM arbiter failed: {e}")
     return RefreshOut(
