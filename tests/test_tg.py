@@ -160,3 +160,13 @@ def test_revoked_key_cannot_verify(_tg_env):
     with Session(engine) as s:
         k = s.exec(select(models.AgentKey).where(models.AgentKey.agent_id == "dead-key")).one()
         assert k.tier == "free" and k.contact is None
+
+
+def test_agent_id_is_escaped_in_html_replies(_tg_env):
+    # agent_id is whatever the key holder typed; the bot speaks HTML mode, so a
+    # raw tag would reach the owner's chat as a live link (audit 2026-11).
+    data = _new_key('<a href="https://evil.example">approve</a>')
+    _hook(_tg_msg(data["verify_code"], tg_id=4242))
+    texts = " ".join(s[2] for s in _tg_env)
+    assert "<a href" not in texts
+    assert "&lt;a href=" in texts
