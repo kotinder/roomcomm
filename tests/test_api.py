@@ -645,3 +645,47 @@ def test_verify_empty_room_clean():
     uid = _new_room()
     v = client.post(f"/api/rooms/{uid}/verify").json()
     assert v["verdict"] == "CLEAN"
+
+
+# ---------- Ledger writes pass the room's write gates (audit 2026-11) ----------
+
+def _key_room():
+    r = client.post("/api/rooms", json={"description": "guarded", "write_policy": "key"})
+    assert r.status_code == 201
+    return r.json()["uuid"], r.json()["write_key"]
+
+
+def test_ledger_writes_respect_write_policy():
+    uid, wk = _key_room()
+    body = {"subject": "Price", "value": "100", "opened_by": "alice"}
+    # A stranger with only the UUID cannot touch the ledger of a guarded room.
+    assert client.post(f"/api/rooms/{uid}/claims", json=body).status_code == 403
+    r = client.post(f"/api/rooms/{uid}/claims", json=body, headers={"X-Room-Key": wk})
+    assert r.status_code == 201, r.text
+    cid = r.json()["id"]
+    rev = {"agent_id": "bob", "value": "100", "kind": "confirm"}
+    assert client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json=rev).status_code == 403
+    assert client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json=rev,
+                       headers={"X-Room-Key": wk}).status_code == 201
+    h = client.get(f"/api/rooms/{uid}/context").json()["context_hash"]
+    hs = {"agent_id": "bob", "context_hash": h}
+    assert client.post(f"/api/rooms/{uid}/handshake", json=hs).status_code == 403
+    assert client.post(f"/api/rooms/{uid}/handshake", json=hs,
+                       headers={"X-Room-Key": wk}).status_code == 201
+
+
+def test_ledger_refuses_the_arbiter_name():
+    uid = _new_room()
+    r = client.post(f"/api/rooms/{uid}/claims",
+                    json={"subject": "s", "value": "v", "opened_by": " Arbiter "})
+    assert r.status_code == 403
+
+
+def test_ledger_rows_are_capped(monkeypatch):
+    monkeypatch.setattr(_main, "MAX_CLAIMS_PER_ROOM", 2)
+    uid = _new_room()
+    body = {"subject": "s", "value": "v", "opened_by": "alice"}
+    assert client.post(f"/api/rooms/{uid}/claims", json=body).status_code == 201
+    assert client.post(f"/api/rooms/{uid}/claims", json=body).status_code == 201
+    r = client.post(f"/api/rooms/{uid}/claims", json=body)
+    assert r.status_code == 429 and "room_ledger_full" in r.json()["detail"]
