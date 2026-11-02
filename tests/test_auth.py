@@ -966,3 +966,19 @@ def test_the_list_and_the_digests_carry_the_notice_too():
                       headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE
     assert client.get("/api/keys/me",
                       headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE
+
+
+def test_admin_keys_page_keeps_agent_id_out_of_inline_js():
+    # Jinja escapes ' to &#39;, but the browser decodes that back before an
+    # on* handler runs, so a name inside onsubmit="confirm('...')" was script
+    # (audit 2026-11). The name now travels in a data- attribute.
+    evil = "x');alert(1);('"
+    assert client.post("/api/keys", json={"agent_id": evil}).status_code == 201
+    r = client.get("/admin", headers={"Authorization": f"Bearer {ADMIN}"})
+    assert r.status_code == 200
+    for line in r.text.splitlines():
+        if "onsubmit=" in line and "x&#39;);alert(1)" in line:
+            assert "data-confirm=" in line and "confirm(this.dataset.confirm)" in line
+            break
+    else:
+        raise AssertionError("revoke form for the test key not found on /admin")

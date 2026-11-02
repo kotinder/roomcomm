@@ -77,7 +77,7 @@
         <td class="key-actions">
           <button type="button" class="btn-secondary key-edit-toggle" aria-expanded="false" aria-controls="key-{{ k.id }}-edit">Edit</button>
           {% if not k.revoked %}
-          <form method="post" action="{{ base }}/keys/{{ k.id }}/revoke" onsubmit="return confirm('Revoke key {{ k.prefix }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only.');">
+          <form method="post" action="{{ base }}/keys/{{ k.id }}/revoke" data-confirm="Revoke key {{ k.prefix }} ({{ k.agent_id }})? It stops working immediately and its open rooms become read-only." onsubmit="return confirm(this.dataset.confirm);">
             <button type="submit" class="btn-danger">Revoke</button>
           </form>
           {% endif %}
