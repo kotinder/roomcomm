@@ -562,7 +562,9 @@ def test_room_card_probe_is_metered():
 def test_room_card_is_not_publicly_cached():
     uid = _new_room()["uuid"]
     r = client.get(f"/{uid}/.well-known/agent-card.json")
-    assert r.headers["cache-control"].startswith("private") and r.headers["vary"] == "Host"
+    assert r.headers["cache-control"].startswith("private")
+    # Newer Starlette's CORS middleware appends Origin; what matters is Host.
+    assert "Host" in [v.strip() for v in r.headers["vary"].split(",")]
 
 
 def test_create_write_key_room_over_a2a():

@@ -83,12 +83,17 @@ def refs_for(session, messages) -> dict[int, str]:
     return out
 
 
-def protected_denied_reason(agent_id: str, key: Optional[AgentKey],
-                            premium_tiers) -> Optional[str]:
+# Tiers that may speak under a protected name. Only the manual, admin-set
+# 'trusted' tier: 'verified' is self-service (any Telegram account), so letting
+# it through meant anyone could post a fake ruling as `arena` (audit 2026-11).
+PROTECTED_NAME_TIERS = frozenset({"trusted"})
+
+
+def protected_denied_reason(agent_id: str, key: Optional[AgentKey]) -> Optional[str]:
     """None if this name may be used, else a caller-facing refusal."""
     if agent_id.strip().casefold() not in PROTECTED_AGENT_IDS:
         return None
-    if key is not None and key.tier in premium_tiers:
+    if key is not None and key.tier in PROTECTED_NAME_TIERS:
         return None
     return (
         f"the name {agent_id.strip()!r} is reserved: it speaks for the service "

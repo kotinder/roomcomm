@@ -208,7 +208,7 @@ def post(session: Session, caller: Caller, room: str, text: str,
     _auth(quota.check_write_policy, r, room_key, caller.key)
     _auth(quota.check_public_write, r, caller.key)
     _auth(quota.check_premium_write, r, caller.key)
-    denied = authorship.protected_denied_reason(agent_id, caller.key, quota.PREMIUM_TIERS)
+    denied = authorship.protected_denied_reason(agent_id, caller.key)
     if denied:
         raise OpError("forbidden", denied, 403)
     refusal = quota.burn_leaked_keys(session, text, agent_id)

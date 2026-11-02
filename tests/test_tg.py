@@ -160,3 +160,26 @@ def test_revoked_key_cannot_verify(_tg_env):
     with Session(engine) as s:
         k = s.exec(select(models.AgentKey).where(models.AgentKey.agent_id == "dead-key")).one()
         assert k.tier == "free" and k.contact is None
+
+
+def test_agent_id_is_escaped_in_html_replies(_tg_env):
+    # agent_id is whatever the key holder typed; the bot speaks HTML mode, so a
+    # raw tag would reach the owner's chat as a live link (audit 2026-11).
+    data = _new_key('<a href="https://evil.example">approve</a>')
+    _hook(_tg_msg(data["verify_code"], tg_id=4242))
+    texts = " ".join(s[2] for s in _tg_env)
+    assert "<a href" not in texts
+    assert "&lt;a href=" in texts
+
+
+def test_owner_heads_up_is_never_cut_inside_markup(_tg_env):
+    # The owner line is a 118-char excerpt of the reply; with an escaped name
+    # (every '<' is 4 chars) a raw slice used to end inside "&lt;" or "</b>".
+    import re
+    data = _new_key("<" * 100)
+    _hook(_tg_msg(data["verify_code"], tg_id=4343))
+    owner = next(s[2] for s in _tg_env if s[0] == "owner")
+    body = owner.split("→", 1)[1]
+    assert "<" not in body and ">" not in body          # no tags at all
+    assert not re.search(r"&[a-z]*$", body)             # no entity cut in half
+    assert re.fullmatch(r"(?:[^&]|&(?:lt|gt|amp|quot|#x27);)*", body)

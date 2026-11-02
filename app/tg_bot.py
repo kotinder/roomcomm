@@ -18,6 +18,7 @@ Binding rules:
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 
@@ -25,6 +26,15 @@ from sqlmodel import Session, select
 
 from . import notify, quota
 from .models import AgentKey, UsageCounter, utcnow
+
+
+def _name(key: AgentKey, fallback: str = "#") -> str:
+    """A key's agent_id for an HTML-mode Telegram message. The name is
+    whatever its holder typed at POST /api/keys, so it is escaped: a raw
+    <a href> or a stray '<' would land in the owner's chat as markup, or make
+    Telegram refuse the whole message (audit 2026-11)."""
+    return html.escape(key.agent_id) if key.agent_id else f"{fallback}{key.id}"
+
 
 log = logging.getLogger("roomcomm.tg")
 
@@ -51,7 +61,7 @@ def _knocks_cmd(session: Session, tg_id: int, arg: str) -> str:
         return "No verified key is bound to this Telegram account. Send /start for how-to."
     if arg not in ("on", "off"):
         states = ", ".join(
-            f"<b>{k.agent_id or '#' + str(k.id)}</b>: {'on' if knock.alerts_enabled(session, k) else 'off'}"
+            f"<b>{_name(k)}</b>: {'on' if knock.alerts_enabled(session, k) else 'off'}"
             for k in keys)
         return f"Knock alerts — {states}.\n/knocks on · /knocks off"
     for k in keys:
@@ -78,7 +88,7 @@ def _fmt_status(session: Session, key: AgentKey) -> str:
         used[row.kind] = row.count
     state = "⛔ revoked" if key.revoked else key.tier
     return (
-        f"<b>{key.agent_id or 'key #' + str(key.id)}</b> — {state}\n"
+        f"<b>{_name(key, 'key #')}</b> — {state}\n"
         f"messages today: {used['msg']}/{quota.daily_quota(key, 'msg')}\n"
         f"rooms today: {used['room']}/{quota.daily_quota(key, 'room')}"
     )
@@ -108,14 +118,14 @@ def _bind(session: Session, code: str, tg_id: int) -> str:
     log.info("tg verify: key #%s -> verified (tg:%s)", key.id, tg_id)
     extra = (
         f"\n\n(Your previously verified key "
-        f"<b>{demoted.agent_id or '#' + str(demoted.id)}</b> went back to "
+        f"<b>{_name(demoted)}</b> went back to "
         f"<b>free</b> — one Telegram account backs one verified key.)"
         if demoted else ""
     )
     q_msg = quota.daily_quota(key, "msg")
     q_room = quota.daily_quota(key, "room")
     return (
-        f"✅ Key <b>{key.agent_id or '#' + str(key.id)}</b> is now "
+        f"✅ Key <b>{_name(key)}</b> is now "
         f"<b>verified</b>: {q_msg} messages / {q_room} rooms per day.{extra}"
     )
 
@@ -152,9 +162,13 @@ async def handle_update(update: dict, session: Session) -> None:
             reply = _bind(session, code, from_id)
             if reply.startswith("✅"):
                 # Owner heads-up on the notification channel.
+                # Cut the plain text, then escape: slicing the HTML reply
+                # could split a tag or an entity (&lt;) and make Telegram
+                # refuse the whole message.
+                plain = html.unescape(re.sub(r"<[^>]+>", "", reply[2:]))
                 await notify.send(
                     f"🔑 <b>Key verified via Telegram</b>\n"
-                    f"tg:<code>{from_id}</code> → {reply[2:120]}"
+                    f"tg:<code>{from_id}</code> → {html.escape(plain[:118])}"
                 )
         else:
             reply = (

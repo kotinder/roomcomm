@@ -1347,8 +1347,7 @@ def post_message(
         raise HTTPException(status_code=e.status, detail=e.detail)
     # A handful of names speak for the service itself; borrowing one is the
     # forgery with consequences (audit F2). Every other name stays free.
-    denied = authorship.protected_denied_reason(
-        payload.agent_id, key, quota.PREMIUM_TIERS)
+    denied = authorship.protected_denied_reason(payload.agent_id, key)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
     refusal = quota.burn_leaked_keys(session, payload.text, payload.agent_id)
@@ -1656,7 +1655,8 @@ def _open_thread(
 
 # ----- LLM processing -----
 
-async def _process_new_messages_for_room(session: Session, room_uuid: str, *, full: bool = False) -> dict:
+async def _process_new_messages_for_room(session: Session, room_uuid: str, *, full: bool = False,
+                                         max_msgs: Optional[int] = None) -> dict:
     """Incrementally feed new messages to the arbiter, applying its output.
 
     Returns counters {processed_msgs, new_threads, revisions, discrepancies,
@@ -1681,7 +1681,7 @@ async def _process_new_messages_for_room(session: Session, room_uuid: str, *, fu
         select(Message).where(
             Message.room_uuid == room_uuid,
             Message.id > room.last_extracted_msg_id,
-        ).order_by(Message.id.asc())
+        ).order_by(Message.id.asc()).limit(max_msgs)
     ).all()
     if not new_msgs:
         return {
@@ -1819,15 +1819,52 @@ async def _refresh_room_context_bg(room_uuid: str) -> None:
 
 # ----- Manual claim/revision endpoints -----
 
+# The ledger is part of the room: a write here is a write into the room, so it
+# passes the same gates as a message (audit 2026-11). Before this, claims,
+# revisions and handshakes went into write-protected, pair and sealed rooms
+# alike, from anyone holding the UUID, and without any cap on the rows.
+MAX_CLAIMS_PER_ROOM = 200
+MAX_REVISIONS_PER_CLAIM = 200
+MAX_HANDSHAKES_PER_ROOM = 200
+# The arbiter's own name: threads it opens are the ones agents are told to
+# trust as transcriptions. Nobody may type it into the manual endpoints.
+_ARBITER_NAME = "arbiter"
+
+
+def _check_ledger_write(request: Request, session: Session, room: Room, actor: str) -> None:
+    """403 unless this caller may write into the room's ledger as `actor`."""
+    _, key = _resolve_subject(request, session)
+    try:
+        quota.check_write_policy(room, request.headers.get("x-room-key"), key)
+        quota.check_public_write(room, key)
+        quota.check_premium_write(room, key)
+    except quota.AuthError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+    if actor.strip().casefold() == _ARBITER_NAME:
+        raise HTTPException(status_code=403,
+                            detail="the name 'arbiter' is reserved for the LLM arbiter")
+    denied = authorship.protected_denied_reason(actor, key)
+    if denied:
+        raise HTTPException(status_code=403, detail=denied)
+
+
+def _ledger_full(session: Session, model, *where) -> int:
+    return session.exec(select(func.count()).select_from(model).where(*where)).one()
+
 @app.post("/api/rooms/{room_uuid}/claims", response_model=ThreadOut, status_code=201)
 def open_claim(
     room_uuid: str,
     payload: ClaimIn,
+    request: Request,
     session: Session = Depends(get_session),
 ):
     """Manually open a new thread with an initial propose-revision."""
     room_uuid = _validate_uuid(room_uuid)
-    _get_room_or_404(session, room_uuid)
+    room = _get_room_or_404(session, room_uuid)
+    _check_ledger_write(request, session, room, payload.opened_by)
+    if _ledger_full(session, Claim, Claim.room_uuid == room_uuid) >= MAX_CLAIMS_PER_ROOM:
+        raise HTTPException(status_code=429,
+                            detail=f"room_ledger_full: at most {MAX_CLAIMS_PER_ROOM} threads per room")
     if payload.source_msg_id is not None:
         msg = session.get(Message, payload.source_msg_id)
         if msg is None or msg.room_uuid != room_uuid:
@@ -1883,14 +1920,20 @@ def append_revision(
     room_uuid: str,
     claim_id: str,
     payload: RevisionIn,
+    request: Request,
     session: Session = Depends(get_session),
 ):
     """Manually append a revision (update / confirm / contradict / retract)."""
     room_uuid = _validate_uuid(room_uuid)
-    _get_room_or_404(session, room_uuid)
+    room = _get_room_or_404(session, room_uuid)
     claim = session.get(Claim, claim_id)
     if claim is None or claim.room_uuid != room_uuid:
         raise HTTPException(status_code=404, detail="thread not found in this room")
+    _check_ledger_write(request, session, room, payload.agent_id)
+    if _ledger_full(session, ClaimRevision,
+                    ClaimRevision.claim_id == claim_id) >= MAX_REVISIONS_PER_CLAIM:
+        raise HTTPException(status_code=429,
+                            detail=f"room_ledger_full: at most {MAX_REVISIONS_PER_CLAIM} revisions per thread")
 
     agent_id = payload.agent_id.strip()
     kind = payload.kind
@@ -1964,21 +2007,39 @@ def get_context(room_uuid: str, session: Session = Depends(get_session)):
     )
 
 
+# One anonymous call used to buy as many LLM calls as the room had unread
+# messages — up to 1000, and 1000 again on every `?full=true` (audit 2026-11).
+# Now a call processes at most this many; the watermark advances, so calling
+# again continues where the last one stopped.
+REFRESH_MAX_MSGS = int(os.environ.get("ROOMCOMM_REFRESH_MAX_MSGS", "20") or 20)
+
+
 @app.post("/api/rooms/{room_uuid}/context/refresh", response_model=RefreshOut)
 async def refresh_context(
     room_uuid: str,
+    request: Request,
     full: bool = Query(default=False),
     session: Session = Depends(get_session),
 ):
-    """Run the LLM arbiter against new messages (or all, with `?full=true`)."""
+    """Run the LLM arbiter against new messages (or all, with `?full=true`).
+
+    At most REFRESH_MAX_MSGS messages per call. A full rescan throws the
+    arbiter's work away and pays for it again, so it needs a verified key."""
     room_uuid = _validate_uuid(room_uuid)
     _get_room_or_404(session, room_uuid)
     if not llm.is_configured():
         raise HTTPException(status_code=503,
                             detail="LLM arbiter not configured on this server")
+    if full:
+        subject, key = _resolve_subject(request, session)
+        if subject != quota.ADMIN_SUBJECT and (key is None or key.tier not in quota.PREMIUM_TIERS):
+            raise HTTPException(status_code=403,
+                                detail="full=true (rescan from the start) needs a "
+                                       "Telegram-verified key; omit it to process new messages")
     async with _room_refresh_lock(room_uuid):
         try:
-            out = await _process_new_messages_for_room(session, room_uuid, full=full)
+            out = await _process_new_messages_for_room(session, room_uuid, full=full,
+                                                       max_msgs=REFRESH_MAX_MSGS)
         except llm.LLMUnavailable as e:
             raise HTTPException(status_code=502, detail=f"LLM arbiter failed: {e}")
     return RefreshOut(
@@ -1993,6 +2054,7 @@ async def refresh_context(
 def handshake(
     room_uuid: str,
     payload: HandshakeIn,
+    request: Request,
     session: Session = Depends(get_session),
 ):
     """Record one agent's final signature over the canonical threads hash.
@@ -2002,7 +2064,12 @@ def handshake(
     does NOT broker trust.
     """
     room_uuid = _validate_uuid(room_uuid)
-    _get_room_or_404(session, room_uuid)
+    room = _get_room_or_404(session, room_uuid)
+    _check_ledger_write(request, session, room, payload.agent_id)
+    if _ledger_full(session, Handshake,
+                    Handshake.room_uuid == room_uuid) >= MAX_HANDSHAKES_PER_ROOM:
+        raise HTTPException(status_code=429,
+                            detail=f"room_ledger_full: at most {MAX_HANDSHAKES_PER_ROOM} handshakes per room")
     threads = _gather_threads(session, room_uuid)
     current_hash = _canonical_threads_hash(threads)
     if payload.context_hash != current_hash:

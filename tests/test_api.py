@@ -494,9 +494,42 @@ def test_refresh_full_reprocesses_all(monkeypatch):
     client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": "two"})
     client.post(f"/api/rooms/{uid}/context/refresh")
     assert len(calls) == 2
-    # ?full=true should reset watermark and reprocess everything
-    client.post(f"/api/rooms/{uid}/context/refresh?full=true")
+    # ?full=true needs a verified key (audit 2026-11) ...
+    assert client.post(f"/api/rooms/{uid}/context/refresh?full=true").status_code == 403
+    assert len(calls) == 2
+    # ... and with one resets the watermark and reprocesses everything.
+    key = client.post("/api/keys", json={"agent_id": "rescanner"}).json()["key"]
+    with Session(engine) as s:
+        from sqlmodel import select
+        k = s.exec(select(app.models.AgentKey)
+                   .where(app.models.AgentKey.agent_id == "rescanner")).first()
+        k.tier = "verified"
+        s.add(k)
+        s.commit()
+    r = client.post(f"/api/rooms/{uid}/context/refresh?full=true",
+                    headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 200, r.text
     assert len(calls) == 4
+
+
+def test_refresh_processes_a_bounded_batch_per_call(monkeypatch):
+    monkeypatch.setattr("app.llm.NVIDIA_API_KEY", "fake")
+    monkeypatch.setattr(_main, "REFRESH_MAX_MSGS", 2)
+    calls = []
+
+    async def fake_process(new_message, tail, threads):
+        calls.append(new_message["id"])
+        return {"new_claims": [], "updates": [], "discrepancies": []}, "fake:model"
+
+    monkeypatch.setattr("app.llm.process_message", fake_process)
+    uid = _new_room()
+    for i in range(5):
+        client.post(f"/api/rooms/{uid}/messages", json={"agent_id": "a", "text": f"m{i}"})
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 2
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    client.post(f"/api/rooms/{uid}/context/refresh")
+    assert len(calls) == 5 and len(set(calls)) == 5
 
 
 # ---------- PCIS: per-message signatures + arbiter-signed chain + /verify ----------
@@ -645,3 +678,47 @@ def test_verify_empty_room_clean():
     uid = _new_room()
     v = client.post(f"/api/rooms/{uid}/verify").json()
     assert v["verdict"] == "CLEAN"
+
+
+# ---------- Ledger writes pass the room's write gates (audit 2026-11) ----------
+
+def _key_room():
+    r = client.post("/api/rooms", json={"description": "guarded", "write_policy": "key"})
+    assert r.status_code == 201
+    return r.json()["uuid"], r.json()["write_key"]
+
+
+def test_ledger_writes_respect_write_policy():
+    uid, wk = _key_room()
+    body = {"subject": "Price", "value": "100", "opened_by": "alice"}
+    # A stranger with only the UUID cannot touch the ledger of a guarded room.
+    assert client.post(f"/api/rooms/{uid}/claims", json=body).status_code == 403
+    r = client.post(f"/api/rooms/{uid}/claims", json=body, headers={"X-Room-Key": wk})
+    assert r.status_code == 201, r.text
+    cid = r.json()["id"]
+    rev = {"agent_id": "bob", "value": "100", "kind": "confirm"}
+    assert client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json=rev).status_code == 403
+    assert client.post(f"/api/rooms/{uid}/claims/{cid}/revisions", json=rev,
+                       headers={"X-Room-Key": wk}).status_code == 201
+    h = client.get(f"/api/rooms/{uid}/context").json()["context_hash"]
+    hs = {"agent_id": "bob", "context_hash": h}
+    assert client.post(f"/api/rooms/{uid}/handshake", json=hs).status_code == 403
+    assert client.post(f"/api/rooms/{uid}/handshake", json=hs,
+                       headers={"X-Room-Key": wk}).status_code == 201
+
+
+def test_ledger_refuses_the_arbiter_name():
+    uid = _new_room()
+    r = client.post(f"/api/rooms/{uid}/claims",
+                    json={"subject": "s", "value": "v", "opened_by": " Arbiter "})
+    assert r.status_code == 403
+
+
+def test_ledger_rows_are_capped(monkeypatch):
+    monkeypatch.setattr(_main, "MAX_CLAIMS_PER_ROOM", 2)
+    uid = _new_room()
+    body = {"subject": "s", "value": "v", "opened_by": "alice"}
+    assert client.post(f"/api/rooms/{uid}/claims", json=body).status_code == 201
+    assert client.post(f"/api/rooms/{uid}/claims", json=body).status_code == 201
+    r = client.post(f"/api/rooms/{uid}/claims", json=body)
+    assert r.status_code == 429 and "room_ledger_full" in r.json()["detail"]

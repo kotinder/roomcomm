@@ -219,9 +219,16 @@ def knock(session: Session, key: Optional[AgentKey], to_ref: str, agent_id: str,
         raise KnockError("invalid_params", f"agent_id is required (max {AGENT_ID_MAX})", 400)
     if not text.strip() or len(text) > TEXT_MAX:
         raise KnockError("invalid_params", f"text is required (max {TEXT_MAX})", 400)
-    denied = authorship.protected_denied_reason(agent_id, me, quota.PREMIUM_TIERS)
+    denied = authorship.protected_denied_reason(agent_id, me)
     if denied:
         raise KnockError("forbidden", denied, 403)
+    # The knock text becomes the pair room's first message: same leaked-key
+    # burn as any other post (audit 2026-11). Commit the revocations here —
+    # the transports roll back on KnockError.
+    refusal = quota.burn_leaked_keys(session, text, agent_id)
+    if refusal:
+        session.commit()
+        raise KnockError("key_leaked", refusal, 422)
 
     target = resolve_acquaintance(session, me, to_ref)
     if is_forgotten(session, target.id, me.id):
