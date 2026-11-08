@@ -113,26 +113,48 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _burst_subject(request: Request,
+                   key: Optional["AgentKey"] = None) -> tuple[str, str]:
+    """(bucket, whose) for a burst limit: a Telegram-verified key is counted
+    on its own, everyone else on the caller's address.
+
+    Five agents on one address, each with its own key, shared one
+    address-sized bucket and 429'd each other out (report 02.11.2026). The
+    daily quotas have always billed a key for itself (quota.subject_of); these
+    burst limiters had not. Free keys stay on the address on purpose: they are
+    free and instant to mint (KEY_CREATE_LIMIT, 3/hour per IP), so a per-key
+    burst budget would be no budget at all — Telegram verification is what
+    makes a key a subject of its own.
+    """
+    if key is not None and key.tier in quota.PREMIUM_TIERS:
+        return f"key:{key.id}", "key"
+    return _client_ip(request), "IP"
+
+
 def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
-                       limit: int, window: int, what: str) -> None:
-    """Raise 429 if the IP exceeded `limit` events in the sliding `window`.
-    Counted in Redis across all workers; the in-process bucket is the
-    fallback while Redis is unavailable (see app/shared.py)."""
+                       limit: int, window: int, what: str,
+                       key: Optional["AgentKey"] = None) -> None:
+    """Raise 429 if the subject exceeded `limit` events in the sliding
+    `window`. The subject is a verified key where one is presented, else the
+    caller's address — see _burst_subject. Counted in Redis across all
+    workers; the in-process bucket is the fallback while Redis is unavailable
+    (see app/shared.py)."""
     ip = _client_ip(request)
     if quota.ip_exempt(ip):
         return
-    retry = shared.rate_hit(what.replace(" ", "_"), ip, limit, window)
+    subject, whose = _burst_subject(request, key)
+    retry = shared.rate_hit(what.replace(" ", "_"), subject, limit, window)
     if retry is not None:
         if retry > 0:
             raise HTTPException(
                 status_code=429,
-                detail=f"Too many {what} from this IP. Try again in {retry}s.",
+                detail=f"Too many {what} from this {whose}. Try again in {retry}s.",
                 headers={"Retry-After": str(retry)},
             )
         return
     now = time.monotonic()
     with lock:
-        bucket = buckets[ip]
+        bucket = buckets[subject]
         cutoff = now - window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
@@ -140,15 +162,15 @@ def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
             retry_after = int(window - (now - bucket[0])) + 1
             raise HTTPException(
                 status_code=429,
-                detail=f"Too many {what} from this IP. Try again in {retry_after}s.",
+                detail=f"Too many {what} from this {whose}. Try again in {retry_after}s.",
                 headers={"Retry-After": str(retry_after)},
             )
         bucket.append(now)
 
 
-def _check_create_rate(request: Request) -> None:
+def _check_create_rate(request: Request, key: Optional["AgentKey"] = None) -> None:
     _check_bucket_rate(request, _create_buckets, _create_lock,
-                       ROOM_CREATE_LIMIT, ROOM_CREATE_WINDOW, "rooms created")
+                       ROOM_CREATE_LIMIT, ROOM_CREATE_WINDOW, "rooms created", key)
 
 
 def _check_skill_rate(request: Request) -> None:
@@ -156,14 +178,14 @@ def _check_skill_rate(request: Request) -> None:
                        SKILL_UPLOAD_LIMIT, SKILL_UPLOAD_WINDOW, "skill uploads")
 
 
-def _check_file_rate(request: Request) -> None:
+def _check_file_rate(request: Request, key: Optional["AgentKey"] = None) -> None:
     _check_bucket_rate(request, _file_buckets, _file_lock,
-                       FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads")
+                       FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads", key)
 
 
-def _check_msg_rate(request: Request) -> None:
+def _check_msg_rate(request: Request, key: Optional["AgentKey"] = None) -> None:
     _check_bucket_rate(request, _msg_buckets, _msg_lock,
-                       MSG_POST_LIMIT, MSG_POST_WINDOW, "messages posted")
+                       MSG_POST_LIMIT, MSG_POST_WINDOW, "messages posted", key)
 
 
 def _check_key_rate(request: Request) -> None:
@@ -981,8 +1003,8 @@ def create_knock(payload: KnockIn, request: Request, background_tasks: Backgroun
     """Knock on an acquaintance: a key that posted, with its key, into a room
     you also posted into. Creates a private two-party room with your text as
     its first message and puts it into their inbox. Verified keys only."""
-    _check_create_rate(request)
     key = _knock_key(request, session)
+    _check_create_rate(request, key)
     try:
         out = knock.knock(session, key, payload.to_ref, payload.agent_id,
                           payload.text, payload.ttl_hours)
@@ -1064,8 +1086,10 @@ def create_room(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
-    _check_create_rate(request)
+    # Subject first: the burst limiter bills a verified key for itself, so it
+    # has to know who is calling (_burst_subject).
     subject, key = _resolve_subject(request, session)
+    _check_create_rate(request, key)
     # "Keyed create" wall: anonymous callers may read and post into open rooms,
     # but creating a room requires a (revocable) key. Enforced independently of
     # QUOTA_MODE; killswitch quota.KEYED_CREATE=off.
@@ -2663,7 +2687,7 @@ async def upload_room_file(
         quota.check_write_policy(room, request.headers.get("x-room-key"), key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
-    _check_file_rate(request)
+    _check_file_rate(request, key)
 
     data = await file.read(files.MAX_BYTES + 1)
     try:

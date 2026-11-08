@@ -362,7 +362,7 @@ def _caller(request: Request, session: Session) -> ops.Caller:
 
     def rate_check(kind: str) -> None:
         try:
-            checks[kind](request)
+            checks[kind](request, key)
         except HTTPException as e:
             retry = (e.headers or {}).get("Retry-After", "3600")
             raise ops.OpError("quota_exceeded", str(e.detail), 429, int(retry))

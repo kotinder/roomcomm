@@ -966,3 +966,69 @@ def test_the_list_and_the_digests_carry_the_notice_too():
                       headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE
     assert client.get("/api/keys/me",
                       headers=_bearer(key)).json()["notice"] == UNTRUSTED_NOTICE
+
+
+# ---------- burst limits: a verified key is its own subject ----------
+
+def _verify_last_key():
+    """Elevate the most recently issued key to 'verified' — what the Telegram
+    bot does."""
+    import sqlmodel
+    with Session(engine) as s:
+        kid = s.exec(sqlmodel.select(app.models.AgentKey)).all()[-1].id
+    assert client.post(f"/admin/keys/{kid}/tier", data={"tier": "verified"},
+                       headers={"Authorization": f"Bearer {ADMIN}"},
+                       follow_redirects=False).status_code == 303
+
+
+def test_verified_keys_get_their_own_burst_budget():
+    """Several agents on ONE address, each with its own verified key, must not
+    429 each other out — the whole point of the report of 02.11.2026. The
+    daily quotas have always been per key; the burst limiter counted the
+    address and that is what ran out."""
+    old = _main.ROOM_CREATE_LIMIT
+    _main.ROOM_CREATE_LIMIT = 2
+    _main._create_buckets.clear()
+    try:
+        a = _new_key("agent-a")["key"]
+        _verify_last_key()
+        b = _new_key("agent-b")["key"]
+        _verify_last_key()
+
+        for i in range(2):
+            assert client.post("/api/rooms", json={"description": f"a{i}"},
+                               headers=_bearer(a)).status_code == 201
+        spent = client.post("/api/rooms", json={"description": "a-over"},
+                            headers=_bearer(a))
+        assert spent.status_code == 429
+        assert "from this key" in spent.json()["detail"]
+
+        # Same address, a different verified key: untouched.
+        assert client.post("/api/rooms", json={"description": "b0"},
+                           headers=_bearer(b)).status_code == 201
+    finally:
+        _main.ROOM_CREATE_LIMIT = old
+        _main._create_buckets.clear()
+
+
+def test_free_keys_and_anonymous_still_share_the_address_budget():
+    """A free key is instant and free to mint, so per-key bursts would be no
+    limit at all: free and anonymous callers stay billed to the address."""
+    old = _main.ROOM_CREATE_LIMIT
+    _main.ROOM_CREATE_LIMIT = 2
+    _main._create_buckets.clear()
+    try:
+        free = _new_key("agent-free")["key"]
+        for i in range(2):
+            assert client.post("/api/rooms", json={"description": f"f{i}"},
+                               headers=_bearer(free)).status_code == 201
+        over = client.post("/api/rooms", json={"description": "f-over"},
+                           headers=_bearer(free))
+        assert over.status_code == 429
+        assert "from this IP" in over.json()["detail"]
+        # Anonymous shares that same address bucket, already spent.
+        assert client.post("/api/rooms",
+                           json={"description": "anon"}).status_code == 429
+    finally:
+        _main.ROOM_CREATE_LIMIT = old
+        _main._create_buckets.clear()
