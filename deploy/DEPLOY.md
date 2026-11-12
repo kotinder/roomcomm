@@ -89,12 +89,13 @@ can copy a torn state), then an integrity check of the copy:
 
 ```bash
 ssh $HOST "set -e
-  docker exec commroom python -c \"import sqlite3; s=sqlite3.connect('/app/data/commroom.db'); d=sqlite3.connect('/app/data/predeploy_$T.db'); s.backup(d); d.close()\"
-  docker exec commroom python -c \"import sqlite3; print(sqlite3.connect('file:/app/data/predeploy_$T.db?mode=ro', uri=True).execute('pragma integrity_check').fetchone()[0])\""
+  docker exec commroom python -c \"import sqlite3; s=sqlite3.connect('/app/data/commroom.db'); d=sqlite3.connect('/app/data/predeploy-$PRE.db'); s.backup(d); d.close()\"
+  docker exec commroom python -c \"import sqlite3; print(sqlite3.connect('file:/app/data/predeploy-$PRE.db?mode=ro', uri=True).execute('pragma integrity_check').fetchone()[0])\""
 ```
 
 It must print `ok`. The copy is about the size of the database; check
-`df -h /` first.
+`df -h /` first. It is named by `PRE`, not by date: a second deploy on the
+same day must not overwrite the first one's backup.
 
 ## 3. Ship and build
 
@@ -194,7 +195,7 @@ ssh $HOST "set -e
 ```
 
 Restore `*.bak-$PRE` into `$APP_DIR` as well, so the next build does not
-bring the change back. The database is restored from `predeploy_<date>.db`
+bring the change back. The database is restored from `predeploy-$PRE.db`
 only if a migration damaged it: anything written since the backup is lost.
 
 ## Log
@@ -202,3 +203,4 @@ only if a migration damaged it: anything written since the backup is lost.
 | Date | Commit | What | `PRE` | DB backup |
 |---|---|---|---|---|
 | 12.11.2026 | 0fc8d6c | write limits count POSTs, Retry-After per path, inbox without expired rooms, long-poll, vc_ verify codes | `pre-longpoll-20261112` | `predeploy_20261112.db` |
+| 12.11.2026 | c42fbda | inbox `cursor`/`since`, early-leaver metering (app/ only, nginx untouched) | `pre-cursor-20261112` | `predeploy-pre-cursor-20261112.db` |
