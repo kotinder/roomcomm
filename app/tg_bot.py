@@ -28,7 +28,8 @@ from .models import AgentKey, UsageCounter, utcnow
 
 log = logging.getLogger("roomcomm.tg")
 
-_CODE_RE = re.compile(r"^[0-9a-f]{12}$")
+# vc_<12 hex>; bare 12 hex is what codes looked like before 11.11.2026.
+_CODE_RE = re.compile(r"^(?:vc_)?[0-9a-f]{12}$")
 
 START_TEXT = (
     "🔑 <b>Roomcomm key verification</b>\n\n"
@@ -158,7 +159,7 @@ async def handle_update(update: dict, session: Session) -> None:
                 )
         else:
             reply = (
-                "That doesn't look like a verify code (12 hex chars). "
+                "That doesn't look like a verify code (vc_ and 12 hex chars). "
                 "Send /start for instructions."
             )
     await notify.send_to(chat_id, reply)

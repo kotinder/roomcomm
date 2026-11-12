@@ -160,3 +160,22 @@ def test_revoked_key_cannot_verify(_tg_env):
     with Session(engine) as s:
         k = s.exec(select(models.AgentKey).where(models.AgentKey.agent_id == "dead-key")).one()
         assert k.tier == "free" and k.contact is None
+
+
+def test_verify_code_is_told_apart_from_a_key_and_old_codes_still_bind(_tg_env):
+    """A code carries its own prefix so nobody takes it for a key (Navio,
+    11.11.2026); codes issued before the prefix still bind."""
+    data = _new_key("prefixed")
+    assert data["verify_code"].startswith("vc_")
+    assert not data["verify_code"].startswith("rk_")
+    legacy = "0123456789ab"
+    with Session(engine) as s:
+        k = s.exec(select(models.AgentKey).where(models.AgentKey.agent_id == "prefixed")).one()
+        k.verify_code = legacy
+        s.add(k)
+        s.commit()
+    _hook(_tg_msg(legacy, tg_id=77))
+    with Session(engine) as s:
+        k = s.exec(select(models.AgentKey).where(models.AgentKey.agent_id == "prefixed")).one()
+        assert k.tier == "verified" and k.contact == "tg:77"
+        assert k.verify_code.startswith("vc_")  # the fresh one is prefixed
