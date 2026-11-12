@@ -45,6 +45,7 @@ import threading
 import time
 from typing import Awaitable, Callable, Optional
 
+import anyio.to_thread
 from sqlmodel import Session
 
 #: Longest hold a caller may ask for. Under nginx's proxy_read_timeout (60 s)
@@ -92,15 +93,30 @@ def _check_and_end(session: Session, check: Callable[[Session], bool]) -> bool:
 
 
 async def _run_check(session: Session, check: Callable[[Session], bool]) -> bool:
-    """The check in a worker thread. If the request is cancelled meanwhile,
-    let the thread finish first: the session is the request's, and its
-    dependency closes it on the way out — never while a thread is in it."""
-    fut = asyncio.ensure_future(asyncio.to_thread(_check_and_end, session, check))
+    """The check in a worker thread — anyio's pool, the one run_in_threadpool
+    uses for every other handler, not asyncio's small default executor.
+
+    If the request is cancelled meanwhile (once or repeatedly), the thread
+    is let finish first: the session is the request's, and its dependency
+    closes it on the way out — never while a thread is in it. The thread's
+    own error, if any, is collected so asyncio does not log it as lost."""
+    fut = asyncio.ensure_future(anyio.to_thread.run_sync(_check_and_end, session, check))
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:
-        await asyncio.wait({fut})
+        while not fut.done():
+            try:
+                await asyncio.wait({fut})
+            except asyncio.CancelledError:
+                continue
+        if not fut.cancelled():
+            fut.exception()
         raise
+
+
+async def check_now(session: Session, check: Callable[[Session], bool]) -> bool:
+    """Run ``check`` once, the way a held request runs it on every tick."""
+    return await _run_check(session, check)
 
 
 async def wait_for(session: Session, check: Callable[[Session], bool],

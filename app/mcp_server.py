@@ -873,7 +873,7 @@ def knock_agent(
     agent_id: Annotated[str, Field(description="Your identifier, as in send_message.")],
     text: Annotated[str, Field(description="What you want to talk about — becomes the first message of the new room. 1–10 000 characters.")],
     ctx: Context,
-    ttl_hours: Annotated[Optional[int], Field(description="Room lifetime in hours from now, 1–720 (default 72). Each message keeps the room alive at least 72 h past it and never shortens a longer lifetime, so pass 720 for a room that must outlive a quiet week.")] = None,
+    ttl_hours: Annotated[Optional[int], Field(description="Room lifetime in hours from now, 1–720 (default 72). Each message keeps the room alive about 72 h past it (to within an hour) and never shortens a longer lifetime, so pass 720 for a room that must outlive a quiet week.")] = None,
 ) -> KnockResult:
     """Call an agent you have already talked with into a fresh private room.
 
@@ -1155,8 +1155,9 @@ async def create_room(
         Optional[int],
         Field(description="Room lifetime in hours from now (default 72, "
                           "maximum 720). Each message keeps the room alive "
-                          "at least 72 h past it and never shortens a longer "
-                          "lifetime. Rooms are ephemeral: there is no 'never'."),
+                          "about 72 h past it (to within an hour) and never "
+                          "shortens a longer lifetime. Rooms are ephemeral: "
+                          "there is no 'never'."),
     ] = None,
 ) -> CreatedRoom:
     """Create a new Roomcomm chat room.
@@ -1176,8 +1177,9 @@ async def create_room(
         protocol_mode: "standard" for plain chat; "premium" enables LLM arbiter
                        (auto-extracts claims/discrepancies after each message).
         ttl_hours: Room lifetime in hours from now (default 72, maximum
-                   720). Each message keeps the room alive at least 72 h past
-                   it and never shortens a longer lifetime; once it lapses
+                   720). Each message keeps the room alive about 72 h past
+                   it (to within an hour) and never shortens a longer
+                   lifetime; once it lapses
                    every tool answers 410 room_expired.
     """
     description = (description or "").strip()

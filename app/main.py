@@ -966,6 +966,7 @@ def key_me_revoke(request: Request, session: Session = Depends(get_session)):
 async def my_inbox(
     request: Request,
     wait: int = Query(default=0, ge=0, le=longpoll.MAX_WAIT),
+    since: Optional[int] = Query(default=None, ge=0),
     session: Session = Depends(get_session),
 ):
     """"Did anyone look for me?" — cross-room digest for the presented key.
@@ -984,21 +985,41 @@ async def my_inbox(
     request is held until something new arrives for this key or the time is
     up (app/longpoll.py). An empty answer after a wait of 10 s or more is not
     counted as an idle poll.
+
+    Every answer carries `cursor`, the newest message id when it was built.
+    With `since=<cursor>` the request waits for news newer than that, even
+    while older news is still unread; without `since` any unread news ends
+    the wait at once — an agent that leaves a room unread would otherwise
+    turn `wait` into a tight loop (review 12.11.2026).
     """
+    top = await run_in_threadpool(longpoll.top_message_id, session)
     if wait <= 0:
-        out, _key_id = await run_in_threadpool(_inbox_once, request, session, True, True)
+        out, _key_id = await run_in_threadpool(_inbox_once, request, session, True, True, top)
         return out
     # A short wait is metered up front, so a throttled caller is refused at
-    # once; a long one is metered only if it could not wait (worker full).
+    # once; a long one is metered only if it did not really wait (worker
+    # full, or the client left early).
     short = wait < longpoll.FREE_WAIT
-    top = await run_in_threadpool(longpoll.top_message_id, session)
-    out, key_id = await run_in_threadpool(_inbox_once, request, session, short, True)
-    if not _inbox_out_empty(out):
+    out, key_id = await run_in_threadpool(_inbox_once, request, session, short, True, top)
+    if since is None:
+        fresh = not _inbox_out_empty(out)
+    else:
+        fresh = await longpoll.check_now(session, longpoll.inbox_has_news(key_id, since))
+    if fresh:
         return out
-    waited = await _hold(request, session, longpoll.inbox_has_news(key_id, top), wait)
+    baseline = top if since is None else since
+    waited = await _hold(request, session, longpoll.inbox_has_news(key_id, baseline), wait)
+    top = await run_in_threadpool(longpoll.top_message_id, session)
     out, _key_id = await run_in_threadpool(
-        _inbox_once, request, session, waited is None and not short, False)
+        _inbox_once, request, session, _meter_after(short, waited), False, top)
     return out
+
+
+def _meter_after(short: bool, waited: Optional[float]) -> bool:
+    """Whether the read after a hold is metered as an idle poll if empty: a
+    short wait was metered before the hold; a long one counts only if it did
+    not really wait — worker full, or the client left early."""
+    return not short and (waited is None or waited < longpoll.FREE_WAIT)
 
 
 def _inbox_out_empty(out: "InboxOut") -> bool:
@@ -1007,10 +1028,12 @@ def _inbox_out_empty(out: "InboxOut") -> bool:
 
 
 def _inbox_once(request: Request, session: Session, meter_empty: bool,
-                count: bool) -> tuple["InboxOut", int]:
+                count: bool, cursor: int) -> tuple["InboxOut", int]:
     """One build of the inbox. ``meter_empty`` False skips idle-poll metering
     (a long-poll about to wait, or one that waited long enough); ``count``
-    False skips the visibility counter on the second build of a long-poll."""
+    False skips the visibility counter on the second build of a long-poll.
+    ``cursor`` is the newest message id read before the build, returned so
+    the caller can wait for anything newer (`since`)."""
     subject, key = _resolve_subject(request, session)
     if key is None:
         raise HTTPException(
@@ -1036,7 +1059,7 @@ def _inbox_once(request: Request, session: Session, meter_empty: bool,
                 headers={"Retry-After": str(retry_after)},
             )
     assert key.id is not None  # a resolved key is a stored row
-    return InboxOut(**data), key.id
+    return InboxOut(**data, cursor=cursor), key.id
 
 
 # ---------------------------------------------------------------------------
@@ -1362,7 +1385,8 @@ async def list_messages(
         return await run_in_threadpool(_messages_once, room_uuid, request, since,
                                        limit, session, True)
     # A short wait is metered up front, so a throttled caller is refused at
-    # once; a long one is metered only if it could not wait (worker full).
+    # once; a long one is metered only if it did not really wait (worker
+    # full, or the client left early).
     short = wait < longpoll.FREE_WAIT
     page = await run_in_threadpool(_messages_once, room_uuid, request, since,
                                    limit, session, short)
@@ -1372,7 +1396,7 @@ async def list_messages(
     waited = await _hold(request, session,
                          longpoll.room_has_news(room_uuid, since or 0), wait)
     return await run_in_threadpool(_messages_once, room_uuid, request, since,
-                                   limit, session, waited is None and not short)
+                                   limit, session, _meter_after(short, waited))
 
 
 def _messages_once(room_uuid: str, request: Request, since: Optional[int],

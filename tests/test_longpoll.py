@@ -280,3 +280,148 @@ def test_a_gone_client_frees_its_place(_file_db):
         waited = asyncio.run(longpoll.wait_for(s, lambda _s: False, 20, gone))
     assert waited is not None and waited < 1
     assert calls and longpoll.held() == 0
+
+
+# ---------- second review 12.11.2026 ----------
+
+def test_inbox_cursor_waits_past_stale_unread_news():
+    """Old unread news used to end every inbox wait at once, turning
+    `wait=30` into a tight loop. With since=<cursor> it waits for news newer
+    than the cursor."""
+    key = _key("lp-cursor")
+    stale, live = _room(), _room()
+    for room in (stale, live):
+        _post(room, "lp-cursor", "hi", headers=_bearer(key))
+    _post(stale, "someone", "old news, never read")
+    first = client.get("/api/me/inbox", headers=_bearer(key)).json()
+    assert any(r["new_messages"] for r in first["rooms"])  # stale news present
+    cursor = first["cursor"]
+    assert cursor > 0
+    t0 = time.monotonic()
+    r = client.get("/api/me/inbox", params={"wait": 1, "since": cursor}, headers=_bearer(key))
+    assert r.status_code == 200 and time.monotonic() - t0 > 0.9  # held despite stale news
+    th, box = _in_background(lambda: client.get(
+        "/api/me/inbox", params={"wait": 20, "since": cursor}, headers=_bearer(key)))
+    time.sleep(0.5)
+    _post(live, "dealer", "fresh")
+    th.join(10)
+    assert box["r"].status_code == 200 and box["dt"] < 3
+    rooms = {r["uuid"]: r["new_messages"] for r in box["r"].json()["rooms"]}
+    assert rooms[live] == 1
+    assert box["r"].json()["cursor"] > cursor
+
+
+def test_without_since_unread_news_ends_the_wait_at_once():
+    key = _key("lp-nocursor")
+    room = _room()
+    _post(room, "lp-nocursor", "hi", headers=_bearer(key))
+    _post(room, "someone", "unread")
+    t0 = time.monotonic()
+    r = client.get("/api/me/inbox", params={"wait": 20}, headers=_bearer(key))
+    assert r.status_code == 200 and time.monotonic() - t0 < 2
+
+
+def test_a_long_wait_that_did_not_really_wait_is_metered():
+    """A client asking wait=30 and leaving after 50 ms must not get an
+    unmetered idle poll (review 12.11.2026)."""
+    from app.main import _meter_after
+    assert _meter_after(False, None) is True          # worker full
+    assert _meter_after(False, 0.05) is True          # client left early
+    assert _meter_after(False, longpoll.FREE_WAIT) is False
+    assert _meter_after(True, 0.05) is False          # short: metered before the hold
+
+
+def test_cancelling_twice_still_waits_for_the_check_thread(_file_db):
+    """The session must not be closed while a check thread is in it, however
+    often the request is cancelled."""
+    import asyncio
+
+    finished = []
+
+    def slow_check(_s):
+        time.sleep(0.4)
+        finished.append(time.monotonic())
+        return False
+
+    async def scenario():
+        with Session(_file_db) as s:
+            task = asyncio.ensure_future(longpoll.check_now(s, slow_check))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return time.monotonic()
+
+    returned = asyncio.run(scenario())
+    assert finished and finished[0] <= returned
+
+
+# ---------- tests-axis review 12.11.2026: gaps mutations slipped through ----------
+
+def test_throttled_caller_is_refused_before_a_short_inbox_wait(monkeypatch):
+    key = _key("lp-inbox-throttled")
+    room = _room()
+    _post(room, "lp-inbox-throttled", "hi", headers=_bearer(key))
+    monkeypatch.setattr(quota, "READ_EMPTY_LIMIT", 1)
+    client.get("/api/me/inbox", headers=_bearer(key))
+    t0 = time.monotonic()
+    r = client.get("/api/me/inbox", params={"wait": 5}, headers=_bearer(key))
+    assert r.status_code == 429
+    assert "empty_poll_throttled" in r.json()["detail"]
+    assert time.monotonic() - t0 < 2
+
+
+def test_held_inbox_wakes_a_key_that_only_read_the_room():
+    key = _key("lp-reader")
+    room = _room()
+    last = _post(room, "someone", "hello")
+    client.get(f"/api/rooms/{room}/messages", headers=_bearer(key))  # read, never post
+    th, box = _in_background(lambda: client.get(
+        "/api/me/inbox", params={"wait": 20, "since": last}, headers=_bearer(key)))
+    time.sleep(0.5)
+    _post(room, "someone", "news")
+    th.join(10)
+    assert box["r"].status_code == 200 and box["dt"] < 3
+    assert [(r["uuid"], r["new_messages"]) for r in box["r"].json()["rooms"]] == [(room, 1)]
+
+
+def test_news_landing_during_the_first_inbox_build_ends_the_wait(monkeypatch):
+    """The wait baseline is the newest id read *before* the build: a message
+    committed while the inbox is being built must not wait out the timer."""
+    key = _key("lp-race")
+    room = _room()
+    _post(room, "lp-race", "hi", headers=_bearer(key))
+    real = _main.inbox.build_inbox
+    fired = []
+
+    def build(session, k):
+        data = real(session, k)
+        if not fired:
+            fired.append(1)
+            th = threading.Thread(target=_post, args=(room, "dealer", "mid-build"))
+            th.start()
+            th.join(10)
+        return data
+    monkeypatch.setattr(_main.inbox, "build_inbox", build)
+    t0 = time.monotonic()
+    r = client.get("/api/me/inbox", params={"wait": 20}, headers=_bearer(key))
+    assert r.status_code == 200 and time.monotonic() - t0 < 3
+    assert [(x["uuid"], x["new_messages"]) for x in r.json()["rooms"]] == [(room, 1)]
+
+
+@pytest.mark.parametrize("path", ["room", "inbox"])
+def test_full_worker_meters_a_short_wait_once(_file_db, monkeypatch, path):
+    agent = f"lp-full-short-{path}"
+    key = _key(agent)
+    room = _room()
+    last = _post(room, agent, "hi", headers=_bearer(key))
+    monkeypatch.setattr(longpoll, "MAX_WAITERS", 0)
+    url = f"/api/rooms/{room}/messages" if path == "room" else "/api/me/inbox"
+    params = {"since": last, "wait": 1}
+    r = client.get(url, params=params, headers=_bearer(key))
+    assert r.status_code == 200
+    assert _idle_polls(_file_db, agent) == 1
