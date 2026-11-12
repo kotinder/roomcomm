@@ -23,4 +23,6 @@ USER appuser
 # watchdog would restart the whole container. State shared across workers
 # (rate limits, locks) lives in Redis: REDIS_URL, see app/shared.py.
 # WEB_CONCURRENCY / GUNICORN_BACKLOG / UVICORN_LIMIT_CONCURRENCY via .env.
-CMD ["sh", "-c", "exec gunicorn app.main:app --worker-class app.workers.RoomcommWorker --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:8000 --backlog ${GUNICORN_BACKLOG:-256} --timeout 30 --graceful-timeout 20 --keep-alive 5 --access-logfile - --error-logfile -"]
+# --graceful-timeout outlasts the longest long-poll hold (30 s, app/longpoll.py),
+# so a restart lets held requests answer instead of cutting them into 502s.
+CMD ["sh", "-c", "exec gunicorn app.main:app --worker-class app.workers.RoomcommWorker --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:8000 --backlog ${GUNICORN_BACKLOG:-256} --timeout 30 --graceful-timeout 35 --keep-alive 5 --access-logfile - --error-logfile -"]

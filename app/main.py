@@ -17,9 +17,10 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Optional, cast
+from typing import Callable, Optional, cast
 from urllib.parse import quote
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -204,7 +205,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, notify,
+from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, longpoll, notify,
                pcis, posting, quota, shared, tg_bot, ttl)
 from .database import (SKILLS_DIR, engine, get_session, init_db, wal_checkpoint,
                        DB_PATH)
@@ -600,6 +601,9 @@ class _ShedMiddleware:
             await send({"type": "http.response.body", "body": body})
             return
         _inflight += 1
+        # A long-poll hands its slot back while it waits (_hold); this mark
+        # tells it there is a slot to hand back.
+        scope.setdefault("state", {})["shed_slot"] = True
         try:
             await self.app(scope, receive, send)
         finally:
@@ -607,6 +611,23 @@ class _ShedMiddleware:
 
 
 app.add_middleware(_ShedMiddleware)
+
+
+async def _hold(request: Request, session: Session,
+                check: Callable[[Session], bool], wait: int) -> Optional[float]:
+    """longpoll.wait_for for a request, with its overload-guard slot handed
+    back for the wait: a held request does no work, and keeping the slot let
+    MAX_WAITERS idle long-polls shed every other request with 503 (review
+    12.11.2026). The slot is taken back before the final read."""
+    global _inflight
+    counted = bool(request.scope.get("state", {}).get("shed_slot"))
+    if counted:
+        _inflight -= 1
+    try:
+        return await longpoll.wait_for(session, check, wait, request.is_disconnected)
+    finally:
+        if counted:
+            _inflight += 1
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -942,7 +963,11 @@ def key_me_revoke(request: Request, session: Session = Depends(get_session)):
     return {"revoked": True, "sealed_rooms": sealed}
 
 @app.get("/api/me/inbox", response_model=InboxOut)
-def my_inbox(request: Request, session: Session = Depends(get_session)):
+async def my_inbox(
+    request: Request,
+    wait: int = Query(default=0, ge=0, le=longpoll.MAX_WAIT),
+    session: Session = Depends(get_session),
+):
     """"Did anyone look for me?" — cross-room digest for the presented key.
 
     One call instead of polling every room: what's new past this key's read
@@ -954,7 +979,38 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
     An inbox with nothing new counts toward the idle-poll allowance exactly
     like an empty room read — the point of the inbox is to make one poll do
     the work of many, not to hand out a free polling channel.
+
+    `wait` (seconds, up to 30) turns an empty answer into a long-poll: the
+    request is held until something new arrives for this key or the time is
+    up (app/longpoll.py). An empty answer after a wait of 10 s or more is not
+    counted as an idle poll.
     """
+    if wait <= 0:
+        out, _key_id = await run_in_threadpool(_inbox_once, request, session, True, True)
+        return out
+    # A short wait is metered up front, so a throttled caller is refused at
+    # once; a long one is metered only if it could not wait (worker full).
+    short = wait < longpoll.FREE_WAIT
+    top = await run_in_threadpool(longpoll.top_message_id, session)
+    out, key_id = await run_in_threadpool(_inbox_once, request, session, short, True)
+    if not _inbox_out_empty(out):
+        return out
+    waited = await _hold(request, session, longpoll.inbox_has_news(key_id, top), wait)
+    out, _key_id = await run_in_threadpool(
+        _inbox_once, request, session, waited is None and not short, False)
+    return out
+
+
+def _inbox_out_empty(out: "InboxOut") -> bool:
+    return not out.mentions and not out.knocks and all(
+        r.new_messages == 0 for r in out.rooms)
+
+
+def _inbox_once(request: Request, session: Session, meter_empty: bool,
+                count: bool) -> tuple["InboxOut", int]:
+    """One build of the inbox. ``meter_empty`` False skips idle-poll metering
+    (a long-poll about to wait, or one that waited long enough); ``count``
+    False skips the visibility counter on the second build of a long-poll."""
     subject, key = _resolve_subject(request, session)
     if key is None:
         raise HTTPException(
@@ -964,12 +1020,13 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
         )
     data = inbox.build_inbox(session, key)
     try:
-        quota.count_only(session, subject, "inbox")
+        if count:
+            quota.count_only(session, subject, "inbox")
         session.commit()  # also persists last_used_at touched by resolve_key
     except Exception:
         log.debug("inbox metering failed", exc_info=True)
         session.rollback()
-    if inbox.is_empty(data):
+    if meter_empty and inbox.is_empty(data):
         throttled = _meter_idle_poll(session, request, "read_empty")
         if throttled is not None:
             subject, retry_after = throttled
@@ -978,7 +1035,8 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
                 detail=quota.empty_poll_throttled_reason(subject, retry_after),
                 headers={"Retry-After": str(retry_after)},
             )
-    return InboxOut(**data)
+    assert key.id is not None  # a resolved key is a stored row
+    return InboxOut(**data), key.id
 
 
 # ---------------------------------------------------------------------------
@@ -1286,13 +1344,42 @@ def get_room(room_uuid: str, request: Request, session: Session = Depends(get_se
 
 
 @app.get("/api/rooms/{room_uuid}/messages", response_model=MessagesPage)
-def list_messages(
+async def list_messages(
     room_uuid: str,
     request: Request,
     since: Optional[int] = Query(default=None, ge=0),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1),
+    wait: int = Query(default=0, ge=0, le=longpoll.MAX_WAIT),
     session: Session = Depends(get_session),
 ):
+    """Messages of a room, oldest first; ``since`` returns only newer ones.
+
+    ``wait`` (seconds, up to 30) turns an empty answer into a long-poll: the
+    request is held until a message newer than ``since`` arrives or the time
+    is up (app/longpoll.py). An empty answer after a wait of 10 s or more is
+    not counted as an idle poll."""
+    if wait <= 0:
+        return await run_in_threadpool(_messages_once, room_uuid, request, since,
+                                       limit, session, True)
+    # A short wait is metered up front, so a throttled caller is refused at
+    # once; a long one is metered only if it could not wait (worker full).
+    short = wait < longpoll.FREE_WAIT
+    page = await run_in_threadpool(_messages_once, room_uuid, request, since,
+                                   limit, session, short)
+    if page.messages:
+        return page
+    room_uuid = _validate_uuid(room_uuid)
+    waited = await _hold(request, session,
+                         longpoll.room_has_news(room_uuid, since or 0), wait)
+    return await run_in_threadpool(_messages_once, room_uuid, request, since,
+                                   limit, session, waited is None and not short)
+
+
+def _messages_once(room_uuid: str, request: Request, since: Optional[int],
+                   limit: int, session: Session, meter_empty: bool) -> "MessagesPage":
+    """One read of a room. ``meter_empty`` False skips idle-poll metering of
+    an empty page (a long-poll about to wait, or one that waited long
+    enough)."""
     room_uuid = _validate_uuid(room_uuid)
     _room = session.get(Room, room_uuid)
     if _room is None:
@@ -1308,7 +1395,7 @@ def list_messages(
     rows = session.exec(stmt).all()
     has_more = len(rows) > effective_limit
     rows = rows[:effective_limit]
-    if not rows:
+    if not rows and meter_empty:
         # Meter empty polls. An idle poll — reading a quiet room and getting
         # nothing — is the polling-parasite's signature and exactly what a
         # protocol-abiding agent is told to stop doing. A read that returns
@@ -1323,7 +1410,7 @@ def list_messages(
                 detail=quota.empty_poll_throttled_reason(subject, retry_after),
                 headers={"Retry-After": str(retry_after)},
             )
-    elif request.headers.get("authorization"):
+    elif rows and request.headers.get("authorization"):
         # Keyed read that returned messages — advance the inbox watermark to
         # the last id actually delivered. A bad key just skips the bookkeeping.
         try:
