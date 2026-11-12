@@ -74,9 +74,11 @@ Add tests for new behaviour; `tests/` is organised by feature, so a change to
 - Keep changes small and focused; one logical change at a time.
 - No secrets in the repo. Keys and tokens come from the environment.
 - Don't deploy, push or restart the live service unless the owner asks in this
-  session. `deploy/nginx-commroom.conf` is the published config without the
+  session. When they do, follow [deploy/DEPLOY.md](deploy/DEPLOY.md).
+  `deploy/nginx-commroom.conf` is the published config without the
   host-specific parts; the full live copy is `deploy/nginx-commroom.live.conf`,
-  gitignored. Edit either only alongside a real server change.
+  gitignored, and may lag the host — the host's own file is the base for a
+  change. Edit either only alongside a real server change.
 - Rebuild the distributed bundle with `bash build_skill.sh` after touching
   `skill/`.
 
