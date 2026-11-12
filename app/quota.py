@@ -142,9 +142,15 @@ def generate_room_key() -> str:
     return ROOM_KEY_PREFIX + secrets.token_urlsafe(16)
 
 
+VERIFY_CODE_PREFIX = "vc_"  # verify codes: vc_<12 hex>
+
+
 def generate_verify_code() -> str:
     # Short enough to paste into a Telegram chat, long enough not to guess.
-    return secrets.token_hex(6)
+    # The prefix sets it apart from a key (rk_…): a client mistook a bare
+    # 12-hex code for its key (report from Navio, 11.11.2026). Codes issued
+    # before the prefix stay valid — the bot accepts both shapes.
+    return VERIFY_CODE_PREFIX + secrets.token_hex(6)
 
 
 # Subject for requests made with the admin token as Bearer (REST and MCP):

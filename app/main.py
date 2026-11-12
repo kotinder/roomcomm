@@ -17,9 +17,10 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Optional, cast
+from typing import Callable, Optional, cast
 from urllib.parse import quote
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,26 +114,48 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _burst_subject(request: Request,
+                   key: Optional["AgentKey"] = None) -> tuple[str, str]:
+    """(bucket, whose) for a burst limit: a Telegram-verified key is counted
+    on its own, everyone else on the caller's address.
+
+    Five agents on one address, each with its own key, shared one
+    address-sized bucket and 429'd each other out (report 02.11.2026). The
+    daily quotas have always billed a key for itself (quota.subject_of); these
+    burst limiters had not. Free keys stay on the address on purpose: they are
+    free and instant to mint (KEY_CREATE_LIMIT, 3/hour per IP), so a per-key
+    burst budget would be no budget at all — Telegram verification is what
+    makes a key a subject of its own.
+    """
+    if key is not None and key.tier in quota.PREMIUM_TIERS:
+        return f"key:{key.id}", "key"
+    return _client_ip(request), "IP"
+
+
 def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
-                       limit: int, window: int, what: str) -> None:
-    """Raise 429 if the IP exceeded `limit` events in the sliding `window`.
-    Counted in Redis across all workers; the in-process bucket is the
-    fallback while Redis is unavailable (see app/shared.py)."""
+                       limit: int, window: int, what: str,
+                       key: Optional["AgentKey"] = None) -> None:
+    """Raise 429 if the subject exceeded `limit` events in the sliding
+    `window`. The subject is a verified key where one is presented, else the
+    caller's address — see _burst_subject. Counted in Redis across all
+    workers; the in-process bucket is the fallback while Redis is unavailable
+    (see app/shared.py)."""
     ip = _client_ip(request)
     if quota.ip_exempt(ip):
         return
-    retry = shared.rate_hit(what.replace(" ", "_"), ip, limit, window)
+    subject, whose = _burst_subject(request, key)
+    retry = shared.rate_hit(what.replace(" ", "_"), subject, limit, window)
     if retry is not None:
         if retry > 0:
             raise HTTPException(
                 status_code=429,
-                detail=f"Too many {what} from this IP. Try again in {retry}s.",
+                detail=f"Too many {what} from this {whose}. Try again in {retry}s.",
                 headers={"Retry-After": str(retry)},
             )
         return
     now = time.monotonic()
     with lock:
-        bucket = buckets[ip]
+        bucket = buckets[subject]
         cutoff = now - window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
@@ -140,15 +163,15 @@ def _check_bucket_rate(request: Request, buckets: dict[str, deque], lock: Lock,
             retry_after = int(window - (now - bucket[0])) + 1
             raise HTTPException(
                 status_code=429,
-                detail=f"Too many {what} from this IP. Try again in {retry_after}s.",
+                detail=f"Too many {what} from this {whose}. Try again in {retry_after}s.",
                 headers={"Retry-After": str(retry_after)},
             )
         bucket.append(now)
 
 
-def _check_create_rate(request: Request) -> None:
+def _check_create_rate(request: Request, key: Optional["AgentKey"] = None) -> None:
     _check_bucket_rate(request, _create_buckets, _create_lock,
-                       ROOM_CREATE_LIMIT, ROOM_CREATE_WINDOW, "rooms created")
+                       ROOM_CREATE_LIMIT, ROOM_CREATE_WINDOW, "rooms created", key)
 
 
 def _check_skill_rate(request: Request) -> None:
@@ -156,14 +179,14 @@ def _check_skill_rate(request: Request) -> None:
                        SKILL_UPLOAD_LIMIT, SKILL_UPLOAD_WINDOW, "skill uploads")
 
 
-def _check_file_rate(request: Request) -> None:
+def _check_file_rate(request: Request, key: Optional["AgentKey"] = None) -> None:
     _check_bucket_rate(request, _file_buckets, _file_lock,
-                       FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads")
+                       FILE_UPLOAD_LIMIT, FILE_UPLOAD_WINDOW, "file uploads", key)
 
 
-def _check_msg_rate(request: Request) -> None:
+def _check_msg_rate(request: Request, key: Optional["AgentKey"] = None) -> None:
     _check_bucket_rate(request, _msg_buckets, _msg_lock,
-                       MSG_POST_LIMIT, MSG_POST_WINDOW, "messages posted")
+                       MSG_POST_LIMIT, MSG_POST_WINDOW, "messages posted", key)
 
 
 def _check_key_rate(request: Request) -> None:
@@ -182,7 +205,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
-from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, notify,
+from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, longpoll, notify,
                pcis, posting, quota, shared, tg_bot, ttl)
 from .database import (SKILLS_DIR, engine, get_session, init_db, wal_checkpoint,
                        DB_PATH)
@@ -578,6 +601,9 @@ class _ShedMiddleware:
             await send({"type": "http.response.body", "body": body})
             return
         _inflight += 1
+        # A long-poll hands its slot back while it waits (_hold); this mark
+        # tells it there is a slot to hand back.
+        scope.setdefault("state", {})["shed_slot"] = True
         try:
             await self.app(scope, receive, send)
         finally:
@@ -585,6 +611,23 @@ class _ShedMiddleware:
 
 
 app.add_middleware(_ShedMiddleware)
+
+
+async def _hold(request: Request, session: Session,
+                check: Callable[[Session], bool], wait: int) -> Optional[float]:
+    """longpoll.wait_for for a request, with its overload-guard slot handed
+    back for the wait: a held request does no work, and keeping the slot let
+    MAX_WAITERS idle long-polls shed every other request with 503 (review
+    12.11.2026). The slot is taken back before the final read."""
+    global _inflight
+    counted = bool(request.scope.get("state", {}).get("shed_slot"))
+    if counted:
+        _inflight -= 1
+    try:
+        return await longpoll.wait_for(session, check, wait, request.is_disconnected)
+    finally:
+        if counted:
+            _inflight += 1
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -920,7 +963,12 @@ def key_me_revoke(request: Request, session: Session = Depends(get_session)):
     return {"revoked": True, "sealed_rooms": sealed}
 
 @app.get("/api/me/inbox", response_model=InboxOut)
-def my_inbox(request: Request, session: Session = Depends(get_session)):
+async def my_inbox(
+    request: Request,
+    wait: int = Query(default=0, ge=0, le=longpoll.MAX_WAIT),
+    since: Optional[int] = Query(default=None, ge=0),
+    session: Session = Depends(get_session),
+):
     """"Did anyone look for me?" — cross-room digest for the presented key.
 
     One call instead of polling every room: what's new past this key's read
@@ -932,7 +980,60 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
     An inbox with nothing new counts toward the idle-poll allowance exactly
     like an empty room read — the point of the inbox is to make one poll do
     the work of many, not to hand out a free polling channel.
+
+    `wait` (seconds, up to 30) turns an empty answer into a long-poll: the
+    request is held until something new arrives for this key or the time is
+    up (app/longpoll.py). An empty answer after a wait of 10 s or more is not
+    counted as an idle poll.
+
+    Every answer carries `cursor`, the newest message id when it was built.
+    With `since=<cursor>` the request waits for news newer than that, even
+    while older news is still unread; without `since` any unread news ends
+    the wait at once — an agent that leaves a room unread would otherwise
+    turn `wait` into a tight loop (review 12.11.2026).
     """
+    top = await run_in_threadpool(longpoll.top_message_id, session)
+    if wait <= 0:
+        out, _key_id = await run_in_threadpool(_inbox_once, request, session, True, True, top)
+        return out
+    # A short wait is metered up front, so a throttled caller is refused at
+    # once; a long one is metered only if it did not really wait (worker
+    # full, or the client left early).
+    short = wait < longpoll.FREE_WAIT
+    out, key_id = await run_in_threadpool(_inbox_once, request, session, short, True, top)
+    if since is None:
+        fresh = not _inbox_out_empty(out)
+    else:
+        fresh = await longpoll.check_now(session, longpoll.inbox_has_news(key_id, since))
+    if fresh:
+        return out
+    baseline = top if since is None else since
+    waited = await _hold(request, session, longpoll.inbox_has_news(key_id, baseline), wait)
+    top = await run_in_threadpool(longpoll.top_message_id, session)
+    out, _key_id = await run_in_threadpool(
+        _inbox_once, request, session, _meter_after(short, waited), False, top)
+    return out
+
+
+def _meter_after(short: bool, waited: Optional[float]) -> bool:
+    """Whether the read after a hold is metered as an idle poll if empty: a
+    short wait was metered before the hold; a long one counts only if it did
+    not really wait — worker full, or the client left early."""
+    return not short and (waited is None or waited < longpoll.FREE_WAIT)
+
+
+def _inbox_out_empty(out: "InboxOut") -> bool:
+    return not out.mentions and not out.knocks and all(
+        r.new_messages == 0 for r in out.rooms)
+
+
+def _inbox_once(request: Request, session: Session, meter_empty: bool,
+                count: bool, cursor: int) -> tuple["InboxOut", int]:
+    """One build of the inbox. ``meter_empty`` False skips idle-poll metering
+    (a long-poll about to wait, or one that waited long enough); ``count``
+    False skips the visibility counter on the second build of a long-poll.
+    ``cursor`` is the newest message id read before the build, returned so
+    the caller can wait for anything newer (`since`)."""
     subject, key = _resolve_subject(request, session)
     if key is None:
         raise HTTPException(
@@ -942,12 +1043,13 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
         )
     data = inbox.build_inbox(session, key)
     try:
-        quota.count_only(session, subject, "inbox")
+        if count:
+            quota.count_only(session, subject, "inbox")
         session.commit()  # also persists last_used_at touched by resolve_key
     except Exception:
         log.debug("inbox metering failed", exc_info=True)
         session.rollback()
-    if inbox.is_empty(data):
+    if meter_empty and inbox.is_empty(data):
         throttled = _meter_idle_poll(session, request, "read_empty")
         if throttled is not None:
             subject, retry_after = throttled
@@ -956,7 +1058,8 @@ def my_inbox(request: Request, session: Session = Depends(get_session)):
                 detail=quota.empty_poll_throttled_reason(subject, retry_after),
                 headers={"Retry-After": str(retry_after)},
             )
-    return InboxOut(**data)
+    assert key.id is not None  # a resolved key is a stored row
+    return InboxOut(**data, cursor=cursor), key.id
 
 
 # ---------------------------------------------------------------------------
@@ -981,8 +1084,8 @@ def create_knock(payload: KnockIn, request: Request, background_tasks: Backgroun
     """Knock on an acquaintance: a key that posted, with its key, into a room
     you also posted into. Creates a private two-party room with your text as
     its first message and puts it into their inbox. Verified keys only."""
-    _check_create_rate(request)
     key = _knock_key(request, session)
+    _check_create_rate(request, key)
     try:
         out = knock.knock(session, key, payload.to_ref, payload.agent_id,
                           payload.text, payload.ttl_hours)
@@ -1064,8 +1167,10 @@ def create_room(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
-    _check_create_rate(request)
+    # Subject first: the burst limiter bills a verified key for itself, so it
+    # has to know who is calling (_burst_subject).
     subject, key = _resolve_subject(request, session)
+    _check_create_rate(request, key)
     # "Keyed create" wall: anonymous callers may read and post into open rooms,
     # but creating a room requires a (revocable) key. Enforced independently of
     # QUOTA_MODE; killswitch quota.KEYED_CREATE=off.
@@ -1262,13 +1367,43 @@ def get_room(room_uuid: str, request: Request, session: Session = Depends(get_se
 
 
 @app.get("/api/rooms/{room_uuid}/messages", response_model=MessagesPage)
-def list_messages(
+async def list_messages(
     room_uuid: str,
     request: Request,
     since: Optional[int] = Query(default=None, ge=0),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1),
+    wait: int = Query(default=0, ge=0, le=longpoll.MAX_WAIT),
     session: Session = Depends(get_session),
 ):
+    """Messages of a room, oldest first; ``since`` returns only newer ones.
+
+    ``wait`` (seconds, up to 30) turns an empty answer into a long-poll: the
+    request is held until a message newer than ``since`` arrives or the time
+    is up (app/longpoll.py). An empty answer after a wait of 10 s or more is
+    not counted as an idle poll."""
+    if wait <= 0:
+        return await run_in_threadpool(_messages_once, room_uuid, request, since,
+                                       limit, session, True)
+    # A short wait is metered up front, so a throttled caller is refused at
+    # once; a long one is metered only if it did not really wait (worker
+    # full, or the client left early).
+    short = wait < longpoll.FREE_WAIT
+    page = await run_in_threadpool(_messages_once, room_uuid, request, since,
+                                   limit, session, short)
+    if page.messages:
+        return page
+    room_uuid = _validate_uuid(room_uuid)
+    waited = await _hold(request, session,
+                         longpoll.room_has_news(room_uuid, since or 0), wait)
+    return await run_in_threadpool(_messages_once, room_uuid, request, since,
+                                   limit, session, _meter_after(short, waited))
+
+
+def _messages_once(room_uuid: str, request: Request, since: Optional[int],
+                   limit: int, session: Session, meter_empty: bool) -> "MessagesPage":
+    """One read of a room. ``meter_empty`` False skips idle-poll metering of
+    an empty page (a long-poll about to wait, or one that waited long
+    enough)."""
     room_uuid = _validate_uuid(room_uuid)
     _room = session.get(Room, room_uuid)
     if _room is None:
@@ -1284,7 +1419,7 @@ def list_messages(
     rows = session.exec(stmt).all()
     has_more = len(rows) > effective_limit
     rows = rows[:effective_limit]
-    if not rows:
+    if not rows and meter_empty:
         # Meter empty polls. An idle poll — reading a quiet room and getting
         # nothing — is the polling-parasite's signature and exactly what a
         # protocol-abiding agent is told to stop doing. A read that returns
@@ -1299,7 +1434,7 @@ def list_messages(
                 detail=quota.empty_poll_throttled_reason(subject, retry_after),
                 headers={"Retry-After": str(retry_after)},
             )
-    elif request.headers.get("authorization"):
+    elif rows and request.headers.get("authorization"):
         # Keyed read that returned messages — advance the inbox watermark to
         # the last id actually delivered. A bad key just skips the bookkeeping.
         try:
@@ -2663,7 +2798,7 @@ async def upload_room_file(
         quota.check_write_policy(room, request.headers.get("x-room-key"), key)
     except quota.AuthError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
-    _check_file_rate(request)
+    _check_file_rate(request, key)
 
     data = await file.read(files.MAX_BYTES + 1)
     try:

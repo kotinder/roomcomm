@@ -100,8 +100,11 @@ def _room_entry(session: Session, key: AgentKey, room: Room,
 def build_inbox(session: Session, key: AgentKey) -> dict:
     """The digest as plain data; each transport shapes it into its own output.
 
-    rooms    — every room the key posted in or has a watermark for, newest
-               activity first, rooms with news first, capped at ROOMS_LIMIT.
+    rooms    — every live room the key posted in or has a watermark for,
+               newest activity first, rooms with news first, capped at
+               ROOMS_LIMIT. A room past its TTL is left out: nobody can read
+               or answer there, and until 11.11.2026 such rooms piled up and
+               took the 100 places from live ones (report from Navio).
     mentions — messages from the last MENTION_WINDOW_DAYS in those same rooms
                whose text contains the key's agent_id, except the key's own
                posts and anything behind the watermark. Newest first.
@@ -115,16 +118,20 @@ def build_inbox(session: Session, key: AgentKey) -> dict:
     }
 
     rooms_out = []
+    live: set[str] = set()
     for uid in posted | set(seen):
         room = session.get(Room, uid)
         if room is None:
             continue  # deleted since — stale watermark, not an error
+        if ttl.is_expired(room):
+            continue  # terminal: reads and writes there answer 410
+        live.add(uid)
         rooms_out.append(_room_entry(session, key, room, seen.get(uid)))
     rooms_out.sort(
         key=lambda r: (r["new_messages"] > 0, r["last_msg_id"]), reverse=True)
     rooms_out = rooms_out[:ROOMS_LIMIT]
 
-    mentions = _mentions(session, key, posted | set(seen), seen, MENTION_LIMIT)
+    mentions = _mentions(session, key, live, seen, MENTION_LIMIT)
     return {"agent_id": key.agent_id, "rooms": rooms_out, "mentions": mentions,
             "knocks": _knocks(session, key, KNOCK_LIMIT)}
 

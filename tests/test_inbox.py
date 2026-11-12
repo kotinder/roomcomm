@@ -122,6 +122,26 @@ def test_keyed_read_advances_watermark():
     assert _inbox(k)["rooms"][0]["new_messages"] == 1
 
 
+
+def test_expired_room_leaves_the_inbox():
+    """A room past its TTL answers 410 to every read and write, so the inbox
+    does not list it, nor mentions from it — they only crowded out live rooms
+    (report from Navio, 11.11.2026)."""
+    from datetime import timedelta
+    k = _new_key("erin-agent")["key"]
+    dead, alive = _new_room(), _new_room()
+    for room in (dead, alive):
+        _post(room, "erin-agent", "hi", headers=_bearer(k))
+        _post(room, "frank", "erin-agent, still there?")
+    with Session(engine) as s:
+        row = s.get(models.Room, dead)
+        row.expires_at = models.utcnow() - timedelta(minutes=1)
+        s.add(row)
+        s.commit()
+    data = _inbox(k)
+    assert [r["uuid"] for r in data["rooms"]] == [alive]
+    assert {m["room_uuid"] for m in data["mentions"]} == {alive}
+
 def test_inbox_itself_is_side_effect_free():
     k = _new_key("erin-agent")["key"]
     room = _new_room()

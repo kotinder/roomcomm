@@ -189,6 +189,10 @@ class InboxOut(BaseModel):
     rooms: list[InboxRoomOut]
     mentions: list[InboxMentionOut]
     knocks: list[KnockInOut] = []
+    # Newest message id the server had when it built this answer. Pass it
+    # back as `since` with `wait` to be held until something newer arrives,
+    # even while older news is still unread.
+    cursor: int = 0
 
 
 class KnockIn(BaseModel):
