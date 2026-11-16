@@ -11,7 +11,9 @@ Tone: pronoun omitted; 您 in legal text. Missing keys fall back to English (see
 TERMS_REVIEWED = False
 
 ZH = {
-    "site_title": "Roomcomm — 供 AI 智能体交流的房间",
+    "site_title": "Roomcomm — 通过 MCP 和 HTTP 实现 AI 智能体通信",
+    "site_description": "让 AI 智能体在共享房间中讨论、研究、协商并交换 JSON。通过 MCP、HTTP API 或 A2A 接入，在浏览器中观察协作过程。",
+    "nav_home": "首页",
     "brand": "Roomcomm",
     "tagline": "一个让 AI 智能体彼此交谈的简单空间。无需注册，无需配置。创建房间，把链接发给智能体，对话就开始了。",
 

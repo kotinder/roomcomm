@@ -205,6 +205,7 @@ def _verify_ed25519_sig(pubkey_hex: str, message: bytes, sig_hex: str) -> bool:
     except Exception:
         return False
 
+from . import seo
 from . import (anchor, authorship, files, i18n, inbox, knock, latency, llm, longpoll, notify,
                pcis, posting, quota, shared, tg_bot, ttl)
 from .database import (SKILLS_DIR, engine, get_session, init_db, wal_checkpoint,
@@ -2899,12 +2900,14 @@ def delete_room_file(
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     lang = _lang(request)
+    texts = i18n.t(lang)
     resp = templates.TemplateResponse(
         request, "index.html",
         {"lang": lang, "t": i18n.t(lang), "base_url": str(request.base_url).rstrip('/'),
          # Landing texts about Telegram verification flip with the bot state,
          # same as the API hints — the page never advertises a dead bot.
-         "tg_active": quota.tg_verification_active()},
+         "tg_active": quota.tg_verification_active(),
+         "seo": seo.metadata("/", lang, texts["site_title"], texts["site_description"], texts["nav_home"])},
     )
     return _apply_lang_cookie(request, resp)
 
@@ -2917,8 +2920,14 @@ Disallow: /mcp
 
 
 @app.get("/robots.txt", include_in_schema=False)
-def robots_txt():
-    return PlainTextResponse(_ROBOTS_TXT)
+def robots_txt(request: Request):
+    origin = seo.origin_for_host(request.url.hostname)
+    return PlainTextResponse(_ROBOTS_TXT + f"\nSitemap: {origin}/sitemap.xml\n")
+
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def sitemap_xml(request: Request):
+    return Response(seo.sitemap(request.url.hostname), media_type="application/xml")
 
 
 _EXAMPLE_PAGES = json.loads(Path(__file__).with_name("examples.json").read_text(encoding="utf-8"))
@@ -2927,10 +2936,13 @@ _EXAMPLE_PAGES = json.loads(Path(__file__).with_name("examples.json").read_text(
 @app.get("/examples", response_class=HTMLResponse, include_in_schema=False)
 def examples_page(request: Request):
     lang = _lang(request)
+    page = _EXAMPLE_PAGES[lang]
     resp = templates.TemplateResponse(
         request, "examples.html",
         {"lang": lang, "t": i18n.t(lang), "page": _EXAMPLE_PAGES[lang],
-         "base_url": str(request.base_url).rstrip('/')},
+         "base_url": str(request.base_url).rstrip('/'),
+         "seo": seo.metadata("/examples", lang, page["title"], page["description"],
+                             i18n.t(lang)["nav_home"], page["scenarios"])},
     )
     return _apply_lang_cookie(request, resp)
 

@@ -3,15 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ page.title }}</title>
-  <meta name="description" content="{{ page.description }}">
-  <meta property="og:title" content="{{ page.title }}">
-  <meta property="og:description" content="{{ page.description }}">
+  {% include "seo_head.html" %}
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/examples.css">
+  <link rel="stylesheet" href="/static/examples.css?v=20261116-2">
 </head>
 <body>
   <header class="site-header">
@@ -30,6 +27,7 @@
   </header>
   <main class="wrap">
     <div class="page-head">
+      <nav class="breadcrumbs" aria-label="{{ t.nav_home }} / {{ page.nav }}"><a href="/?lang={{ lang }}">{{ t.nav_home }}</a><span aria-hidden="true"> / </span><span>{{ page.nav }}</span></nav>
       <p class="eyebrow">{{ page.kicker }}</p>
       <h1>{{ page.heading }}</h1>
       <p class="lead">{{ page.lead }}</p>
