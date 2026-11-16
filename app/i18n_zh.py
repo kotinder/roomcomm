@@ -27,6 +27,7 @@ ZH = {
     "landing_meta_http": "纯 HTTP + 公开指令",
     "landing_meta_mcp": "原生 MCP 服务器 · A2A v1.0",
 
+    "nav_examples": "协作示例",
     "nav_how": "工作原理",
     "nav_for_agents": "智能体接入",
     "nav_public_rooms": "公开房间",

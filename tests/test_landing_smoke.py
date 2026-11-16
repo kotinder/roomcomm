@@ -16,6 +16,38 @@ def test_landing_renders_both_locales_with_tg_hint():
     assert "Telegram" in r2.text
 
 
+@pytest.mark.parametrize("lang,heading", [
+    ("ru", "Что агенты могут делать вместе"),
+    ("en", "What agents can do together"),
+    ("zh", "智能体可以一起做什么"),
+])
+def test_examples_page_is_localized_and_prompts_are_escaped(lang, heading):
+    r = client.get(f"/examples?lang={lang}")
+    assert r.status_code == 200
+    assert heading in r.text
+    assert r.text.count("<article ") == 7
+    assert r.text.count('class="prompt-text"') == 7
+    assert "built-in method" not in r.text
+    # Placeholder prompts remain visible text, not HTML elements.
+    assert "&lt;" in r.text
+    assert "http://testserver/agents.md" in r.text
+    assert "<URL" not in r.text
+    for anchor in ("second-opinion", "research", "handoff", "negotiation",
+                   "knock", "simulation", "coordination", "start"):
+        assert f'href="#{anchor}"' in r.text
+        assert f'id="{anchor}"' in r.text
+    assert f'href="/examples?lang={lang}"' in client.get(f"/?lang={lang}").text
+
+
+def test_examples_page_uses_domain_language_and_serves_styles():
+    # HTML needs no lifespan; the shared MCP manager can start only once.
+    fresh = TestClient(fastapi_app)
+    response = fresh.get("/examples", headers={"host": "roomcomm.ru"})
+    assert response.status_code == 200
+    assert '<html lang="ru">' in response.text
+    assert fresh.get("/static/examples.css").status_code == 200
+
+
 # Scanner paths must not cost us a 13 KB template render each; a truncated room
 # link still has to reach the page that explains itself.
 @pytest.mark.parametrize("path", [

@@ -2921,6 +2921,20 @@ def robots_txt():
     return PlainTextResponse(_ROBOTS_TXT)
 
 
+_EXAMPLE_PAGES = json.loads(Path(__file__).with_name("examples.json").read_text(encoding="utf-8"))
+
+
+@app.get("/examples", response_class=HTMLResponse, include_in_schema=False)
+def examples_page(request: Request):
+    lang = _lang(request)
+    resp = templates.TemplateResponse(
+        request, "examples.html",
+        {"lang": lang, "t": i18n.t(lang), "page": _EXAMPLE_PAGES[lang],
+         "base_url": str(request.base_url).rstrip('/')},
+    )
+    return _apply_lang_cookie(request, resp)
+
+
 @app.get("/terms", response_class=HTMLResponse)
 def terms_page(request: Request):
     lang = _lang(request)

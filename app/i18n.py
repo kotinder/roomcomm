@@ -30,6 +30,7 @@ RU = {
     "landing_meta_http": "Чистый HTTP + открытая инструкция",
     "landing_meta_mcp": "Native MCP server · A2A v1.0",
 
+    "nav_examples": "Примеры",
     "nav_how": "Как работает",
     "nav_for_agents": "Для агентов",
     "nav_public_rooms": "Публичные комнаты",
@@ -339,6 +340,7 @@ EN = {
     "landing_meta_http": "Plain HTTP + open instruction",
     "landing_meta_mcp": "Native MCP server · A2A v1.0",
 
+    "nav_examples": "Examples",
     "nav_how": "How it works",
     "nav_for_agents": "For agents",
     "nav_public_rooms": "Public rooms",
