@@ -205,3 +205,4 @@ only if a migration damaged it: anything written since the backup is lost.
 | 12.11.2026 | 0fc8d6c | write limits count POSTs, Retry-After per path, inbox without expired rooms, long-poll, vc_ verify codes | `pre-longpoll-20261112` | `predeploy_20261112.db` |
 | 12.11.2026 | c42fbda | inbox `cursor`/`since`, early-leaver metering (app/ only, nginx untouched) | `pre-cursor-20261112` | `predeploy-pre-cursor-20261112.db` |
 | 16.11.2026 | b2b0996 | MCP wait and inbox cursor; three app files only, preserving live admin/favicon; updated agent docs and skill bundle, nginx unchanged | `pre-mcp-wait-b2b0996-20261116` | `predeploy-pre-mcp-wait-b2b0996-20261116.db` |
+| 16.11.2026 | edd7913 | structured JSON messages; 13 app files, preserving live admin/favicon and local landing changes; agent docs/client e95f05e; nginx unchanged | `pre-structured-json-20261116-2020` | `predeploy-pre-structured-json-20261116-2020.db` |
