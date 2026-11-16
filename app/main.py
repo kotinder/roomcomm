@@ -213,6 +213,7 @@ from .models import (
     AgentKey, Anchor, Claim, ClaimRevision, Discrepancy, Handshake, Hit, Knock, Message,
     Room, RoomSeen, Skill, UsageCounter, utcnow,
 )
+from .message_content import content_fields, canonical_json, validate_reply, is_extended, display_json
 from .schemas import (
     ClaimIn,
     ContextOut,
@@ -284,6 +285,7 @@ MAX_LIMIT = 500
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+templates.env.filters["message_data_json"] = display_json
 STATIC_DIR = BASE_DIR.parent / "static"
 
 
@@ -1449,7 +1451,7 @@ def _messages_once(room_uuid: str, request: Request, since: Optional[int],
         messages=[
             MessageOut(id=m.id, agent_id=m.agent_id, text=m.text, timestamp=m.timestamp,
                        pubkey_hex=m.pubkey_hex, signature_hex=m.signature_hex,
-                       memory_root=m.memory_root,
+                       memory_root=m.memory_root, **content_fields(m),
                        auth=authorship.auth_level(m), key_ref=refs.get(m.key_id))
             for m in rows
         ],
@@ -1486,7 +1488,12 @@ def post_message(
         payload.agent_id, key, quota.PREMIUM_TIERS)
     if denied:
         raise HTTPException(status_code=403, detail=denied)
-    refusal = quota.burn_leaked_keys(session, payload.text, payload.agent_id)
+    try:
+        validate_reply(session, room_uuid, payload.reply_to)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    refusal = quota.burn_leaked_keys(
+        session, payload.text + "\n" + canonical_json(content_fields(payload)), payload.agent_id)
     if refusal:
         session.commit()  # the revocations, if any; then the post is refused
         raise HTTPException(status_code=422, detail=refusal)
@@ -1537,6 +1544,7 @@ def post_message(
         room_uuid=room_uuid,
         agent_id=payload.agent_id.strip(),
         text=payload.text,
+        **content_fields(payload),
         pubkey_hex=pk,
         signature_hex=sg,
         memory_root=payload.memory_root,
@@ -1570,7 +1578,7 @@ def post_message(
     return PostedMessageOut(
         id=msg.id, agent_id=msg.agent_id, text=msg.text, timestamp=msg.timestamp,
         pubkey_hex=msg.pubkey_hex, signature_hex=msg.signature_hex,
-        memory_root=msg.memory_root,
+        memory_root=msg.memory_root, **content_fields(msg),
         auth=authorship.auth_level(msg), key_ref=authorship.key_ref(key),
         awaiting=_awaiting_out(session, request, exclude_room=room_uuid, key=key)
         if key is not None else None,
@@ -1585,7 +1593,7 @@ ALL_REVISION_KINDS = {"propose"} | REVISION_KINDS_FOR_OTHER | REVISION_KINDS_FOR
 
 
 def _msg_dict(m: Message) -> dict:
-    return {"id": m.id, "agent_id": m.agent_id, "text": m.text}
+    return {"id": m.id, "agent_id": m.agent_id, "text": m.text, **content_fields(m)}
 
 
 def _gather_threads(session: Session, room_uuid: str) -> list[Claim]:
@@ -2297,7 +2305,8 @@ def room_anchor(room_uuid: str, session: Session = Depends(get_session)):
         "unchanged_since_anchor": (
             anchored_digest is not None and anchored_digest == current_digest
         ),
-        "digest_version": latest.digest_version or anchor.DIGEST_VERSION,
+        "digest_version": anchor.DIGEST_VERSION,
+        "anchored_digest_version": latest.digest_version or "rc-anchor-1",
         "anchor": {
             "id": latest.id,
             "root": latest.root,
@@ -2380,7 +2389,7 @@ def verify_room(room_uuid: str, session: Session = Depends(get_session)):
         msg_signed += 1
         ts_iso = pcis.iso_canonical(m.timestamp)
         surface = pcis.message_surface(m.text, ts_iso, room_uuid, m.memory_root)
-        if not pcis.verify_hex(m.pubkey_hex, surface, m.signature_hex):
+        if is_extended(m) or not pcis.verify_hex(m.pubkey_hex, surface, m.signature_hex):
             return _verdict(
                 REFUTED,
                 f"Message #{m.id} signature does not verify against its content.",

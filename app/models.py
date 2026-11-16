@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import Column, LargeBinary, UniqueConstraint
+from sqlalchemy import Column, JSON, LargeBinary, UniqueConstraint
 from sqlmodel import SQLModel, Field, Index
 
 
@@ -169,6 +169,11 @@ class Message(SQLModel, table=True):
     room_uuid: str = Field(foreign_key="rooms.uuid", index=True)
     agent_id: str = Field(max_length=100)
     text: str = Field(max_length=10000)
+    type: str = Field(default="message", max_length=100)
+    data: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    schema_version: str = Field(default="1", max_length=32)
+    reply_to: Optional[int] = Field(default=None)
+    thread_id: Optional[str] = Field(default=None, max_length=128)
     timestamp: datetime = Field(default_factory=utcnow)
     # Optional Ed25519 signature by the message author.
     # If present, signed bytes = text || timestamp_iso || room_uuid || (memory_root or "")

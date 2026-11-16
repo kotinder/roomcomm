@@ -224,17 +224,38 @@ def fetch_messages(room: str, since: Optional[int] = None, limit: int = 100,
     return _request("GET", url, key=load_key(key))
 
 
-def send(room: str, agent_id: str, text: str, key: Optional[str] = None,
-         room_key: Optional[str] = None) -> dict:
+def send(room: str, agent_id: str, text: str = "", key: Optional[str] = None,
+         room_key: Optional[str] = None, *, type: str = "message",
+         data: Optional[dict] = None, schema_version: str = "1",
+         reply_to: Optional[int] = None, thread_id: Optional[str] = None) -> dict:
     """POST /api/rooms/{uuid}/messages. Returns the created message.
 
     Posting into an OPEN room is anonymous. A write-protected room (e.g. a
     sealed public demo) needs either the room's write-key (`room_key` →
-    X-Room-Key) or the creator's Bearer key."""
+    X-Room-Key) or the creator's Bearer key. Supply text, data (a JSON object),
+    or both. Event types and data schemas are defined by the participants;
+    reply_to references a message in this room, thread_id groups messages.
+    Inline data is limited by the server to 16 KiB canonical JSON, depth 32.
+    """
+    if data is not None and not isinstance(data, dict):
+        raise ValueError("data must be a JSON object")
     host, uuid = _parse(room)
     extra = {"X-Room-Key": room_key} if room_key else None
+    payload = {"agent_id": agent_id, "text": text}
+    # Preserve the legacy request when callers use only text.
+    if data is not None:
+        payload["data"] = data
+    if type != "message":
+        payload["type"] = type
+    if schema_version != "1":
+        payload["schema_version"] = schema_version
+    if reply_to is not None:
+        payload["reply_to"] = reply_to
+    if thread_id is not None:
+        payload["thread_id"] = thread_id
+    json.dumps(payload, allow_nan=False)  # reject non-JSON values before sending
     return _request("POST", f"{host}/api/rooms/{uuid}/messages",
-                    {"agent_id": agent_id, "text": text},
+                    payload,
                     key=load_key(key), extra_headers=extra)
 
 
@@ -634,7 +655,14 @@ def _cli() -> int:
     p_send = sub.add_parser("send", parents=[common], help="Send a message")
     p_send.add_argument("room")
     p_send.add_argument("agent_id")
-    p_send.add_argument("text")
+    p_send.add_argument("text", nargs="?", default="")
+    p_send.add_argument("--type", default="message", help="Sender-defined message type")
+    data_args = p_send.add_mutually_exclusive_group()
+    data_args.add_argument("--data", help="Inline JSON object")
+    data_args.add_argument("--data-file", help="UTF-8 JSON object file, or - for stdin")
+    p_send.add_argument("--schema-version", default="1")
+    p_send.add_argument("--reply-to", type=int, default=None, help="Message ID in this room")
+    p_send.add_argument("--thread-id", default=None, help="Sender-defined grouping label")
     p_send.add_argument("--room-key", default=None, dest="room_key",
                         help="wk_… write-key for a write-protected (sealed) room")
 
@@ -715,8 +743,24 @@ def _cli() -> int:
             print(json.dumps(fetch_messages(args.room, since=args.since, limit=args.limit, key=args.key),
                              ensure_ascii=False, indent=2))
         elif args.cmd == "send":
+            raw_data = args.data
+            if args.data_file == "-":
+                # Pipes on Windows may use a legacy locale encoding. JSON input
+                # is UTF-8, just like --data-file; allow a UTF-8 BOM in either.
+                if hasattr(sys.stdin, "buffer"):
+                    raw_data = sys.stdin.buffer.read().decode("utf-8-sig")
+                else:
+                    raw_data = sys.stdin.read().lstrip("\ufeff")
+            elif args.data_file is not None:
+                with open(args.data_file, encoding="utf-8-sig") as f:
+                    raw_data = f.read()
+            data = json.loads(raw_data) if raw_data is not None else None
+            if raw_data is not None and not isinstance(data, dict):
+                raise ValueError("data must be a JSON object")
             print(json.dumps(send(args.room, args.agent_id, args.text,
-                                  key=args.key, room_key=args.room_key),
+                                  key=args.key, room_key=args.room_key, type=args.type,
+                                  data=data, schema_version=args.schema_version,
+                                  reply_to=args.reply_to, thread_id=args.thread_id),
                              ensure_ascii=False, indent=2))
         elif args.cmd == "poll":
             msgs, last = poll_once(args.room, since=args.since, key=args.key)
@@ -803,7 +847,7 @@ def _cli() -> int:
             return 5
         print(f"error: {e.detail}", file=sys.stderr)
         return 2
-    except (ValueError, urllib.error.URLError) as e:
+    except (ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

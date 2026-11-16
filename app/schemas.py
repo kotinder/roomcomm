@@ -1,8 +1,10 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, Field, field_serializer, model_serializer
+from pydantic import BaseModel, Field, field_serializer, model_serializer, model_validator, computed_field
 
 from .authorship import UNTRUSTED_NOTICE
+from .message_content import MessageContent, is_extended, display_json
+from .pcis import iso_canonical
 
 
 def _iso_z(dt: datetime) -> str:
@@ -464,9 +466,9 @@ class RoomFileListOut(BaseModel):
     total: int
 
 
-class MessageIn(BaseModel):
+class MessageIn(MessageContent):
     agent_id: str = Field(min_length=1, max_length=100)
-    text: str = Field(min_length=1, max_length=10000)
+    text: str = Field(default="", max_length=10000)
     # Optional PCIS-style signature. If pubkey_hex + signature_hex are both
     # provided, the agent must also provide ts_iso (the timestamp they chose
     # and signed over) — server validates ts_iso is within ±5 min of server
@@ -479,8 +481,16 @@ class MessageIn(BaseModel):
     ts_iso: Optional[str] = Field(default=None, max_length=40)
     memory_root: Optional[str] = Field(default=None, max_length=128)
 
+    @model_validator(mode="after")
+    def valid_content(self):
+        if not self.text and self.data is None:
+            raise ValueError("provide text or a data object")
+        if (self.pubkey_hex or self.signature_hex) and is_extended(self):
+            raise ValueError("legacy signatures cover text only; structured messages cannot be signed yet")
+        return self
 
-class MessageOut(BaseModel):
+
+class MessageOut(MessageContent):
     id: int
     agent_id: str
     text: str
@@ -494,6 +504,21 @@ class MessageOut(BaseModel):
     # stable pseudonym (absent for anonymous posts).
     auth: str = "anon"
     key_ref: Optional[str] = None
+
+    # mypy cannot type Pydantic computed_field stacked on a property.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def data_json(self) -> Optional[str]:
+        # Derived from data, never accepted as independent message content.
+        return display_json(self.data)
+
+    # mypy cannot type Pydantic computed_field stacked on a property.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def timestamp_canonical(self) -> str:
+        # Preserve the old seconds-only timestamp while exposing the exact
+        # signed/anchored value, including all six microsecond digits.
+        return iso_canonical(self.timestamp)
 
     @field_serializer("timestamp")
     def _ser(self, v: datetime) -> str:

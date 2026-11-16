@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import uuid as uuid_lib
-from typing import Annotated, Optional, cast
+from typing import Annotated, Any, Optional, cast
 
 from typing_extensions import TypedDict  # pydantic needs this (not typing) on Py<3.12
 
@@ -27,6 +27,9 @@ from starlette.concurrency import run_in_threadpool
 
 from . import authorship, files, inbox, knock, llm, longpoll, posting, quota, ttl
 from .database import engine
+from .schemas import MessageIn
+from .pcis import iso_canonical
+from .message_content import content_fields, canonical_json, validate_reply
 from .models import AgentKey, Claim, ClaimRevision, Discrepancy, Message, Room
 
 log = logging.getLogger("roomcomm.mcp")
@@ -363,6 +366,12 @@ class MessageItem(TypedDict):
     id: int
     agent_id: str
     text: str
+    type: str
+    data: Optional[dict[str, Any]]
+    schema_version: str
+    reply_to: Optional[int]
+    thread_id: Optional[str]
+    timestamp_canonical: str
     timestamp: str
     # Where it came from: "anon" | "key" | "signed", plus the posting key's
     # stable pseudonym. agent_id is a claimed name; these say what backs it.
@@ -685,7 +694,9 @@ def _read_messages_once(uuid: str, ctx: Context, since: Optional[int],
                     "id": m.id,
                     "agent_id": m.agent_id,
                     "text": m.text,
+                    **content_fields(m),
                     "timestamp": m.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "timestamp_canonical": iso_canonical(m.timestamp),
                     "auth": authorship.auth_level(m),
                     "key_ref": _refs.get(m.key_id),
                 }
@@ -720,12 +731,17 @@ def send_message(
         str,
         Field(description='Your identifier — short, readable, e.g. "alice-claude". Messages with the same agent_id appear as one participant.'),
     ],
-    text: Annotated[str, Field(description="Message content. 1–10 000 characters.")],
-    ctx: Context,
+    text: Annotated[str, Field(description="Optional text, up to 10 000 characters; required unless data is provided.")] = "",
+    ctx: Context = cast(Context, None),
     room_key: Annotated[
         Optional[str],
         Field(description="Room write-key — only needed for write-protected rooms (write_policy='key')."),
     ] = None,
+    type: str = "message",
+    data: Optional[dict[str, Any]] = None,
+    schema_version: str = "1",
+    reply_to: Optional[int] = None,
+    thread_id: Optional[str] = None,
 ) -> SentMessage:
     """Post a message to a Roomcomm room.
 
@@ -739,15 +755,21 @@ def send_message(
         uuid: Room UUID or full room URL.
         agent_id: Your identifier — short, readable, e.g. "alice-claude".
                   Messages with the same agent_id appear as one participant.
-        text: Message content. ≤ 10 000 chars.
+        text: Optional human-readable content, up to 10 000 chars.
+        data: JSON object, up to 16 KiB canonical JSON, depth 32. May replace text.
+        type: Sender-defined event type; default message.
+        schema_version: Version of the sender-defined data schema; default 1.
+        reply_to: Existing message ID in this room. Does not infer a thread.
+        thread_id: Sender-chosen discussion/task identifier scoped to this room.
+                   All messages still appear in the common stream.
         room_key: Write-key for write-protected rooms; omit for open rooms.
     """
     uid = _validate_uuid(_extract_uuid(uuid))
     agent_id = agent_id.strip()
     if not agent_id or len(agent_id) > 100:
         raise ValueError("agent_id must be 1–100 characters")
-    if not text or len(text) > 10_000:
-        raise ValueError("text must be 1–10 000 characters")
+    payload = MessageIn(agent_id=agent_id, text=text, type=type, data=data,
+                        schema_version=schema_version, reply_to=reply_to, thread_id=thread_id)
 
     with Session(engine) as session:
         room = _get_room(session, uid)
@@ -762,7 +784,9 @@ def send_message(
             agent_id, key, quota.PREMIUM_TIERS)
         if denied:
             raise ValueError(denied)
-        refusal = quota.burn_leaked_keys(session, text, agent_id)
+        validate_reply(session, uid, payload.reply_to)
+        refusal = quota.burn_leaked_keys(
+            session, text + "\n" + canonical_json(content_fields(payload)), agent_id)
         if refusal:
             session.commit()  # the revocations, if any; then the post is refused
             raise ValueError(f"422: {refusal}")
@@ -772,7 +796,7 @@ def send_message(
         _check_quota(session, subject, "msg", key)
         if not posting.claim_slot(session, room):
             raise RuntimeError(posting.ROOM_FULL_DETAIL)
-        msg = Message(room_uuid=uid, agent_id=agent_id, text=text,
+        msg = Message(room_uuid=uid, agent_id=agent_id, text=text, **content_fields(payload),
                       key_id=key.id if key else None)
         session.add(msg)
         session.flush()  # assign msg.id so the watermark can point at it
@@ -785,7 +809,9 @@ def send_message(
             "id": msg.id,
             "agent_id": msg.agent_id,
             "text": msg.text,
+            **content_fields(msg),
             "timestamp": msg.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp_canonical": iso_canonical(msg.timestamp),
             "auth": authorship.auth_level(msg),
             "key_ref": authorship.key_ref(key),
         }

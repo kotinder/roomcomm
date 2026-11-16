@@ -181,6 +181,18 @@ def _migrate_sqlite() -> None:
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN memory_root VARCHAR(128)")
             conn.commit()
 
+        # Structured messages: existing text rows keep the legacy defaults.
+        for name, definition in {
+            "type": "VARCHAR(100) NOT NULL DEFAULT 'message'",
+            "data": "JSON",
+            "schema_version": "VARCHAR(32) NOT NULL DEFAULT '1'",
+            "reply_to": "INTEGER",
+            "thread_id": "VARCHAR(128)",
+        }.items():
+            if msg_cols and name not in msg_cols:
+                conn.exec_driver_sql(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+        conn.commit()
+
         # Auth MVP: key attribution on messages.
         if msg_cols and "key_id" not in msg_cols:
             conn.exec_driver_sql(

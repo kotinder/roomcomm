@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 from sqlmodel import Session, func, select
 
 from . import authorship, files, inbox, llm, posting, quota, ttl
+from .message_content import content_fields
 from .models import AgentKey, Message, Room, RoomSeen
 
 TEXT_MAX = 10_000
@@ -104,6 +105,7 @@ def _msg(m: Message, refs: dict) -> dict:
         "id": m.id,
         "agent_id": m.agent_id,
         "text": m.text,
+        **content_fields(m),
         "timestamp": _ts(m.timestamp),
         "auth": authorship.auth_level(m),
         "key_ref": refs.get(m.key_id),

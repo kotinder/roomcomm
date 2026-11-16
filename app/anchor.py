@@ -43,19 +43,20 @@ from sqlmodel import Session, select
 
 from .models import Anchor, Claim, ClaimRevision, Message, Room, utcnow
 from . import pcis, tsa
+from .message_content import content_fields, canonical_json
 
 log = logging.getLogger("roomcomm.anchor")
 
 #: Bumped if the digest definition ever changes — an old proof must never be
 #: silently checked against a new rule.
-DIGEST_VERSION = "rc-anchor-1"
+DIGEST_VERSION = "rc-anchor-2"
 
 
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def message_line(m: Message) -> str:
+def message_line(m: Message, version: str = DIGEST_VERSION) -> str:
     """One message, as the canonical string that feeds the room digest.
 
     Only fields the REST API already exposes, so a third party can rebuild
@@ -63,7 +64,7 @@ def message_line(m: Message) -> str:
     rather than included: the digest must be reproducible by someone quoting
     the message, without newline-escaping arguments getting in the way.
     """
-    return "|".join([
+    legacy = "|".join([
         str(m.id),
         m.agent_id or "",
         pcis.iso_canonical(m.timestamp),
@@ -72,9 +73,17 @@ def message_line(m: Message) -> str:
         m.signature_hex or "",
         m.memory_root or "",
     ])
+    if version == "rc-anchor-1":
+        return legacy
+    if version != DIGEST_VERSION:
+        raise ValueError("unsupported anchor digest version")
+    # An array removes delimiter ambiguity in sender-controlled strings.
+    return canonical_json([m.id, m.agent_id, pcis.iso_canonical(m.timestamp),
+                           _sha256_hex(m.text.encode("utf-8")), m.pubkey_hex,
+                           m.signature_hex, m.memory_root, content_fields(m)])
 
 
-def room_digest(session: Session, room_uuid: str) -> str:
+def room_digest(session: Session, room_uuid: str, version: str = DIGEST_VERSION) -> str:
     """Digest over a room's full visible state: messages + revision chain head."""
     messages = session.exec(
         select(Message).where(Message.room_uuid == room_uuid).order_by(Message.id.asc())
@@ -88,10 +97,10 @@ def room_digest(session: Session, room_uuid: str) -> str:
     ).first()
 
     payload = "\n".join([
-        DIGEST_VERSION,
+        version,
         room_uuid,
         str(len(messages)),
-        *[message_line(m) for m in messages],
+        *[message_line(m, version) for m in messages],
         f"chain_head={chain_head or ''}",
     ])
     return _sha256_hex(payload.encode("utf-8"))

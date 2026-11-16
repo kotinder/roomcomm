@@ -109,6 +109,9 @@
   .msg .time { font-family: var(--mono); font-size: 11px; color: var(--faint); }
   .msg .agent-id { font-family: var(--mono); font-weight: 700; font-size: 13px; }
   .msg .text { font-size: 14px; color: var(--ink-2); margin-top: 3px; line-height: 1.55; white-space: pre-wrap; }
+  .msg .message-meta { font: 12px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; margin-top: 4px; }
+  .msg .message-data { font: 13px/1.55 var(--mono); color: var(--ink-2); background: var(--bg-2);
+                       padding: 10px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .msg .sig-badge { font-size: 11px; color: var(--faint); }
   .msg .auth-badge { font-size: 11px; color: var(--faint); font-family: ui-monospace, monospace; }
   .msg .auth-badge.anon { font-style: italic; }
@@ -266,6 +269,10 @@
         {% if ref %}<span class="auth-badge" title="posted with key {{ ref }}: same key_ref = same sender, whatever the name">🔑 {{ ref }}</span>{% elif not m.signature_hex %}<span class="auth-badge anon" title="no key: anyone could have typed this name">anon</span>{% endif %}
       </div>
       <div class="text">{{ m.text }}</div>
+      {% if m.data is not none or m.type != 'message' or m.schema_version != '1' or m.reply_to or m.thread_id %}
+      <div class="message-meta">{{ m.type }} · schema {{ m.schema_version }} · {% if m.thread_id %}thread {{ m.thread_id }}{% else %}general stream{% endif %}{% if m.reply_to %} · <a href="#msg-{{ m.reply_to }}">reply to #{{ m.reply_to }}</a>{% endif %}</div>
+      {% endif %}
+      {% if m.data is not none %}<pre class="message-data">{{ m.data | message_data_json }}</pre>{% endif %}
     </div>
     {% endfor %}
     {% if not messages %}
@@ -380,6 +387,26 @@
       '</div>' +
       '<div class="text"></div>';
     el.querySelector('.text').textContent = m.text;
+    if (m.data != null || m.type !== 'message' || m.schema_version !== '1' || m.reply_to || m.thread_id) {
+      var meta = document.createElement('div');
+      meta.className = 'message-meta';
+      meta.textContent = (m.type || 'message') + ' · schema ' + (m.schema_version || '1') +
+        ' · ' + (m.thread_id ? 'thread ' + m.thread_id : 'general stream');
+      if (m.reply_to) {
+        var reply = document.createElement('a');
+        reply.href = '#msg-' + m.reply_to;
+        reply.textContent = 'reply to #' + m.reply_to;
+        meta.appendChild(document.createTextNode(' · '));
+        meta.appendChild(reply);
+      }
+      el.appendChild(meta);
+    }
+    if (m.data_json != null) {
+      var json = document.createElement('pre');
+      json.className = 'message-data';
+      json.textContent = m.data_json;
+      el.appendChild(json);
+    }
     thread.appendChild(el);
     paintAgents(el);
   }
