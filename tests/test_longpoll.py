@@ -4,8 +4,10 @@ A file database, not the in-memory StaticPool the other suites use: here a
 held request and a post run at the same time, and on one shared connection
 the waiter's end-of-check rollback could roll back the poster's transaction.
 """
+import asyncio
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +16,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 
 import app.longpoll as longpoll
 import app.main as _main
+import app.mcp_server as mcp_server
 import app.models as models
 import app.quota as quota
 from app.database import get_session
@@ -32,6 +35,7 @@ def _file_db(tmp_path, monkeypatch):
         conn.execute("PRAGMA journal_mode=WAL")
 
     SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(mcp_server, "engine", engine)
 
     def _override():
         with Session(engine, expire_on_commit=False) as s:
@@ -93,6 +97,114 @@ def _idle_polls(engine, agent_id):
             models.AgentKey.agent_id == agent_id)).one()
         day = models.utcnow().strftime("%Y-%m-%d")
         return quota._stored_count(s, f"key:{kid}", day, "read_empty")
+
+
+# Exercise the MCP SDK dispatcher, including argument/output validation.
+async def _mcp_call(tool, key, **arguments):
+    request = SimpleNamespace(headers={"authorization": f"Bearer {key}"},
+                              client=SimpleNamespace(host="10.0.0.1"))
+    ctx = SimpleNamespace(request_context=SimpleNamespace(request=request))
+    manager = mcp_server.mcp._tool_manager
+    result = await manager.call_tool(tool, arguments, context=ctx)
+    manager.get_tool(tool).fn_metadata.output_model.model_validate(result)
+    return result
+
+
+@pytest.mark.parametrize("tool", ["read_messages", "check_inbox"])
+def test_mcp_wait_wakes_on_message(tool):
+    key = _key("mcp-wake")
+    room = _room()
+    last = _post(room, "mcp-wake", "joined", headers=_bearer(key))
+    args = {"uuid": room} if tool == "read_messages" else {}
+
+    async def scenario():
+        task = asyncio.create_task(_mcp_call(tool, key, wait=5, since=last, **args))
+        try:
+            for _ in range(200):
+                if longpoll.held():
+                    break
+                await asyncio.sleep(0.01)
+            assert longpoll.held() == 1 and not task.done()
+            new_id = await asyncio.to_thread(_post, room, "dealer", "offer")
+            out = await asyncio.wait_for(task, 3)
+            if tool == "read_messages":
+                assert [m["id"] for m in out["messages"]] == [new_id]
+            else:
+                assert out["cursor"] >= new_id
+                assert out["rooms"][0]["new_messages"] == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert longpoll.held() == 0
+
+    asyncio.run(scenario())
+
+
+def test_mcp_inbox_cursor_waits_past_old_unread():
+    key = _key("mcp-cursor")
+    room = _room()
+    _post(room, "mcp-cursor", "joined", headers=_bearer(key))
+    _post(room, "dealer", "old offer")
+    first = asyncio.run(_mcp_call("check_inbox", key, wait=30))
+    started = time.monotonic()
+    out = asyncio.run(_mcp_call("check_inbox", key, wait=1, since=first["cursor"]))
+    assert time.monotonic() - started >= 0.9
+    assert out["cursor"] == first["cursor"]
+    assert out["rooms"][0]["new_messages"] == 1
+
+
+@pytest.mark.parametrize("tool", ["read_messages", "check_inbox"])
+@pytest.mark.parametrize("mode, expected", [("short", 1), ("long", 0), ("full", 1)])
+def test_mcp_wait_idle_accounting(tool, mode, expected, _file_db, monkeypatch):
+    key = _key("mcp-meter")
+    room = _room()
+    last = _post(room, "mcp-meter", "joined", headers=_bearer(key))
+    args = {"uuid": room} if tool == "read_messages" else {}
+    if mode == "long":
+        monkeypatch.setattr(longpoll, "FREE_WAIT", 0.5)
+    if mode == "full":
+        monkeypatch.setattr(longpoll, "MAX_WAITERS", 0)
+    out = asyncio.run(_mcp_call(tool, key, since=last, wait=1 if mode != "full" else 30, **args))
+    assert not out.get("messages")
+    assert _idle_polls(_file_db, "mcp-meter") == expected
+    assert longpoll.held() == 0
+    if tool == "check_inbox":
+        with Session(_file_db) as session:
+            kid = session.exec(select(models.AgentKey.id).where(
+                models.AgentKey.agent_id == "mcp-meter")).one()
+            day = models.utcnow().strftime("%Y-%m-%d")
+            assert quota._stored_count(session, f"key:{kid}", day, "inbox") == 1
+
+
+@pytest.mark.parametrize("tool", ["read_messages", "check_inbox"])
+def test_mcp_wait_cancellation_releases_slot(tool):
+    key = _key("mcp-cancel")
+    room = _room()
+    last = _post(room, "mcp-cancel", "joined", headers=_bearer(key))
+    args = {"uuid": room} if tool == "read_messages" else {}
+
+    async def scenario():
+        task = asyncio.create_task(_mcp_call(tool, key, wait=30, since=last, **args))
+        try:
+            for _ in range(200):
+                if longpoll.held():
+                    break
+                await asyncio.sleep(0.01)
+            assert longpoll.held() == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert longpoll.held() == 0
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool", ["read_messages", "check_inbox"])
+@pytest.mark.parametrize("wait", [-1, 31])
+def test_mcp_wait_bounds(tool, wait):
+    from pydantic import ValidationError
+    model = mcp_server.mcp._tool_manager.get_tool(tool).fn_metadata.arg_model
+    with pytest.raises(ValidationError):
+        model.model_validate({"uuid": "unused", "wait": wait})
 
 
 # ---------- room ----------

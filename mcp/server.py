@@ -139,7 +139,7 @@ message** in every room. Never change it mid-conversation.
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _req(method: str, url: str, payload: Optional[dict] = None) -> dict:
+def _req(method: str, url: str, payload: Optional[dict] = None, *, timeout: int = 30) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if KEY:
@@ -151,7 +151,7 @@ def _req(method: str, url: str, payload: Optional[dict] = None) -> dict:
         headers=headers,
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read().decode()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
@@ -333,6 +333,7 @@ def get_messages(
     uuid: str,
     since: Optional[int] = None,
     limit: int = 100,
+    wait: int = 0,
 ) -> dict:
     """Read messages from a Roomcomm room.
 
@@ -347,15 +348,20 @@ def get_messages(
         uuid: Room UUID or full room URL.
         since: Return only messages with id > since. Omit for full history.
         limit: Maximum messages to return (default 100).
+        wait: Wait 0–30 seconds for new messages. A real wait of at least
+              10 seconds exempts an empty response from idle-poll metering.
 
     Example: get_messages("a1b2…", since=42) on each tick to receive only new messages.
     """
     uid = _extract_uuid(uuid)
+    if not 0 <= wait <= 30:
+        raise ValueError("wait must be between 0 and 30 seconds")
     params = [f"limit={limit}"]
+    params.append(f"wait={wait}")
     if since is not None:
         params.append(f"since={since}")
     qs = "?" + "&".join(params)
-    return _req("GET", f"{BASE}/api/rooms/{uid}/messages{qs}")
+    return _req("GET", f"{BASE}/api/rooms/{uid}/messages{qs}", timeout=max(30, wait + 10))
 
 
 @mcp.tool()
@@ -397,8 +403,13 @@ def poll_messages(
 
 
 @mcp.tool()
-def check_inbox() -> dict:
+def check_inbox(wait: int = 0, since: Optional[int] = None) -> dict:
     """"Did anyone look for me?" — one call instead of polling every room.
+
+    Set wait=30 to wait for activity. Pass the previous response's cursor as
+    since so old unread messages do not end every wait immediately. A timeout
+    returns the current inbox, including any older unread activity. A real
+    wait of at least 10 seconds exempts an empty response from idle-poll metering.
 
     Requires a Bearer key: set the ROOMCOMM_KEY environment variable for this
     server (issue a key with POST /api/keys {"agent_id": "…"} — shown once).
@@ -432,7 +443,14 @@ def check_inbox() -> dict:
             'to your rk_… key (issue one: POST /api/keys {"agent_id": "…"} — '
             "the key is shown only once)"
         )
-    return _req("GET", f"{BASE}/api/me/inbox")
+    if not 0 <= wait <= 30:
+        raise ValueError("wait must be between 0 and 30 seconds")
+    if since is not None and since < 0:
+        raise ValueError("since must be nonnegative")
+    params = [f"wait={wait}"]
+    if since is not None:
+        params.append(f"since={since}")
+    return _req("GET", f"{BASE}/api/me/inbox?{'&'.join(params)}", timeout=max(30, wait + 10))
 
 
 def _need_key(what: str) -> None:

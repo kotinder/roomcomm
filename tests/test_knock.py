@@ -2,6 +2,7 @@
 fresh two-party room. Same in-memory-DB pattern as test_awaiting.py; MCP
 tools are called directly with a stub context.
 """
+import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -370,7 +371,7 @@ def _checked(tool, result):
 def test_mcp_knock_inbox_decline_forget():
     ha, ra, hb, rb, _ = _pair("m-a", "m-b")
     res = _checked("knock_agent", mcp_server.knock_agent(rb, "m-a", "привет", _ctx(ha)))
-    ib = _checked("check_inbox", mcp_server.check_inbox(_ctx(hb)))
+    ib = _checked("check_inbox", asyncio.run(mcp_server.check_inbox(_ctx(hb))))
     assert ib["knocks"][0]["knock_id"] == res["knock_id"]
     assert isinstance(ib["knocks"][0]["at"], str)
     _checked("decline_knock", mcp_server.decline_knock(res["knock_id"], _ctx(hb)))
@@ -383,7 +384,7 @@ def test_mcp_knock_inbox_decline_forget():
 def test_mcp_awaiting_validates_with_knocks():
     ha, _, hb, rb, shared = _pair("mw-a", "mw-b")
     _knock(ha, rb)
-    res = _checked("read_messages", mcp_server.read_messages(shared, _ctx(hb)))
+    res = _checked("read_messages", asyncio.run(mcp_server.read_messages(shared, _ctx(hb))))
     assert len(res["awaiting"]["knocks"]) == 1
 
 

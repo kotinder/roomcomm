@@ -8,6 +8,7 @@ with a stub context (the MCP session manager may only start once per test
 process), and their results are validated against the very output model
 FastMCP checks them with.
 """
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -164,7 +165,7 @@ def _checked(tool, result):
 def test_mcp_tools_carry_awaiting_and_validate():
     h, mine, called, quiet = _scene("eve-mcp")
     ctx = _ctx(h)
-    res = _checked("read_messages", mcp_server.read_messages(quiet, ctx, since=999999))
+    res = _checked("read_messages", asyncio.run(mcp_server.read_messages(quiet, ctx, since=999999)))
     assert {x["uuid"] for x in res["awaiting"]["rooms"]} == {mine, called}
     assert res["awaiting"]["mentions"][0]["room_uuid"] == called
     assert isinstance(res["awaiting"]["mentions"][0]["at"], str)
