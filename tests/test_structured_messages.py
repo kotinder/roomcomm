@@ -339,6 +339,7 @@ function element() {
 }
 const thread = element();
 const context = {
+  window: {},
   document: {createElement: element, createTextNode: s => ({textContent: s})},
   thread, escapeHtml: String, fmtTime: String, paintAgents() {}
 };

@@ -112,6 +112,26 @@
   .msg .message-meta { font: 12px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; margin-top: 4px; }
   .msg .message-data { font: 13px/1.55 var(--mono); color: var(--ink-2); background: var(--bg-2);
                        padding: 10px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg { min-width: 0; }
+  .msg .text { overflow-wrap: anywhere; }
+  .json-block { margin-top: 8px; border: 1px solid var(--line-2); border-radius: 8px;
+                background: var(--bg-2); white-space: normal; overflow: hidden; }
+  .json-block > summary { padding: 9px 12px; cursor: pointer; color: var(--ink-2);
+                          font: 12px/1.6 var(--mono); overflow-wrap: anywhere; }
+  .json-block > summary::marker { color: var(--green); }
+  .json-block > summary:hover { background: var(--surface); }
+  .json-block[open] > summary { border-bottom: 1px solid var(--line); }
+  .json-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 8px 12px 0; }
+  .json-copy { flex-shrink: 0; font: 12px/1.5 var(--sans); padding: 5px 9px; cursor: pointer;
+               border: 1px solid var(--line-2); border-radius: 5px; background: var(--surface); color: var(--ink-2); }
+  .json-copy:hover { border-color: var(--ink-2); }
+  .json-status { font: 12px/1.5 var(--sans); color: var(--ink-2); }
+  .json-block .json-code { margin: 0; padding: 12px; max-height: 420px; overflow: auto;
+                          white-space: pre; overflow-wrap: normal; font: 12px/1.7 var(--mono); color: var(--ink-2); }
+  .json-key { color: oklch(0.42 0.09 155); }
+  .json-string { color: oklch(0.43 0.07 65); }
+  .json-number, .json-literal { color: oklch(0.43 0.12 255); }
+  .json-block :focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
   .msg .sig-badge { font-size: 11px; color: var(--faint); }
   .msg .auth-badge { font-size: 11px; color: var(--faint); font-family: ui-monospace, monospace; }
   .msg .auth-badge.anon { font-style: italic; }
@@ -320,6 +340,7 @@
   </div>
 </footer>
 
+<script src="/static/message-json.js?v=20261117-1"></script>
 <script>
 (function () {
   var ROOM_UUID = "{{ room.uuid }}";
@@ -360,6 +381,7 @@
     });
   }
   paintAgents(thread);
+  if (window.RoomcommJSON) thread.querySelectorAll('.msg').forEach(window.RoomcommJSON.enhance);
 
   function isNearBottom() {
     return (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 80);
@@ -409,6 +431,7 @@
     }
     thread.appendChild(el);
     paintAgents(el);
+    if (window.RoomcommJSON) window.RoomcommJSON.enhance(el);
   }
 
   function setIdle() {
